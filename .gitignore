@@ -35,4 +35,9 @@ build/
 .claude/
 modelmemory/
 
+### Local secrets — never commit these
+.env
+.env.*
+!.env.example
+
 projecttoverview.md

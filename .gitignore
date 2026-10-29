@@ -40,4 +40,4 @@ modelmemory/
 .env.*
 !.env.example
 
-projecttoverview.md
+projectoverview.md

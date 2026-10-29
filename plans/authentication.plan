@@ -1,6 +1,6 @@
 # Authentication & Authorization — Architecture Plan
 
-**Status:** Draft (revised 2026-10-29 — see §12 for the change log) · **Tasks:** TASKS.md M3.3 (build in-house), M10.1 (migrate to Keycloak) · **Date:** 2026-10-29
+**Status:** Draft (revised twice on 2026-10-29 — see §12 and §13 for the change logs) · **Tasks:** TASKS.md M3.3 (build in-house), M10.1 (migrate to Keycloak) · **Date:** 2026-10-29
 
 This is the full design for the in-house authentication built in M3.3. It's structured so that M10's move to Keycloak replaces only the parts that issue tokens.
 
@@ -38,7 +38,8 @@ Client                    Spring Boot
   │  Authorization:        1. BearerTokenAuthenticationFilter
   │   Bearer <JWT>         │     └─ JwtDecoder (RSA public key) → who (sub)
   │  X-Organization-Id    2. TenantContextFilter  (runs after bearer auth)
-  │                        │     └─ one join: app_user ⨝ membership → org, role, authorities
+  │                        │     └─ org routes: one join app_user ⨝ membership → org, role, authorities
+  │                        │     └─ /platform/**: app_user only → is_platform_admin → PLATFORM_ORG_MANAGE
   │                        │     └─ replaces the Authentication in the SecurityContext
   │                        3. AuthorizationFilter, then @PreAuthorize → allowed?
   │
@@ -68,7 +69,7 @@ Every login event goes to `audit_event`, inside the same transaction as the chan
 - **No roles or organization in the JWT.** If roles were in the token, removing someone's access wouldn't take effect until the token expired. The cost is **one join per request** — `app_user ⨝ membership` in a single query, not two round trips — which is cheap at about 35 req/s (see docs/scalability.md). Querying `app_user` and `membership` separately would double the per-request database cost for no benefit.
 - **The refresh token in an `HttpOnly` cookie.** JavaScript can't read it, so an XSS attack can't steal it. `SameSite=Strict` together with the narrow `Path` limits CSRF to a single endpoint.
   - **This assumes the SPA and the API share a registrable domain.** If the browser sees them as cross-site (different domains, or some local dev setups), `SameSite=Strict` means the cookie is *never* sent. Deploy same-site, or switch to `SameSite=None` and add real CSRF tokens on `/auth/refresh` and `/auth/logout`.
-  - **`Secure` must be `false` for local http**, or the browser silently drops the cookie and refresh appears to fail with no error.
+  - **`Secure` is a configuration property, `reconflow.auth.cookie.secure`, defaulting to `true`.** Only the `local` profile sets it to `false`. Chrome and Firefox treat `http://localhost` as secure and accept `Secure` cookies there; Safari may not, which is the only reason the override exists. Because the default is `true`, forgetting to configure production fails safe instead of shipping a cookie that travels over plain http.
 
 ---
 
@@ -108,16 +109,29 @@ Client                      AuthService / DB
 - **The bcrypt check happens before any lockout branch.** Testing `locked_until` first returns in ~1 ms instead of ~250 ms — precisely the signal the dummy hash exists to remove. The dummy hash must be a real bcrypt hash at the same cost factor as production hashes, or the timing differs anyway.
 - **A locked account returns the same `401` body** as a wrong password. A distinct `423 Locked` confirms the account exists to anyone who has not guessed the password yet.
 
-**Counter semantics.** Increment atomically, never read-modify-write:
+**Counter semantics.** One atomic statement records a failure, restarts the count after an expired lock, and sets the lock. Never read-modify-write, and never split it into separate statements:
 
 ```sql
-UPDATE app_user
-   SET failed_login_count = failed_login_count + 1
- WHERE id = :id
-RETURNING failed_login_count;
+UPDATE app_user SET
+  failed_login_count = CASE WHEN locked_until <= now() THEN 1
+                            ELSE failed_login_count + 1 END,
+  locked_until = CASE
+      WHEN (CASE WHEN locked_until <= now() THEN 1
+                 ELSE failed_login_count + 1 END) >= 5
+      THEN now() + interval '15 minutes' END        -- NULL otherwise, clearing an expired lock
+WHERE id = :id
+  AND (locked_until IS NULL OR locked_until <= now())  -- currently locked: touch nothing
+RETURNING failed_login_count, locked_until;
 ```
 
-Doing this as one statement is what prevents concurrent attempts from losing increments; a read-modify-write lets an attacker get more than five guesses. And when `locked_until` has passed, **reset the counter to 0 before evaluating the attempt** — otherwise the next single failure immediately re-locks the account, letting an attacker hold a real user locked indefinitely at one guess per window. A successful login also clears both `failed_login_count` and `locked_until`.
+- **One statement prevents lost increments.** A read-modify-write lets concurrent attempts overwrite each other's increments, giving an attacker more than five guesses.
+- **An expired lock restarts the count at 1** (this failure is the first of a new window). Without the restart, the next single failure re-locks immediately, so an attacker can keep a real user locked forever at one guess every 15 minutes.
+- **Failures while locked change nothing** (the `WHERE` matches 0 rows). Otherwise each guess during the lock would extend it.
+- The restart lives inside the same statement on purpose: running "reset if expired" as its own statement first reopens the race that the single statement closes.
+
+Verified against PostgreSQL 16: counts 1–4 stay unlocked, the 5th locks, a failure while locked updates 0 rows and leaves the count at 5, and the first failure after expiry returns count 1 with the lock cleared.
+
+A successful login clears both `failed_login_count` and `locked_until`.
 
 If `must_change_password` is set, the JWT carries `pwd_change: true`. A filter then rejects every endpoint except `POST /auth/change-password` and `POST /auth/logout`.
 
@@ -146,53 +160,89 @@ Three cases the filter must handle explicitly, because they are where tenant bug
 
 - **User disabled mid-session.** Step 2 rejects with `401` on the next request. This is stronger than a JWT denylist and is why the status check is worth its query.
 - **User removed from an org.** The membership vanishes; the filter returns `404`, not `403`, so the org's existence isn't confirmed.
-- **Platform admin with no membership.** `is_platform_admin` alone grants **no** org access. Only `/api/v1/platform/**` matches on the `is_platform_admin` claim; every org-scoped route returns `404` for them. See §5.
+- **Platform admin with no membership.** `is_platform_admin` alone grants **no** org access; every org-scoped route returns `404` for them. On `/api/v1/platform/**` the filter runs in *platform mode*: it loads `app_user` by `sub` (no membership join, no org header), rejects a non-`ACTIVE` user with `401`, and grants `PLATFORM_ORG_MANAGE` only if `is_platform_admin` is true **in the database**. The flag is never a JWT claim. See §5.
 
 ### 4.3 Refresh, with rotation
 
-Use one transaction with an atomic claim, so two simultaneous requests can't both use the same refresh token:
+Refresh is a read, a decision, then one of two separate transactions:
+
+```
+1. Read      SELECT id, user_id, family_id, expires_at, family_expires_at,
+                    revoked_at, revoked_reason
+               FROM refresh_token WHERE token_hash = :hash;
+
+2. Decide    not found                                   → 401
+             revoked, revoked_reason = 'ROTATED'         → REUSE   (transaction B)
+             revoked, any other reason                   → 401     (no alarm)
+             expires_at <= now() or family_expires_at <= now() → 401
+             otherwise                                   → ROTATE  (transaction A)
+```
+
+**Transaction A: rotate.** It needs `user_id`, `family_id` and `family_expires_at` from step 1, which is why the read comes first.
 
 ```sql
 BEGIN;
 
--- 1. Insert the replacement first. replaced_by has a foreign key to this
---    row, so the old token cannot point at it until it exists.
+-- Insert the replacement first. replaced_by has a foreign key to this
+-- row, so the old token cannot point at it until it exists.
 INSERT INTO refresh_token (id, user_id, family_id, token_hash,
                            expires_at, family_expires_at)
 VALUES (:newId, :userId, :familyId, :newHash,
-        now() + interval '7 days', :familyExpiresAt);
+        least(now() + interval '7 days', :familyExpiresAt), :familyExpiresAt);
 
--- 2. Claim the old token atomically.
+-- Claim the old token atomically.
 UPDATE refresh_token
-   SET revoked_at = now(), replaced_by = :newId
- WHERE token_hash = :hash
+   SET revoked_at = now(), revoked_reason = 'ROTATED', replaced_by = :newId
+ WHERE id = :oldId
    AND revoked_at IS NULL
    AND expires_at > now()
-   AND family_expires_at > now()
-RETURNING user_id, family_id;
+   AND family_expires_at > now();
 
--- 3. If step 2 updated 0 rows, ROLLBACK — that discards the insert from step 1.
+-- 1 row  → COMMIT, return the new access token and cookie.
+-- 0 rows → ROLLBACK (discards the insert). A concurrent request claimed it
+--          first; re-read the row and treat it as a revoked token (step 2).
 COMMIT;
 ```
 
-The order matters: setting `replaced_by = :newId` before the replacement row exists is a foreign-key violation, and sequential numbered steps without a transaction leave an orphan token whenever the claim loses a race. Two concurrent refreshes both insert, exactly one wins the `UPDATE`, and the loser rolls back.
+The order inside A matters: setting `replaced_by = :newId` before the replacement exists is a foreign-key violation. Under READ COMMITTED, two concurrent refreshes both insert; the second `UPDATE` waits for the first to commit, re-checks `revoked_at IS NULL`, matches 0 rows, and rolls back.
 
-- **1 row updated:** return a new access token and cookie, in the same family.
-- **0 rows:** look the hash up.
-  - **Not found or expired:** `401`.
-  - **Found but already revoked:** **reuse detected.** Someone is replaying an old token, which means either the user or an attacker holds a stolen copy. Revoke every token in that `family_id` (`SET revoked_at = now() WHERE family_id = :id AND revoked_at IS NULL`), record `REFRESH_TOKEN_REUSE`, and return `401`. Both parties have to log in again, and only the real user can.
+**Transaction B: reuse detected.** A token that was *rotated* is being presented again, so either the user or an attacker holds a stolen copy. In its **own** transaction, which must commit:
 
-One false positive to plan for: a client that retries because the response to a successful refresh was lost looks exactly like an attacker replaying a token. Refresh must be single-flight in the client. A server-side grace window would weaken reuse detection, so it is not the default here.
+```sql
+BEGIN;
+UPDATE refresh_token
+   SET revoked_at = now(), revoked_reason = 'REUSE_DETECTED'
+ WHERE family_id = :familyId AND revoked_at IS NULL;
+INSERT INTO audit_event (...) VALUES (..., 'REFRESH_TOKEN_REUSE', ...);
+COMMIT;
+-- then return 401
+```
+
+Both parties have to log in again, and only the real user can.
+
+Two rules make this safe:
+
+- **B must never run inside A's rolled-back transaction.** If the family revocation and the audit row share a transaction that ends in `ROLLBACK`, the attack is neither stopped nor recorded, and the response is still a `401`, so nothing looks wrong.
+- **Only `ROTATED` tokens count as reuse.** After a logout, password change or admin revocation, the user's other devices still hold their old cookies and will try to refresh. Those are expected, not attacks: answer `401` and record nothing. Treating every revoked token as reuse would fill the audit log with false `REFRESH_TOKEN_REUSE` alarms after every password change, which trains people to ignore the real one. V3's constraints guarantee `revoked_reason` is always set and consistent, so this check can rely on it.
+
+The `least(...)` in the insert keeps a rotated token from outliving its family's 30-day cap.
+
+One false positive remains: a client that retries because the response to a successful refresh was lost looks exactly like an attacker replaying a rotated token. Refresh must be single-flight in the client. A server-side grace window would weaken reuse detection, so it is not the default here.
 
 ### 4.4 Logout
 
-Revoke the presented refresh token (or its whole family, to log out everywhere) and clear the cookie. The access token keeps working for up to 15 minutes; that's the accepted trade-off of stateless JWTs. The client also discards it from memory.
+Revoke the presented refresh token (or its whole family, to log out everywhere) with `revoked_reason = 'LOGOUT'`, and clear the cookie. The access token keeps working for up to 15 minutes; that's the accepted trade-off of stateless JWTs. The client also discards it from memory.
 
 ### 4.5 Password change and admin actions
 
-- **Password change:** verify the old password, apply the password policy, rehash, set `must_change_password = false`, and **revoke all of the user's refresh tokens**, which logs out every other device. The caller's existing access token survives its remaining 15 minutes — the documented cost of stateless JWTs (§8).
-- **Admin password reset:** an `ORG_ADMIN` sets a new temporary password (generated server-side, shown once) and `must_change_password = true`, then revokes all refresh tokens and audits the action. This is the *only* recovery path in v1, because there is no self-service email reset and no email infrastructure. Say so in the API docs, because users will expect "forgot password" to exist.
-- **Admin disables a user:** set `status = 'DISABLED'` and revoke all refresh tokens. Step 2 of §4.2 blocks them on the next request, because the user's status is checked every time.
+- **Password change:** verify the old password, apply the password policy, rehash, set `must_change_password = false`, and **revoke all of the user's refresh tokens** (`revoked_reason = 'PASSWORD_CHANGED'`), which logs out every other device. Then, in the same transaction, **start a new family for the calling device** and return a fresh token pair:
+  ```
+  200 {accessToken, expiresIn}     (no pwd_change claim)
+  Set-Cookie: refresh_token=…      (new family, new family_expires_at)
+  ```
+  Without the new pair, first login dead-ends: the current device's refresh token was just revoked, and its access token still carries `pwd_change: true`, so every endpoint except change-password and logout rejects it. The user would change their password and immediately be unable to do anything without logging in again, which looks like a bug. Issuing a new pair also means the 15-minute access token from *before* the change is no longer the one the client uses.
+- **Admin password reset:** an `ORG_ADMIN` sets a new temporary password (generated server-side, shown once) and `must_change_password = true`, then revokes all refresh tokens (`revoked_reason = 'ADMIN_REVOKED'`) and audits the action. This is the *only* recovery path in v1, because there is no self-service email reset and no email infrastructure. Say so in the API docs, because users will expect "forgot password" to exist.
+- **Admin disables a user:** set `status = 'DISABLED'` and revoke all refresh tokens (`revoked_reason = 'USER_DISABLED'`). Step 2 of §4.2 blocks them on the next request, because the user's status is checked every time.
 - **Role change:** update `membership.role` and audit it. Nothing else is required — permissions are resolved per request, so the new role applies immediately and the old one stops working immediately.
 - **Lock semantics:** `status = 'LOCKED'` is *administrative* (an admin decided to block the account); `locked_until` is *automatic* (brute-force protection). Login must deny on either, but only the automatic one expires on its own. Never set `status = 'LOCKED'` from the lockout path.
 
@@ -213,7 +263,16 @@ M3.3g requires admin-created users, and these are the endpoints that make it rea
 Guard rails that are easy to forget:
 
 - **Never accept `role` or `organizationId` from the profile-update endpoint.** Separate request records; never bind the entity.
-- **Refuse to demote or disable the last `ORG_ADMIN`** in an org (`409` plus audit), or the tenant becomes unadministrable.
+- **Refuse to demote or disable the last `ORG_ADMIN`** in an org (`409` plus audit), or the tenant becomes unadministrable. **Lock before counting**, or two admins demoting each other at the same moment both see "one other admin remains", both succeed, and the org is left with none:
+  ```sql
+  BEGIN;
+  SELECT id FROM organization WHERE id = :orgId FOR UPDATE;   -- serialises admin changes per org
+  SELECT count(*) FROM membership m JOIN app_user u ON u.id = m.user_id
+   WHERE m.organization_id = :orgId AND m.role = 'ORG_ADMIN'
+     AND u.status = 'ACTIVE' AND m.user_id <> :targetUserId;
+  -- 0 → ROLLBACK and return 409; otherwise apply the change, audit, COMMIT
+  ```
+  Locking the `organization` row rather than the membership rows makes the second transaction wait even when it targets a different admin, which is exactly the case that races. Count only `ACTIVE` admins: a disabled admin can't administer anything.
 - **Bootstrap the first org and admin** for non-local environments with an idempotent, audited startup runner gated to a one-time env flag. M3.8's seeder is local-only and cannot be the production path.
 
 ---
@@ -237,7 +296,7 @@ Platform admins (`is_platform_admin`) only manage organizations. They don't auto
 
 | Permission | Scope | Notes |
 |---|---|---|
-| `PLATFORM_ORG_MANAGE` | `/api/v1/platform/**` only | Granted solely by the `is_platform_admin` claim. There is no org context on these routes, so `TenantContextFilter` must pass them through without a membership lookup. |
+| `PLATFORM_ORG_MANAGE` | `/api/v1/platform/**` only | Granted only by `TenantContextFilter` in platform mode, from `app_user.is_platform_admin` read **from the database** on each request. Never a JWT claim, so revoking platform admin takes effect on the next request, consistent with §3. There is no org context on these routes, so no membership lookup and no `X-Organization-Id`. |
 
 This is the one place a missing authorization check would be catastrophic, so the rule is explicit: **`is_platform_admin` never satisfies an org-scoped permission.** The two permission sets are disjoint, and a test asserts that a platform-admin token gets `404` (not `200`) on every org-scoped route.
 
@@ -261,7 +320,16 @@ http
 
 **Do not put the org/role lookup in `jwtAuthenticationConverter`.** That converter receives only the `Jwt`, never the `HttpServletRequest`, so it cannot read `X-Organization-Id`. `TenantContextFilter` has the request, does the single join from §4.2, and **replaces the `Authentication`** in the `SecurityContext` with one whose authorities come from `RolePermissions`. `AuthorizationFilter` runs after this filter, so both the URL rules above and `@PreAuthorize` see the replaced authentication.
 
-The filter must also skip the public paths (login, refresh, logout, health) and `/api/v1/platform/**`. Running it on those routes either 404s a legitimate request or requires an org that doesn't exist.
+The filter skips only the public paths (login, refresh, logout, health). It **must not skip `/api/v1/platform/**`**: it runs there in platform mode (§4.2), because it is the only component that grants `PLATFORM_ORG_MANAGE`. `oauth2ResourceServer(jwt(withDefaults()))` turns the token's `scope` claim into `SCOPE_*` authorities and nothing else, so if the filter skipped platform routes, the `hasAuthority("PLATFORM_ORG_MANAGE")` rule above could never pass and every platform request would return `403`.
+
+```java
+// inside TenantContextFilter
+if (isPublic(path))   { chain.doFilter(req, res); return; }
+if (isPlatform(path)) { authenticatePlatformAdmin(jwt); }  // app_user only, no org
+else                  { authenticateTenantMember(jwt, req.getHeader("X-Organization-Id")); }
+```
+
+A test must cover both directions: a platform admin gets `200` on `/api/v1/platform/organizations` and `404` on every org-scoped route; an `ORG_ADMIN` gets `403` on every platform route.
 
 Dependency: `spring-boot-starter-oauth2-resource-server`. It brings `spring-security-oauth2-jose`, which supplies `NimbusJwtEncoder`/`NimbusJwtDecoder` — no JWT is ever parsed by hand.
 
@@ -350,11 +418,30 @@ CREATE INDEX refresh_token_expiry_idx ON refresh_token (expires_at) WHERE revoke
 
 - `family_expires_at` is what makes the 30-day cap in §3 enforceable. Without it the cap cannot be computed after a rotation, because the family root is no longer the presented row.
 - `revoked_reason` separates rotation, logout, reuse and admin revocation. `replaced_by` distinguishes only "rotated" from "not rotated", which is not enough for the audit trail M3.3h asks for.
-- The partial index supports the expiry sweeper below.
+- ~~The partial index supports the expiry sweeper below.~~ It didn't; V3 replaces it (see below).
+
+**V3 corrects V2** (`V3__refresh_token_constraints.sql`, applied and verified):
+
+```sql
+ALTER TABLE refresh_token ADD CONSTRAINT refresh_token_revocation_consistent
+    CHECK ((revoked_at IS NULL) = (revoked_reason IS NULL));
+ALTER TABLE refresh_token ADD CONSTRAINT refresh_token_replaced_only_when_rotated
+    CHECK (replaced_by IS NULL OR revoked_reason = 'ROTATED');
+DROP INDEX refresh_token_expiry_idx;
+CREATE INDEX refresh_token_family_expiry_idx ON refresh_token (family_expires_at);
+```
+
+- **The two CHECKs** make the revocation fields impossible to get out of step. Reuse detection (§4.3) trusts `revoked_reason = 'ROTATED'`; a row revoked with no reason, or rotated but labelled `LOGOUT`, would either disable detection or raise a false alarm, and nothing would notice.
+- **The index** replaces V2's, which the sweeper could never use (see the next bullet).
+- **Why a new migration rather than editing V2:** V2 is recorded in `flyway_schema_history` with a checksum. Editing an applied migration makes validation fail and the application refuses to start, and on any other machine that already ran V2 the edit would simply never apply. Applied migrations are immutable; corrections go forward.
 
 Two operational gaps belong to M3.3 even though they are not schema changes:
 
-- **A refresh-token sweeper** deleting rows where `expires_at < now() - interval '30 days'`. Without it the table grows without bound.
+- **A refresh-token sweeper**, run daily, deleting whole families past their cap:
+  ```sql
+  DELETE FROM refresh_token WHERE family_expires_at < now() - interval '30 days';
+  ```
+  Without it the table grows without bound. The original rule (`expires_at < now() - 30 days`, with an index partial on `revoked_at IS NULL`) had two problems. The planner can't use a partial index for a query that lacks its predicate, so every sweep was a full scan. And the index covered only live tokens, while most rows are revoked, because every refresh revokes one. Sweeping by `family_expires_at` also guarantees a rotated token is never deleted while its family is still live; if it were, presenting it would return "not found" instead of triggering reuse detection. Verified with `EXPLAIN`: the delete uses `refresh_token_family_expiry_idx`.
 - **Bootstrap** of the first organization and `ORG_ADMIN` in any non-local environment (§4.6). The M3.8 seeder is local-only and cannot be the production path.
 
 ---
@@ -373,6 +460,10 @@ Two operational gaps belong to M3.3 even though they are not schema changes:
 10. Why must the password hash be checked before the lockout check, and what does that cost?
 11. Why does a foreign key on `replaced_by` force the insert to happen before the update during rotation?
 12. What happens to a user locked out for 15 minutes — and what breaks if the failure counter isn't reset when the lock expires?
+13. Why must reuse detection commit in its own transaction, and what does an attacker gain if it is rolled back?
+14. Why can't the database use a partial index for a query that lacks the index's predicate?
+15. Why can't you edit a migration that has already been applied, and how do you correct one?
+16. How can a "never remove the last admin" check fail under concurrency, and which row do you lock to prevent it?
 
 ---
 
@@ -393,3 +484,28 @@ Two operational gaps belong to M3.3 even though they are not schema changes:
 | §8 | Added the 72-byte bcrypt cap, cost factor 12, `upgradeEncoding`, the in-memory rate-limit caveat, and the client-retry false positive on reuse detection. |
 | §7 | Fail-fast key loading, `iss`/`aud` as configuration, clock skew. |
 | §9 | Defer dropping `password_hash` and `refresh_token` by one release for rollback. |
+
+---
+
+## 13. Change log — second review pass
+
+**2026-10-29.** Fixes from reviewing the first revision and the V2 migration. Each row says what was wrong, what changed, and why it matters.
+
+| # | Area | Problem | Fix | Why it matters |
+|---|---|---|---|---|
+| 1 | §2, §4.2, §5, §6 | `TenantContextFilter` skipped `/api/v1/platform/**`, and the default JWT converter only produces `SCOPE_*` authorities. Nothing could grant `PLATFORM_ORG_MANAGE`. The plan also called `is_platform_admin` a JWT claim, contradicting "no roles in the JWT". | The filter runs on platform routes in *platform mode*: it loads `app_user` only, checks `status`, and grants `PLATFORM_ORG_MANAGE` from `is_platform_admin` read from the database. Added a two-way test requirement. | As written, every platform route returned `403`, so no organization could ever be created outside the local seeder. Reading the flag from the database keeps the core rule intact: revoking platform admin takes effect on the next request, not 15 minutes later. |
+| 2 | §4.3 | The rotation `INSERT` used `user_id`, `family_id` and `family_expires_at` without saying where they come from. The reuse path ran after a `ROLLBACK`, so if implemented in the same transaction, the family revocation and the audit row would be rolled back too. | Refresh is now read → decide → one of two transactions. Transaction A rotates (insert, then claim by `id`). Transaction B handles reuse and **commits on its own**. Rotation also caps the new token at `least(now() + 7 days, family_expires_at)`. | A rolled-back reuse handler is the worst kind of bug: the stolen token's family stays live, nothing is audited, and the response is still `401`, so every test that checks the status code passes. The `least()` cap stops the last rotation before the 30-day limit from producing a token that outlives its family. |
+| 3 | §4.3, §4.4, §4.5 | Any revoked token presented again was treated as reuse. | Only `revoked_reason = 'ROTATED'` triggers reuse detection; other revoked tokens get a silent `401`. Every revocation path now sets its reason (`LOGOUT`, `PASSWORD_CHANGED`, `ADMIN_REVOKED`, `USER_DISABLED`, `REUSE_DETECTED`). | After a password change, every other device of that user presents an old cookie. Without this rule each one raises a `REFRESH_TOKEN_REUSE` security alarm. Security alerts that fire on normal behaviour teach people to ignore them, so the real attack gets missed. |
+| 4 | V2, §10 | V2's sweeper index was partial on `revoked_at IS NULL`, but the sweeper query had no such predicate, so the planner could never use it. It also only covered live tokens, while most rows are revoked. | **V3** drops it and adds a plain index on `family_expires_at`. The sweeper deletes whole families past their cap. Verified with `EXPLAIN`. | Without a usable index the daily sweep is a full table scan that gets slower every day. Sweeping by family also guarantees a rotated token is never deleted while its family is live; deleting it early would turn a detectable replay into an ordinary "not found". |
+| 5 | V2, §10 | Nothing stopped inconsistent revocation states: revoked with no reason, a reason on a live token, or `replaced_by` set with reason `LOGOUT`. | **V3** adds `CHECK ((revoked_at IS NULL) = (revoked_reason IS NULL))` and `CHECK (replaced_by IS NULL OR revoked_reason = 'ROTATED')`. All three bad states verified rejected. | Fix #3 makes reuse detection depend on `revoked_reason`. A database constraint makes that dependency safe: a bug that forgets to set the reason fails loudly at write time instead of silently weakening detection. Correcting V2 in V3, rather than editing it, follows the rule that applied migrations are immutable: Flyway would reject the changed checksum and refuse to start. |
+| 6 | §4.6 | "Refuse to remove the last `ORG_ADMIN`" was check-then-act with no locking. | Lock the `organization` row (`FOR UPDATE`) before counting, and count only `ACTIVE` admins. | Two admins demoting each other at the same moment would both pass the check and leave the tenant with no administrator, and only a database fix could recover it. Locking the organization row, not the membership rows, is what makes the second transaction wait even when it targets a *different* admin, which is exactly the racing case. |
+| 7 | §4.1 | "Reset the counter when the lock expires" was described as a separate step before the increment, and failures during a lock still incremented the counter. | One `UPDATE` now increments, restarts at 1 after an expired lock, sets the lock at 5, and matches 0 rows while locked. Verified against PostgreSQL 16. | A separate reset statement reopens the lost-update race the atomic increment was added to close. Counting failures during a lock lets an attacker extend the lock indefinitely, turning brute-force protection into a denial-of-service tool. |
+| 8 | §4.5 | Password change revoked **all** refresh tokens, including the caller's, while the caller's access token still carried `pwd_change: true`. | `change-password` starts a new family for the calling device and returns a fresh token pair with no `pwd_change` claim. | Every new user's first login would dead-end: change the password, then be unable to use anything without logging in again. That's the first experience every user has of the product. |
+| 9 | §3 | "`Secure` must be `false` for local http" was only partly true and risked `false` being copied into production. | `Secure` is a property defaulting to `true`; only the `local` profile overrides it. Noted that Chrome and Firefox accept `Secure` cookies on `http://localhost`. | Defaulting to the safe value means a missed setting in production fails safe instead of sending refresh tokens over plain http. |
+
+**Outside the plan, fixed in the same pass:**
+
+- `application.yml`: `DB_USER` no longer defaults to a personal username. A missing variable now fails at startup, the same as `DB_PASSWORD`. Committed config shouldn't carry one developer's account name, and a silent default can connect a misconfigured environment as the wrong user.
+- `.gitignore`: corrected the `projecttoverview.md` typo. The file is already tracked, so the entry has no effect until it's removed from the index with `git rm --cached`, if that's the intent.
+
+**Still open:** tests run against the real development database, because Testcontainers (M2.3) needs Docker, which isn't installed yet.

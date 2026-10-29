@@ -142,17 +142,47 @@ Explicitly **out of scope for v1**: one-to-many matching for aggregated settleme
 
 - **Java 25** — verify with `java -version`
 - No system Maven needed; use the bundled wrapper (`./mvnw`, executable)
-- Docker — not required yet, will be once PostgreSQL is wired up
+- **PostgreSQL 16** — the schema is owned by Flyway and applied on startup
+- Docker — not required yet; it becomes necessary for the Testcontainers tests in M2.3
+
+### Configure
+
+Credentials are read from a gitignored `.env` in the project root:
+
+```bash
+cp .env.example .env
+# then edit DB_USER and DB_PASSWORD
+```
+
+`application.yml` loads it with `spring.config.import: optional:file:.env[.properties]`. Real
+environment variables take precedence over the file, so CI and production supply `DB_URL`,
+`DB_USER` and `DB_PASSWORD` the usual way and never ship a `.env`.
+
+### Prepare the database
+
+The application requires a database and a role that can create tables. It does **not** run
+`CREATE DATABASE`:
+
+```bash
+createdb -h localhost -U "$DB_USER" paymentreconflow
+```
+
+Flyway applies `V1` and `V2` on first startup. Hibernate runs in `validate` mode, so a mismatch
+between the entities and the schema fails the boot rather than silently altering it.
+
+> **Local auth.** PostgreSQL must require a password. Homebrew's default `pg_hba.conf` uses
+> `trust` for localhost, which accepts any password and hides credential mistakes until
+> deployment. Set the `local` and `host` lines to `scram-sha-256` and reload:
+> `psql -c 'SELECT pg_reload_conf()'`.
 
 ### Run
 
 ```bash
-git clone <repository-url>
-cd paymentreconflow
 ./mvnw spring-boot:run
 ```
 
-The application starts on `http://localhost:8080`. It currently exposes **no endpoints** — there is no database configuration and no domain code, so a successful startup only proves the context loads.
+The application starts on `http://localhost:8080` and `/actuator/health` returns `UP`. There are
+no business endpoints yet — the next milestone adds the organization and user entities.
 
 ### Test
 
@@ -160,7 +190,8 @@ The application starts on `http://localhost:8080`. It currently exposes **no end
 ./mvnw test
 ```
 
-The only test present is the default `contextLoads` smoke test.
+The only test present is the default `contextLoads` smoke test, which needs a live database
+and a valid `.env`. It moves to Testcontainers in M2.3.
 
 ---
 

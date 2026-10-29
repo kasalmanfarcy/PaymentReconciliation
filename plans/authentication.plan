@@ -1,0 +1,395 @@
+# Authentication & Authorization — Architecture Plan
+
+**Status:** Draft (revised 2026-10-29 — see §12 for the change log) · **Tasks:** TASKS.md M3.3 (build in-house), M10.1 (migrate to Keycloak) · **Date:** 2026-10-29
+
+This is the full design for the in-house authentication built in M3.3. It's structured so that M10's move to Keycloak replaces only the parts that issue tokens.
+
+> **Revision note.** The first draft had four defects that would have surfaced during
+> implementation: a foreign-key violation in the refresh rotation, a timing side channel
+> in the lockout path, a lost-update race on the failure counter, and no counter reset
+> after a lock expired. Those are fixed below, along with the missing platform-admin
+> routes, user-management endpoints, and the schema additions §10 now requires.
+
+---
+
+## 1. Two separate questions
+
+| | Question | Answered by | Failure |
+|---|---|---|---|
+| **Authentication** | *Who are you?* | Password check, then a signed token | `401 Unauthorized` |
+| **Authorization** | *What may you do, in which organization?* | `membership` lookup, then role permissions | `403 Forbidden`, or `404` for another tenant's data |
+
+The most important rule in the design is to keep these separate. **The token proves identity only. Permissions are looked up fresh on each request.**
+
+---
+
+## 2. Components
+
+```
+Client                    Spring Boot
+(SPA / curl)
+  │  POST /auth/login     AuthController ──▶ AuthService
+  │  POST /auth/refresh                              ├─ PasswordEncoder (bcrypt)
+  │  POST /auth/logout                               ├─ LoginAttemptService (lockout)
+  │  POST /auth/change-password                      ├─ AccessTokenService ── JwtEncoder (RSA private key)
+  │                                                  └─ RefreshTokenService ── refresh_token table
+  │
+  │  GET /api/v1/...     Security filter chain
+  │  Authorization:        1. BearerTokenAuthenticationFilter
+  │   Bearer <JWT>         │     └─ JwtDecoder (RSA public key) → who (sub)
+  │  X-Organization-Id    2. TenantContextFilter  (runs after bearer auth)
+  │                        │     └─ one join: app_user ⨝ membership → org, role, authorities
+  │                        │     └─ replaces the Authentication in the SecurityContext
+  │                        3. AuthorizationFilter, then @PreAuthorize → allowed?
+  │
+  │                        Business code reads only CurrentUser / TenantContext
+```
+
+Every login event goes to `audit_event`, inside the same transaction as the change it records.
+
+---
+
+## 3. The two tokens
+
+| | Access token | Refresh token |
+|---|---|---|
+| Format | JWT, signed RS256 | 32 random bytes, base64url. It's not a JWT and has no meaning on its own |
+| Lifetime | **15 minutes** | **7 days** per token, replaced on every use. The family is capped at **30 days** by `family_expires_at`, copied on each rotation |
+| Contents | `sub` (user id), `iss`, `aud`, `iat`, `exp`, `jti` (reserved for a future denylist; unused in v1), and `pwd_change` if a password change is pending | Nothing; it's just a random value |
+| Stored on the server | **No.** It's checked by its signature alone | **Yes**, as a SHA-256 hash in `refresh_token` |
+| Where the browser keeps it | In JavaScript memory only | `HttpOnly; Secure; SameSite=Strict` cookie, scoped to `Path=/api/v1/auth` |
+| Can it be cancelled? | Not before expiry, which is why it's short | Yes: set `revoked_at` |
+
+**Why each choice:**
+
+- **Short access token plus long refresh token.** Checking the access token needs no database lookup (fast, stateless, any instance can do it). Revocation still takes effect within 15 minutes, because the refresh token can be cancelled and the access token can't outlive its 15 minutes.
+- **RS256, not HS256.** Only the component that issues tokens holds the private key; anything that checks tokens needs only the public key. In M10, Keycloak signs and the app keeps checking with the same configuration.
+- **SHA-256 for refresh tokens, but bcrypt for passwords.** A refresh token has 256 bits of randomness, so it can't be brute-forced and a fast hash is enough. Passwords are low-entropy guesses, so they need a deliberately slow hash.
+- **No roles or organization in the JWT.** If roles were in the token, removing someone's access wouldn't take effect until the token expired. The cost is **one join per request** — `app_user ⨝ membership` in a single query, not two round trips — which is cheap at about 35 req/s (see docs/scalability.md). Querying `app_user` and `membership` separately would double the per-request database cost for no benefit.
+- **The refresh token in an `HttpOnly` cookie.** JavaScript can't read it, so an XSS attack can't steal it. `SameSite=Strict` together with the narrow `Path` limits CSRF to a single endpoint.
+  - **This assumes the SPA and the API share a registrable domain.** If the browser sees them as cross-site (different domains, or some local dev setups), `SameSite=Strict` means the cookie is *never* sent. Deploy same-site, or switch to `SameSite=None` and add real CSRF tokens on `/auth/refresh` and `/auth/logout`.
+  - **`Secure` must be `false` for local http**, or the browser silently drops the cookie and refresh appears to fail with no error.
+
+---
+
+## 4. The flows
+
+### 4.1 Login
+
+```
+Client                      AuthService / DB
+  │ POST /auth/login          │ find user by lower(email)
+  │ {email, password} ───────▶│
+  │                           │ bcrypt.matches(password, hash)
+  │                           │   └─ unknown user? verify a DUMMY hash at the same cost
+  │                           │      ← so response time can't reveal which emails exist
+  │                           │
+  │                           │ if locked_until > now → 401  (checked AFTER the hash)
+  │                           │
+  │                           │ PASSWORD FAILURE
+  │                           │   atomic failed_login_count += 1   (UPDATE … RETURNING)
+  │                           │   count >= 5 → locked_until = now + 15m
+  │                           │   audit LOGIN_FAILED
+  │◀── 401 "Invalid email or password"   (identical for every failure)
+  │                           │
+  │                           │ SUCCESS
+  │                           │   reset failed_login_count, locked_until = NULL
+  │                           │   last_login_at = now()
+  │                           │   new family_id + family_expires_at
+  │                           │   store SHA-256(refresh token)
+  │                           │   sign access JWT
+  │                           │   audit LOGIN_SUCCEEDED
+  │◀── 200 {accessToken, expiresIn, memberships:[{orgId, name, role}]}
+  │     Set-Cookie: refresh_token=…; HttpOnly; Secure; SameSite=Strict
+```
+
+**Two ordering rules that are load-bearing:**
+
+- **The bcrypt check happens before any lockout branch.** Testing `locked_until` first returns in ~1 ms instead of ~250 ms — precisely the signal the dummy hash exists to remove. The dummy hash must be a real bcrypt hash at the same cost factor as production hashes, or the timing differs anyway.
+- **A locked account returns the same `401` body** as a wrong password. A distinct `423 Locked` confirms the account exists to anyone who has not guessed the password yet.
+
+**Counter semantics.** Increment atomically, never read-modify-write:
+
+```sql
+UPDATE app_user
+   SET failed_login_count = failed_login_count + 1
+ WHERE id = :id
+RETURNING failed_login_count;
+```
+
+Doing this as one statement is what prevents concurrent attempts from losing increments; a read-modify-write lets an attacker get more than five guesses. And when `locked_until` has passed, **reset the counter to 0 before evaluating the attempt** — otherwise the next single failure immediately re-locks the account, letting an attacker hold a real user locked indefinitely at one guess per window. A successful login also clears both `failed_login_count` and `locked_until`.
+
+If `must_change_password` is set, the JWT carries `pwd_change: true`. A filter then rejects every endpoint except `POST /auth/change-password` and `POST /auth/logout`.
+
+### 4.2 An authenticated request
+
+```
+GET /api/v1/exceptions
+Authorization: Bearer eyJ…
+X-Organization-Id: 7f3c…
+
+1. JwtDecoder checks the signature, exp, iss and aud      → fails: 401
+2. TenantContextFilter, one join query:
+     app_user (status ACTIVE?) ⨝ membership(user, org)    → disabled: 401
+3. Resolve the requested organization:
+     header absent + exactly one membership → use it
+     header absent + several memberships    → 400 organization_required
+     header points at a non-member org      → 404 (pretend the org doesn't exist)
+4. Role → permissions, e.g. EXCEPTION_RESOLVE; replace the Authentication
+5. AuthorizationFilter / @PreAuthorize("hasAuthority('EXCEPTION_READ')") → 403
+6. Controller, then repository: WHERE organization_id = tenant.orgId()
+```
+
+The client picks the organization with the header. Most users belong to one, in which case the header may be omitted; the login response lists every membership so a multi-org client can choose.
+
+Three cases the filter must handle explicitly, because they are where tenant bugs hide:
+
+- **User disabled mid-session.** Step 2 rejects with `401` on the next request. This is stronger than a JWT denylist and is why the status check is worth its query.
+- **User removed from an org.** The membership vanishes; the filter returns `404`, not `403`, so the org's existence isn't confirmed.
+- **Platform admin with no membership.** `is_platform_admin` alone grants **no** org access. Only `/api/v1/platform/**` matches on the `is_platform_admin` claim; every org-scoped route returns `404` for them. See §5.
+
+### 4.3 Refresh, with rotation
+
+Use one transaction with an atomic claim, so two simultaneous requests can't both use the same refresh token:
+
+```sql
+BEGIN;
+
+-- 1. Insert the replacement first. replaced_by has a foreign key to this
+--    row, so the old token cannot point at it until it exists.
+INSERT INTO refresh_token (id, user_id, family_id, token_hash,
+                           expires_at, family_expires_at)
+VALUES (:newId, :userId, :familyId, :newHash,
+        now() + interval '7 days', :familyExpiresAt);
+
+-- 2. Claim the old token atomically.
+UPDATE refresh_token
+   SET revoked_at = now(), replaced_by = :newId
+ WHERE token_hash = :hash
+   AND revoked_at IS NULL
+   AND expires_at > now()
+   AND family_expires_at > now()
+RETURNING user_id, family_id;
+
+-- 3. If step 2 updated 0 rows, ROLLBACK — that discards the insert from step 1.
+COMMIT;
+```
+
+The order matters: setting `replaced_by = :newId` before the replacement row exists is a foreign-key violation, and sequential numbered steps without a transaction leave an orphan token whenever the claim loses a race. Two concurrent refreshes both insert, exactly one wins the `UPDATE`, and the loser rolls back.
+
+- **1 row updated:** return a new access token and cookie, in the same family.
+- **0 rows:** look the hash up.
+  - **Not found or expired:** `401`.
+  - **Found but already revoked:** **reuse detected.** Someone is replaying an old token, which means either the user or an attacker holds a stolen copy. Revoke every token in that `family_id` (`SET revoked_at = now() WHERE family_id = :id AND revoked_at IS NULL`), record `REFRESH_TOKEN_REUSE`, and return `401`. Both parties have to log in again, and only the real user can.
+
+One false positive to plan for: a client that retries because the response to a successful refresh was lost looks exactly like an attacker replaying a token. Refresh must be single-flight in the client. A server-side grace window would weaken reuse detection, so it is not the default here.
+
+### 4.4 Logout
+
+Revoke the presented refresh token (or its whole family, to log out everywhere) and clear the cookie. The access token keeps working for up to 15 minutes; that's the accepted trade-off of stateless JWTs. The client also discards it from memory.
+
+### 4.5 Password change and admin actions
+
+- **Password change:** verify the old password, apply the password policy, rehash, set `must_change_password = false`, and **revoke all of the user's refresh tokens**, which logs out every other device. The caller's existing access token survives its remaining 15 minutes — the documented cost of stateless JWTs (§8).
+- **Admin password reset:** an `ORG_ADMIN` sets a new temporary password (generated server-side, shown once) and `must_change_password = true`, then revokes all refresh tokens and audits the action. This is the *only* recovery path in v1, because there is no self-service email reset and no email infrastructure. Say so in the API docs, because users will expect "forgot password" to exist.
+- **Admin disables a user:** set `status = 'DISABLED'` and revoke all refresh tokens. Step 2 of §4.2 blocks them on the next request, because the user's status is checked every time.
+- **Role change:** update `membership.role` and audit it. Nothing else is required — permissions are resolved per request, so the new role applies immediately and the old one stops working immediately.
+- **Lock semantics:** `status = 'LOCKED'` is *administrative* (an admin decided to block the account); `locked_until` is *automatic* (brute-force protection). Login must deny on either, but only the automatic one expires on its own. Never set `status = 'LOCKED'` from the lockout path.
+
+### 4.6 User-management endpoints
+
+M3.3g requires admin-created users, and these are the endpoints that make it real. The `/members` routes are org-scoped and require `MEMBER_MANAGE`; the `/platform` routes require `PLATFORM_ORG_MANAGE`.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/v1/members` | List memberships in the caller's org |
+| `POST /api/v1/members` | Create a user (or attach an existing one) with a temp password and a role |
+| `PATCH /api/v1/members/{userId}` | Change role |
+| `POST /api/v1/members/{userId}/reset-password` | Issue a new temporary password, revoke sessions |
+| `POST /api/v1/members/{userId}/disable` | Set `DISABLED`, revoke sessions |
+| `GET /api/v1/platform/organizations` | Platform admin: list orgs |
+| `POST /api/v1/platform/organizations` | Platform admin: create an org and its first `ORG_ADMIN` |
+
+Guard rails that are easy to forget:
+
+- **Never accept `role` or `organizationId` from the profile-update endpoint.** Separate request records; never bind the entity.
+- **Refuse to demote or disable the last `ORG_ADMIN`** in an org (`409` plus audit), or the tenant becomes unadministrable.
+- **Bootstrap the first org and admin** for non-local environments with an idempotent, audited startup runner gated to a one-time env flag. M3.8's seeder is local-only and cannot be the production path.
+
+---
+
+## 5. Authorization: roles to permissions
+
+Code checks permissions, never role names. That way, changing what a role can do is a one-line change in a single file.
+
+| Permission | VIEWER | UPLOADER | INVESTIGATOR | ORG_ADMIN |
+|---|---|---|---|---|
+| `IMPORT_READ`, `TRANSACTION_READ`, `REPORT_READ`, `EXCEPTION_READ` | ✓ | ✓ | ✓ | ✓ |
+| `IMPORT_CREATE` | | ✓ | | ✓ |
+| `RUN_CREATE` | | ✓ | ✓ | ✓ |
+| `EXCEPTION_UPDATE` (assign, add notes) | | | ✓ | ✓ |
+| `EXCEPTION_RESOLVE` | | | ✓ | ✓ |
+| `EXCEPTION_REOPEN` | | | | ✓ |
+| `MEMBER_MANAGE` | | | | ✓ |
+| `AUDIT_READ` | | | | ✓ |
+
+Platform admins (`is_platform_admin`) only manage organizations. They don't automatically get access to tenants' financial data.
+
+| Permission | Scope | Notes |
+|---|---|---|
+| `PLATFORM_ORG_MANAGE` | `/api/v1/platform/**` only | Granted solely by the `is_platform_admin` claim. There is no org context on these routes, so `TenantContextFilter` must pass them through without a membership lookup. |
+
+This is the one place a missing authorization check would be catastrophic, so the rule is explicit: **`is_platform_admin` never satisfies an org-scoped permission.** The two permission sets are disjoint, and a test asserts that a platform-admin token gets `404` (not `200`) on every org-scoped route.
+
+---
+
+## 6. Spring Security wiring
+
+```java
+http
+  .sessionManagement(s -> s.sessionCreationPolicy(STATELESS))
+  .csrf(c -> c.disable())          // bearer-token API; the refresh cookie is protected by SameSite + Path
+  .authorizeHttpRequests(a -> a
+      .requestMatchers(POST, "/api/v1/auth/login", "/api/v1/auth/refresh").permitAll()
+      .requestMatchers(POST, "/api/v1/auth/logout").permitAll()   // authenticated by the cookie, not a bearer
+      .requestMatchers("/actuator/health/**").permitAll()
+      .requestMatchers("/api/v1/platform/**").hasAuthority("PLATFORM_ORG_MANAGE")
+      .anyRequest().authenticated())
+  .oauth2ResourceServer(o -> o.jwt(Customizer.withDefaults()))
+  .addFilterAfter(tenantContextFilter, BearerTokenAuthenticationFilter.class);
+```
+
+**Do not put the org/role lookup in `jwtAuthenticationConverter`.** That converter receives only the `Jwt`, never the `HttpServletRequest`, so it cannot read `X-Organization-Id`. `TenantContextFilter` has the request, does the single join from §4.2, and **replaces the `Authentication`** in the `SecurityContext` with one whose authorities come from `RolePermissions`. `AuthorizationFilter` runs after this filter, so both the URL rules above and `@PreAuthorize` see the replaced authentication.
+
+The filter must also skip the public paths (login, refresh, logout, health) and `/api/v1/platform/**`. Running it on those routes either 404s a legitimate request or requires an org that doesn't exist.
+
+Dependency: `spring-boot-starter-oauth2-resource-server`. It brings `spring-security-oauth2-jose`, which supplies `NimbusJwtEncoder`/`NimbusJwtDecoder` — no JWT is ever parsed by hand.
+
+**Package layout:**
+
+```
+security/
+  config/     SecurityConfig, JwtKeyConfig
+  auth/       AuthController, AuthService, LoginAttemptService, PasswordPolicy
+  token/      AccessTokenService, RefreshTokenService, TokenHasher
+  tenant/     TenantContext, TenantContextFilter, CurrentUser
+  authz/      Permission, RolePermissions
+```
+
+The architecture tests (M2.9) should enforce that no code outside `security/` imports anything from `security.auth` or `security.token`.
+
+---
+
+## 7. Keys and secrets
+
+- RSA-2048 key pair. The private key comes from an environment variable or a mounted file, **never from the repo**. For local development, generate it at startup with a `local`-profile-only bean, and log a warning that tokens die on restart.
+- **Fail fast at startup** if the key is missing in any non-local profile. A service that boots without a signing key and only fails on the first login is a deployment trap.
+- Every JWT carries a `kid` (key ID) header. To rotate keys: start signing with the new key, keep accepting the old public key for 15 minutes, then remove it. The decoder accepts a set, not a single key.
+- `iss` and `aud` are configured values (e.g. `reconflow` / `reconflow-api`), not hard-coded strings, and the decoder validates both. Allow a small clock skew (30–60 s) so a slightly fast issuer doesn't reject everything.
+
+---
+
+## 8. Attacks covered, and the trade-offs
+
+| Threat | Defense | Trade-off to know |
+|---|---|---|
+| Guessing a password | Lockout after 5 failures, plus a rate limit per IP | An attacker can lock real users out on purpose, so the lock is temporary (15 min), never permanent. The rate limiter is in-memory per instance, so two API instances allow twice the configured rate |
+| Finding out which emails have accounts | Identical status and error text, a dummy bcrypt hash at the same cost factor for unknown users, and the password check runs **before** the lockout branch | Slightly slower failed logins. The dummy hash must be regenerated whenever the cost factor changes, or the timing gap returns |
+| A stolen access token | 15-minute lifetime | Can't be cancelled early |
+| A stolen refresh token | Replaced on every use; reuse cancels the whole chain | Two browser tabs, or a client retrying a lost response, can look like reuse and log the user out. Fix with single-flight refresh in the client, not a server-side grace window |
+| XSS reading tokens | Refresh token is `HttpOnly`; access token lives only in memory | An XSS attack can still make calls while the page is open |
+| A database leak | bcrypt passwords and hashed refresh tokens | None |
+| Forged tokens | RS256 signature, plus `iss`/`aud` checks | The private key must be protected |
+| Reading another tenant's data | Membership check plus `organization_id` filters plus RLS | Returning 404 instead of 403 makes debugging harder |
+
+**Password policy (NIST 800-63B):** at least 12 characters, no forced composition rules, no forced periodic changes. Optionally reject passwords that appear in known breach lists.
+
+Three implementation details that carry the whole argument:
+
+- **Maximum 72 bytes.** bcrypt silently truncates past 72 bytes, so without a cap two different long passwords can authenticate each other. Reject longer input with `400`, and count UTF-8 bytes rather than characters.
+- **Cost factor 12**, measured at roughly 250 ms per hash on the target hardware. Record the measurement and the machine in the ADR — the security argument depends on that number, and so does the timing equalisation above.
+- **Hash upgrade on login.** `DelegatingPasswordEncoder` writes a `{bcrypt}` prefix, which is what allows the algorithm and cost to change later. On every successful login, call `upgradeEncoding(hash)` and rehash when it returns true. Without this, raising the cost factor would require a mass password reset.
+
+---
+
+## 9. What changes in M10 (moving to Keycloak)
+
+| Removed | Stays the same |
+|---|---|
+| `AuthController`, `AuthService`, `LoginAttemptService` | `TenantContextFilter`, `membership`, `RolePermissions` |
+| `AccessTokenService`, `RefreshTokenService`, the RSA key pair | `@PreAuthorize` checks and every business module |
+| `refresh_token` table and `password_hash` column | `CurrentUser` / `TenantContext` interfaces |
+
+> **Drop those two in a second migration, one release after cutover.** Dropping them in the same deploy removes the rollback path: if the Keycloak integration fails, there is no stored password left to fall back to.
+
+Configuration changes from a local public key to `spring.security.oauth2.resourceserver.jwt.issuer-uri` (Keycloak's URL), and `app_user` gains an `external_subject` column linking each user to their Keycloak `sub`. If anything outside `security/` has to change, that's the lesson M10 is designed to surface.
+
+---
+
+## 10. Schema support
+
+`V1__initial_schema.sql` already carries most of M3.3:
+
+- `app_user`: `password_hash`, `status`, `must_change_password`, `failed_login_count`, `locked_until`, `last_login_at`, `is_platform_admin`
+- `membership`: `(user_id, organization_id)`, `role`
+- `refresh_token`: `token_hash`, `family_id`, `expires_at`, `revoked_at`, `replaced_by`
+- `audit_event`: login, lockout, refresh-reuse and logout events
+
+**One migration is still required.** An earlier draft of this plan said none was — that was only true for tenant binding, which the `X-Organization-Id` header now handles. Three things are genuinely missing:
+
+```sql
+-- V2__auth_hardening.sql
+ALTER TABLE refresh_token ADD COLUMN family_expires_at TIMESTAMPTZ NOT NULL;
+ALTER TABLE refresh_token ADD COLUMN revoked_reason TEXT
+    CHECK (revoked_reason IN ('ROTATED', 'LOGOUT', 'REUSE_DETECTED',
+                              'PASSWORD_CHANGED', 'ADMIN_REVOKED', 'USER_DISABLED'));
+CREATE INDEX refresh_token_expiry_idx ON refresh_token (expires_at) WHERE revoked_at IS NULL;
+```
+
+`family_expires_at` can be `NOT NULL` without a default here because `refresh_token` is empty until M3.3 ships. If that stops being true, backfill first and then add the constraint.
+
+- `family_expires_at` is what makes the 30-day cap in §3 enforceable. Without it the cap cannot be computed after a rotation, because the family root is no longer the presented row.
+- `revoked_reason` separates rotation, logout, reuse and admin revocation. `replaced_by` distinguishes only "rotated" from "not rotated", which is not enough for the audit trail M3.3h asks for.
+- The partial index supports the expiry sweeper below.
+
+Two operational gaps belong to M3.3 even though they are not schema changes:
+
+- **A refresh-token sweeper** deleting rows where `expires_at < now() - interval '30 days'`. Without it the table grows without bound.
+- **Bootstrap** of the first organization and `ORG_ADMIN` in any non-local environment (§4.6). The M3.8 seeder is local-only and cannot be the production path.
+
+---
+
+## 11. Interview questions this prepares you for
+
+1. Sessions vs JWTs: why can't a JWT be cancelled, and how do short lifetimes plus refresh tokens make up for it?
+2. Why rotate refresh tokens, and how does reuse detection catch a stolen one?
+3. Why bcrypt for passwords but SHA-256 for refresh tokens?
+4. RS256 vs HS256, and how do you rotate signing keys?
+5. Where should a browser keep tokens (localStorage, cookie or memory), and what's the XSS vs CSRF trade-off?
+6. Why not put roles in the JWT?
+7. 401 vs 403 vs 404, and why return 404 for another tenant's data?
+8. How can a login form leak which accounts exist (the error message and response time), and how do you stop it?
+9. Lockout vs rate limiting, and how lockout can itself be abused?
+10. Why must the password hash be checked before the lockout check, and what does that cost?
+11. Why does a foreign key on `replaced_by` force the insert to happen before the update during rotation?
+12. What happens to a user locked out for 15 minutes — and what breaks if the failure counter isn't reset when the lock expires?
+
+---
+
+## 12. Change log
+
+**2026-10-29 — review pass.** Corrections that change behaviour:
+
+| Area | Change |
+|---|---|
+| §4.3 | Rotation now inserts before updating, inside one transaction. `replaced_by` has an FK to the new row, so the original statement order was a guaranteed violation. A lost race now rolls back the orphan insert. |
+| §4.1 | bcrypt runs **before** the lockout branch. The original order returned in ~1 ms for a locked account and re-created the timing oracle the dummy hash exists to remove. Locked accounts also return the same `401`. |
+| §4.1 | `failed_login_count` increments atomically via `UPDATE … RETURNING`; the counter and `locked_until` are cleared on success and on an expired lock. The original read-modify-write lost increments, and an unreset counter allowed indefinite re-locking at one guess per window. |
+| §3, §10 | The 30-day family cap now has a `family_expires_at` column, plus `revoked_reason` and a partial expiry index. The plan no longer claims "no migration needed". |
+| §2, §6 | The org/role lookup is unambiguously in `TenantContextFilter`, which replaces the `Authentication`; `jwtAuthenticationConverter` is removed because it has no access to the request header. |
+| §4.2 | Defined the missing-header cases (`400` vs defaulting to a single membership) and the platform-admin path. |
+| §4.5, §4.6 | Added admin password reset, role change, `LOCKED` vs `locked_until` semantics, the user-management endpoint table, last-admin protection, and non-local bootstrap. |
+| §5 | Added `PLATFORM_ORG_MANAGE` and the rule that `is_platform_admin` never satisfies an org-scoped permission. |
+| §8 | Added the 72-byte bcrypt cap, cost factor 12, `upgradeEncoding`, the in-memory rate-limit caveat, and the client-retry false positive on reuse detection. |
+| §7 | Fail-fast key loading, `iss`/`aud` as configuration, clock skew. |
+| §9 | Defer dropping `password_hash` and `refresh_token` by one release for rollback. |

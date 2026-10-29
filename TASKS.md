@@ -93,7 +93,17 @@ Tenant isolation comes before any financial data exists, not after.
 
 - [ ] **M3.1** Write a migration and entity for `organization`.
 - [ ] **M3.2** Write a migration and entity for `app_user`, plus user–organization membership with a role: `ORG_ADMIN`, `INVESTIGATOR`, `UPLOADER`, `VIEWER`.
-- [ ] **M3.3** Authentication: HTTP Basic or form login for v1. Document the path to JWT/OIDC in an ADR.
+- [ ] **M3.3** Authentication, built in-house as a learning exercise (ADR: why we build it, and what we'd delegate in production). Spring Security does the cryptography; we never hand-roll hashing or JWT parsing.
+  - [ ] **M3.3a** Password storage: `DelegatingPasswordEncoder` (bcrypt). Document the cost factor and how stored hashes get upgraded.
+  - [ ] **M3.3b** `POST /api/v1/auth/login` issues a short-lived access JWT (15 min), signed with `NimbusJwtEncoder` (RS256), plus a refresh token.
+  - [ ] **M3.3c** Refresh tokens: random, stored **hashed** in `refresh_token`, rotated on every use, with reuse detection that revokes the whole token family.
+  - [ ] **M3.3d** `POST /api/v1/auth/refresh` and `POST /api/v1/auth/logout` (revokes the refresh token).
+  - [ ] **M3.3e** Configure the app as an OAuth2 resource server that validates our own JWTs. The same config later accepts Keycloak's tokens (M10.1).
+  - [ ] **M3.3f** Brute-force protection: lock the account after 5 failures, return the same error for an unknown user and a wrong password, and rate-limit the login endpoint.
+  - [ ] **M3.3g** Users are created by an admin with a temporary password and must change it on first login. No public sign-up.
+  - [ ] **M3.3h** Record login success, failure, lockout, refresh-token reuse and logout in `audit_event`.
+  - [ ] **M3.3i** All code reads identity only through `CurrentUser` / `TenantContext`, never from the `SecurityContext` directly.
+  - [ ] **M3.3j** Tests: an expired token gives `401`, a tampered signature gives `401`, a reused refresh token revokes its family, lockout triggers after N failures, and the error messages for unknown user and wrong password are identical.
 - [ ] **M3.4** Tenant context: resolve the caller's `organizationId` once per request and expose it through a request-scoped bean.
 - [ ] **M3.5** Repository convention: every tenant-owned query takes `organizationId`. Add an ArchUnit rule or a review checklist item for it.
 - [ ] **M3.6** Return `404` (not `403`) for another tenant's resource IDs, so IDs can't be probed.
@@ -266,7 +276,7 @@ Built early so later milestones emit events as they go, instead of retrofitting 
 
 ## M10 — Security hardening
 
-- [ ] **M10.1** Replace Basic auth with JWT or OIDC (e.g. a Keycloak container in Compose).
+- [ ] **M10.1** Migrate login to OIDC with a Keycloak container in Compose. Only the security package should change; if anything outside it has to change, that's a design lesson worth writing down. Write a comparison ADR covering what we built in M3.3, what Keycloak gives us, and what each costs.
 - [ ] **M10.2** CSV injection protection on export: escape cells that start with `=`, `+`, `-` or `@`.
 - [ ] **M10.3** Upload limits enforced at the servlet level as well as in code.
 - [ ] **M10.4** Rate limiting on the upload and run endpoints.

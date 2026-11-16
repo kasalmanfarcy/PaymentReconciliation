@@ -105,7 +105,9 @@ public class ExactReferenceStrategy implements MatchingStrategy {
                 counterpartNotSuccess.contains(new GroupKey(group.normalizedReference(), group.transactionType()))
                         ? ReasonCodes.COUNTERPART_NOT_SUCCESS
                         : null;
-            default -> null;
+            // Docs (rules §5.2) name these; the plan had no duplicate reason codes.
+            case DUPLICATE_IN_SOURCE -> group.sameAmount() ? ReasonCodes.SAME_AMOUNT : ReasonCodes.DIFFERENT_AMOUNTS;
+            case AMOUNT_MISMATCH, CURRENCY_MISMATCH -> null;
         };
     }
 
@@ -116,6 +118,9 @@ public class ExactReferenceStrategy implements MatchingStrategy {
             throw new EngineInvariantViolation("group " + group.normalizedReference() + " has no records");
         }
         ExceptionType type = ExceptionType.valueOf(group.outcome());
+        // The amount at stake: the ledger's figure when there is one (the business's own record),
+        // else the gateway's. For a duplicate, the smallest such amount: a value to filter on,
+        // not a total of the linked records.
         BigDecimal amount = group.ledgerAmount() != null ? group.ledgerAmount() : group.gatewayAmount();
         @Nullable
         BigDecimal difference = type == ExceptionType.AMOUNT_MISMATCH

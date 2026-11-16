@@ -29,8 +29,11 @@ import org.springframework.test.web.servlet.request.AbstractMockHttpServletReque
  */
 class AuthorizationMatrixIT extends AbstractIntegrationTest {
 
+    /** What a request may aim at, all in the caller's organization: a member and a FAILED import. */
+    record Target(UUID userId, UUID batchId) {}
+
     record Endpoint(
-            String name, Permission required, Function<UUID, AbstractMockHttpServletRequestBuilder<?>> request) {
+            String name, Permission required, Function<Target, AbstractMockHttpServletRequestBuilder<?>> request) {
         @Override
         public String toString() {
             return name;
@@ -49,17 +52,17 @@ class AuthorizationMatrixIT extends AbstractIntegrationTest {
         new Endpoint(
                 "PATCH /members/{userId}",
                 Permission.MEMBER_MANAGE,
-                target -> patch("/api/v1/members/" + target)
+                target -> patch("/api/v1/members/" + target.userId())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"role\":\"UPLOADER\"}")),
         new Endpoint(
                 "POST /members/{userId}/reset-password",
                 Permission.MEMBER_MANAGE,
-                target -> post("/api/v1/members/" + target + "/reset-password")),
+                target -> post("/api/v1/members/" + target.userId() + "/reset-password")),
         new Endpoint(
                 "POST /members/{userId}/disable",
                 Permission.MEMBER_MANAGE,
-                target -> post("/api/v1/members/" + target + "/disable")),
+                target -> post("/api/v1/members/" + target.userId() + "/disable")),
         new Endpoint(
                 "POST /imports",
                 Permission.IMPORT_CREATE,
@@ -72,6 +75,11 @@ class AuthorizationMatrixIT extends AbstractIntegrationTest {
                                                 + ",1.00,AED,SUCCESS,2026-10-01\n")
                                         .getBytes(StandardCharsets.UTF_8)))
                         .param("sourceType", "INTERNAL_LEDGER")),
+        new Endpoint("GET /imports/{id}", Permission.IMPORT_READ, target -> get("/api/v1/imports/" + target.batchId())),
+        new Endpoint(
+                "GET /imports/{id}/errors",
+                Permission.IMPORT_READ,
+                target -> get("/api/v1/imports/" + target.batchId() + "/errors")),
     };
 
     static Stream<Arguments> endpointByRole() {
@@ -85,9 +93,10 @@ class AuthorizationMatrixIT extends AbstractIntegrationTest {
         data().newMember(org, Role.ORG_ADMIN); // so demoting or disabling the caller is never "last admin"
         var caller = data().newMember(org, role);
         var target = data().newMember(org, Role.VIEWER);
+        UUID batch = data().newImportBatch(org, target.id(), "GATEWAY", "FAILED");
 
         MockHttpServletResponse response = mockMvc.perform(
-                        endpoint.request().apply(target.id()).with(as(caller.id())))
+                        endpoint.request().apply(new Target(target.id(), batch)).with(as(caller.id())))
                 .andReturn()
                 .getResponse();
 

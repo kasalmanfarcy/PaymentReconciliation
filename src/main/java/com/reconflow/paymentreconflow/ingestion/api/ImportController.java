@@ -1,14 +1,20 @@
 package com.reconflow.paymentreconflow.ingestion.api;
 
+import com.reconflow.paymentreconflow.ingestion.application.ImportQueries;
 import com.reconflow.paymentreconflow.ingestion.application.ImportReceiver;
 import com.reconflow.paymentreconflow.ingestion.application.ImportView;
+import com.reconflow.paymentreconflow.ingestion.application.RowErrorView;
 import com.reconflow.paymentreconflow.ledger.SourceType;
 import com.reconflow.paymentreconflow.shared.context.Permission;
 import com.reconflow.paymentreconflow.shared.context.RequiresPermission;
 import java.net.URI;
+import java.util.UUID;
 import org.jspecify.annotations.Nullable;
+import org.springframework.data.web.PagedModel;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -28,9 +34,11 @@ class ImportController {
     static final String RETRY_AFTER_SECONDS = "2";
 
     private final ImportReceiver receiver;
+    private final ImportQueries queries;
 
-    ImportController(ImportReceiver receiver) {
+    ImportController(ImportReceiver receiver, ImportQueries queries) {
         this.receiver = receiver;
+        this.queries = queries;
     }
 
     /**
@@ -48,5 +56,30 @@ class ImportController {
                 .location(URI.create("/api/v1/imports/" + batch.id()))
                 .header("Retry-After", RETRY_AFTER_SECONDS)
                 .body(batch);
+    }
+
+    /** Cheap to poll: one primary-key lookup and one index count. */
+    @GetMapping("/{id}")
+    @RequiresPermission(Permission.IMPORT_READ)
+    ResponseEntity<ImportView> get(@PathVariable UUID id) {
+        return withRetryAfter(queries.get(id));
+    }
+
+    @GetMapping("/{id}/errors")
+    @RequiresPermission(Permission.IMPORT_READ)
+    PagedModel<RowErrorView> errors(
+            @PathVariable UUID id,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "50") int size) {
+        return new PagedModel<>(queries.errors(id, page, size));
+    }
+
+    /** {@code Retry-After: 2} while the batch is RECEIVED or PROCESSING: how often to poll. */
+    static ResponseEntity<ImportView> withRetryAfter(ImportView batch) {
+        ResponseEntity.BodyBuilder ok = ResponseEntity.ok();
+        if (!batch.status().isTerminal()) {
+            ok.header("Retry-After", RETRY_AFTER_SECONDS);
+        }
+        return ok.body(batch);
     }
 }

@@ -37,8 +37,9 @@ public interface ImportBatchRepository extends Repository<ImportBatch, UUID> {
     /**
      * Advances the checkpoint and the counters in the chunk's own transaction, together with the
      * chunk's rows: one SQL statement, so a stale copy of the entity can never overwrite them, and
-     * after any crash they are exactly right. Zero rows updated means the batch isn't PROCESSING
-     * any more; the caller must roll the chunk back.
+     * after any crash they are exactly right. A compare-and-set on {@code previousRow} (M9.3): zero
+     * rows updated means the batch isn't PROCESSING any more, or the checkpoint already moved (a
+     * retried commit whose first attempt did land; see {@link #findLastCommittedRow}).
      */
     @Modifying(flushAutomatically = true, clearAutomatically = true)
     @Query(value = """
@@ -47,13 +48,21 @@ public interface ImportBatchRepository extends Repository<ImportBatch, UUID> {
                            valid_rows = valid_rows + :validRows, error_rows = error_rows + :errorRows,
                            updated_at = now()
                      WHERE id = :id AND organization_id = :organizationId AND status = 'PROCESSING'
+                       AND last_committed_row = :previousRow
                     """, nativeQuery = true)
     int recordChunk(
             @Param("id") UUID id,
             @Param("organizationId") UUID organizationId,
+            @Param("previousRow") int previousRow,
             @Param("lastRow") int lastRow,
             @Param("validRows") int validRows,
             @Param("errorRows") int errorRows);
+
+    /** The checkpoint as committed, read with SQL (the chunk path never loads the entity). */
+    @Query(
+            value = "SELECT last_committed_row FROM import_batch WHERE id = :id AND organization_id = :organizationId",
+            nativeQuery = true)
+    Optional<Integer> findLastCommittedRow(@Param("id") UUID id, @Param("organizationId") UUID organizationId);
 
     /**
      * Batches still RECEIVED or PROCESSING that haven't changed for {@code minAgeSeconds}: the

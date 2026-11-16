@@ -12,6 +12,9 @@ import java.util.List;
  */
 public record DayResult(int matchesInserted, BigDecimal matchedAmount, List<Discrepancy> discrepancies) {
 
+    /** A day whose chunk an earlier attempt of this same transaction already committed (M9.3). */
+    public static final DayResult ALREADY_COMMITTED = new DayResult(0, BigDecimal.ZERO, List.of());
+
     public DayResult {
         discrepancies = List.copyOf(discrepancies);
     }

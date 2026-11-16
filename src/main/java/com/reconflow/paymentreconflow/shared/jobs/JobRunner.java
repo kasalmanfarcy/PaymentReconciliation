@@ -19,10 +19,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
 import org.springframework.beans.factory.ObjectProvider;
-import org.springframework.dao.RecoverableDataAccessException;
-import org.springframework.dao.TransientDataAccessException;
 import org.springframework.stereotype.Component;
-import org.springframework.transaction.CannotCreateTransactionException;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
@@ -182,11 +179,9 @@ public class JobRunner {
         }
     }
 
+    /** The same classifier as the in-process layer ({@link TransientFailures}), M9.3. */
     static boolean isTransient(Throwable e) {
-        return e instanceof TransientJobFailure
-                || e instanceof TransientDataAccessException
-                || e instanceof RecoverableDataAccessException
-                || e instanceof CannotCreateTransactionException;
+        return TransientFailures.isTransient(e);
     }
 
     /**

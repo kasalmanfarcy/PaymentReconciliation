@@ -4,10 +4,13 @@ import com.reconflow.paymentreconflow.exceptions.DiscrepancyRecorder;
 import com.reconflow.paymentreconflow.reconciliation.engine.DayResult;
 import com.reconflow.paymentreconflow.reconciliation.engine.MatchingStrategy;
 import com.reconflow.paymentreconflow.reconciliation.engine.RunContext;
+import com.reconflow.paymentreconflow.shared.fault.FaultInjector;
+import com.reconflow.paymentreconflow.shared.fault.FaultPoints;
 import com.reconflow.paymentreconflow.shared.jobs.Job;
 import com.reconflow.paymentreconflow.shared.jobs.JobContext;
 import com.reconflow.paymentreconflow.shared.jobs.JobDeferredException;
 import com.reconflow.paymentreconflow.shared.jobs.JobStoppedException;
+import com.reconflow.paymentreconflow.shared.jobs.TransientRetry;
 import java.time.Duration;
 import java.time.LocalDate;
 import java.util.UUID;
@@ -46,28 +49,37 @@ public class RunExecutor {
     private final MatchingStrategy strategy;
     private final DiscrepancyRecorder discrepancies;
     private final RunChunkHook hook;
+    private final TransientRetry retry;
+    private final FaultInjector faults;
 
     RunExecutor(
             TransactionTemplate tx,
             RunLifecycle lifecycle,
             MatchingStrategy strategy,
             DiscrepancyRecorder discrepancies,
-            RunChunkHook hook) {
+            RunChunkHook hook,
+            TransientRetry retry,
+            FaultInjector faults) {
         this.tx = tx;
         this.lifecycle = lifecycle;
         this.strategy = strategy;
         this.discrepancies = discrepancies;
         this.hook = hook;
+        this.retry = retry;
+        this.faults = faults;
     }
 
     /** Runs (or resumes) the job's run. The job's organization is already bound (JobRunner). */
     public void execute(Job job, JobContext context) {
         UUID organizationId = job.organizationId();
         UUID runId = job.uuid(ReconcileJobs.RUN_ID);
-        RunLifecycle.Start start = tx.execute(s -> {
-            context.fence();
-            return lifecycle.start(organizationId, runId);
-        });
+        // Every transaction below is wrapped by the in-process retry (M9.3), never the reverse.
+        RunLifecycle.Start start = retry.call(
+                "reconcile.start",
+                () -> tx.execute(s -> {
+                    context.fence();
+                    return lifecycle.start(organizationId, runId);
+                }));
         switch (start) {
             case RunLifecycle.Start.Skip skip -> {} // the runner marks the job DONE
             case RunLifecycle.Start.Defer defer -> throw new JobDeferredException(IMPORT_WAIT, "import-in-progress");
@@ -79,16 +91,21 @@ public class RunExecutor {
         for (LocalDate day = firstDay; !day.isAfter(run.periodEnd()); day = day.plusDays(1)) {
             LocalDate d = day;
             context.ensureLeaseHeld();
-            DayResult result = tx.execute(s -> {
-                lifecycle.lockForChunk(run, d); // fence 1: the checkpoint is where we expect
-                context.fence(); // fence 2: we still hold the job's lease (and extend it)
-                DayResult r = strategy.reconcileDay(run, d);
-                discrepancies.record(run.organizationId(), run.runId(), d, r.discrepancies());
-                lifecycle.recordDay(run, d, r); // M8.1: the day's totals, for date-range reports
-                hook.beforeCheckpoint(run.runId(), d);
-                lifecycle.advanceCheckpoint(run, d);
-                return r;
-            });
+            DayResult result = retry.call(
+                    "reconcile.day",
+                    () -> tx.execute(s -> {
+                        context.fence(); // fence 1: we still hold the job's lease (and extend it)
+                        if (!lifecycle.lockForChunk(run, d)) { // fence 2: the checkpoint is where we expect
+                            return DayResult.ALREADY_COMMITTED; // our own retried commit had landed
+                        }
+                        DayResult r = strategy.reconcileDay(run, d);
+                        discrepancies.record(run.organizationId(), run.runId(), d, r.discrepancies());
+                        lifecycle.recordDay(run, d, r); // M8.1: the day's totals, for date-range reports
+                        hook.beforeCheckpoint(run.runId(), d);
+                        lifecycle.advanceCheckpoint(run, d);
+                        return r;
+                    }));
+            faults.at(FaultPoints.RECONCILE_AFTER_DAY_COMMIT);
             log.debug(
                     "Run {} day {}: {} matches, {} discrepancies",
                     run.runId(),
@@ -99,11 +116,15 @@ public class RunExecutor {
                 throw new JobStoppedException(); // hand back at a chunk boundary
             }
         }
-        // The summary, the COMPLETED status, its audit event and the job's DONE: all or nothing.
-        tx.executeWithoutResult(s -> {
-            context.fence();
-            lifecycle.complete(run);
-            context.complete();
-        });
+        faults.at(FaultPoints.RECONCILE_BEFORE_SUMMARY);
+        // The summary, the COMPLETED status, its audit event and the job's DONE: all or nothing. A
+        // retry after a commit that did land fails the fence (the job is DONE): nothing is redone.
+        retry.run(
+                "reconcile.complete",
+                () -> tx.executeWithoutResult(s -> {
+                    context.fence();
+                    lifecycle.complete(run);
+                    context.complete();
+                }));
     }
 }

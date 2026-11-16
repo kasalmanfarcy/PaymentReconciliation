@@ -117,9 +117,13 @@ public class RunLifecycle {
      * Fencing for a day-chunk: locks the run row and checks it is RUNNING with its checkpoint on
      * the previous day. A worker whose view is stale (another one moved the run on) stops here,
      * before writing anything; the row lock also serializes two workers on one run.
+     *
+     * @return false if the checkpoint is already on {@code day}: this worker's own retried commit
+     *     whose first attempt did land (a connection lost during COMMIT, M9.3), so the day is done.
+     *     Only reachable after the caller's lease fence passed, so it is never someone else's day.
      */
     @Transactional(propagation = Propagation.MANDATORY)
-    public void lockForChunk(RunContext run, LocalDate day) {
+    public boolean lockForChunk(RunContext run, LocalDate day) {
         Map<String, Object> row = jdbc.sql(LOCK_RUN_FOR_CHUNK)
                 .param("runId", run.runId())
                 .param("org", run.organizationId())
@@ -129,9 +133,13 @@ public class RunLifecycle {
         LocalDate checkpoint =
                 row.get("last_completed_date") == null ? null : ((Date) row.get("last_completed_date")).toLocalDate();
         LocalDate expected = day.equals(run.periodStart()) ? null : day.minusDays(1);
+        if (RunStatus.RUNNING.name().equals(status) && day.equals(checkpoint)) {
+            return false;
+        }
         if (!RunStatus.RUNNING.name().equals(status) || !Objects.equals(checkpoint, expected)) {
             throw new StaleRunOwnershipException(run.runId(), day, status, checkpoint);
         }
+        return true;
     }
 
     /** The checkpoint, in the chunk's transaction, by SQL (see the class comment). */

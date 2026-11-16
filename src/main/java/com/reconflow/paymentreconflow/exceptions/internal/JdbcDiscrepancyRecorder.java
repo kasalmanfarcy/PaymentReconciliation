@@ -9,6 +9,8 @@ import com.reconflow.paymentreconflow.exceptions.DiscrepancyRecorder;
 import com.reconflow.paymentreconflow.exceptions.ExceptionType;
 import com.reconflow.paymentreconflow.exceptions.RecordRef;
 import com.reconflow.paymentreconflow.exceptions.RunExceptionSummary;
+import com.reconflow.paymentreconflow.shared.fault.FaultInjector;
+import com.reconflow.paymentreconflow.shared.fault.FaultPoints;
 import com.reconflow.paymentreconflow.shared.id.Ids;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
@@ -103,11 +105,13 @@ class JdbcDiscrepancyRecorder implements DiscrepancyRecorder {
     private final JdbcClient sql;
     private final JdbcTemplate jdbc;
     private final AuditService audit;
+    private final FaultInjector faults;
 
-    JdbcDiscrepancyRecorder(JdbcClient sql, JdbcTemplate jdbc, AuditService audit) {
+    JdbcDiscrepancyRecorder(JdbcClient sql, JdbcTemplate jdbc, AuditService audit, FaultInjector faults) {
         this.sql = sql;
         this.jdbc = jdbc;
         this.audit = audit;
+        this.faults = faults;
     }
 
     @Override
@@ -124,6 +128,8 @@ class JdbcDiscrepancyRecorder implements DiscrepancyRecorder {
             CaseId found = createOrFind(organizationId, runId, d);
             if (found.created()) {
                 created++;
+                // M9.4: the case exists but not its history: one transaction, so nothing partial survives.
+                faults.at(FaultPoints.EXCEPTIONS_AFTER_CASE_INSERT);
                 sql.sql(INSERT_HISTORY)
                         .param("id", Ids.newId())
                         .param("org", organizationId)

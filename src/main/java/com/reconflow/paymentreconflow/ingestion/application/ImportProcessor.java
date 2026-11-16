@@ -14,11 +14,14 @@ import com.reconflow.paymentreconflow.ingestion.validation.RowValidation;
 import com.reconflow.paymentreconflow.ingestion.validation.RowValidator;
 import com.reconflow.paymentreconflow.ledger.SourceType;
 import com.reconflow.paymentreconflow.ledger.TransactionRecordWriter;
+import com.reconflow.paymentreconflow.shared.fault.FaultInjector;
+import com.reconflow.paymentreconflow.shared.fault.FaultPoints;
 import com.reconflow.paymentreconflow.shared.jobs.Job;
 import com.reconflow.paymentreconflow.shared.jobs.JobContext;
 import com.reconflow.paymentreconflow.shared.jobs.JobStoppedException;
 import com.reconflow.paymentreconflow.shared.jobs.PermanentJobFailure;
 import com.reconflow.paymentreconflow.shared.jobs.TransientJobFailure;
+import com.reconflow.paymentreconflow.shared.jobs.TransientRetry;
 import com.reconflow.paymentreconflow.shared.storage.FileStorage;
 import com.reconflow.paymentreconflow.shared.storage.StoredFileMissingException;
 import java.io.IOException;
@@ -26,6 +29,7 @@ import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
+import java.util.Optional;
 import java.util.UUID;
 import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
@@ -67,6 +71,8 @@ public class ImportProcessor {
     private final ImportProcessingHook hook;
     private final ImportOutcomes outcomes;
     private final TransactionTemplate tx;
+    private final TransientRetry retry;
+    private final FaultInjector faults;
     private final Clock clock;
 
     ImportProcessor(
@@ -81,6 +87,8 @@ public class ImportProcessor {
             ImportProcessingHook hook,
             ImportOutcomes outcomes,
             TransactionTemplate tx,
+            TransientRetry retry,
+            FaultInjector faults,
             Clock clock) {
         this.batches = batches;
         this.errors = errors;
@@ -93,6 +101,8 @@ public class ImportProcessor {
         this.hook = hook;
         this.outcomes = outcomes;
         this.tx = tx;
+        this.retry = retry;
+        this.faults = faults;
         this.clock = clock;
     }
 
@@ -104,7 +114,8 @@ public class ImportProcessor {
         UUID batchId = job.uuid(ImportJobs.BATCH_ID);
         MDC.put("batchId", batchId.toString());
         try {
-            Start start = tx.execute(s -> begin(organizationId, batchId, context));
+            // Each transaction is wrapped by the in-process retry (M9.3), never the other way round.
+            Start start = retry.call("import.begin", () -> tx.execute(s -> begin(organizationId, batchId, context)));
             if (start == null) {
                 return; // already finished: a repeated job is harmless, and the runner marks it DONE
             }
@@ -112,6 +123,7 @@ public class ImportProcessor {
             try {
                 download(start.storageKey(), file);
                 int lastRow = readAndCommit(file, organizationId, batchId, start, context);
+                faults.at(FaultPoints.IMPORT_AFTER_LAST_CHUNK);
                 finish(organizationId, batchId, lastRow, job, context);
             } finally {
                 deleteQuietly(file);
@@ -149,6 +161,7 @@ public class ImportProcessor {
 
     private int readAndCommit(Path file, UUID organizationId, UUID batchId, Start start, JobContext context) {
         int lastRow = start.lastCommittedRow();
+        int committedThrough = start.lastCommittedRow();
         int errorBudget = (int) Math.max(0, props.maxStoredErrors() - start.storedErrors());
         Chunk chunk = new Chunk(errorBudget);
         try (CsvRows rows = CsvRows.open(file, start.sourceType())) {
@@ -170,7 +183,8 @@ public class ImportProcessor {
                 lastRow = number;
                 hook.afterRow(batchId, number);
                 if (chunk.rows() >= props.chunkSize()) {
-                    errorBudget -= commit(organizationId, batchId, chunk, lastRow, context);
+                    errorBudget -= commit(organizationId, batchId, chunk, committedThrough, lastRow, context);
+                    committedThrough = lastRow;
                     chunk = new Chunk(errorBudget);
                     if (context.stopRequested()) {
                         throw new JobStoppedException(); // hand back at a chunk boundary
@@ -178,7 +192,7 @@ public class ImportProcessor {
                 }
             }
             if (!chunk.isEmpty()) {
-                commit(organizationId, batchId, chunk, lastRow, context);
+                commit(organizationId, batchId, chunk, committedThrough, lastRow, context);
             }
         } catch (CsvEncodingException e) {
             throw new PermanentJobFailure(e.rowNumber() == 0 ? "invalid-encoding in the header" : e.getMessage(), e);
@@ -190,19 +204,39 @@ public class ImportProcessor {
         return lastRow;
     }
 
-    /** One chunk, one transaction: rows, row errors, checkpoint and counters, fenced. */
-    private int commit(UUID organizationId, UUID batchId, Chunk chunk, int lastRow, JobContext context) {
+    /**
+     * One chunk, one transaction: rows, row errors, checkpoint and counters, fenced. Retried whole on
+     * a transient failure (M9.3); the checkpoint's compare-and-set makes a retry of a commit that did
+     * land (a connection lost during COMMIT) a no-op instead of counting the chunk twice.
+     */
+    private int commit(
+            UUID organizationId, UUID batchId, Chunk chunk, int previousRow, int lastRow, JobContext context) {
         records.ensurePartitions(chunk.months()); // own short transactions, before this one
-        tx.executeWithoutResult(s -> {
-            context.fence();
-            records.insert(organizationId, chunk.valid());
-            errorWriter.insert(organizationId, batchId, chunk.errors());
-            int updated = batches.recordChunk(
-                    batchId, organizationId, lastRow, chunk.valid().size(), chunk.errorRows());
-            if (updated != 1) {
-                throw new IllegalStateException("Batch " + batchId + " is no longer PROCESSING");
-            }
-        });
+        retry.run(
+                "import.chunk",
+                () -> tx.executeWithoutResult(s -> {
+                    context.fence();
+                    int updated = batches.recordChunk(
+                            batchId,
+                            organizationId,
+                            previousRow,
+                            lastRow,
+                            chunk.valid().size(),
+                            chunk.errorRows());
+                    if (updated != 1) {
+                        Optional<Integer> checkpoint = batches.findLastCommittedRow(batchId, organizationId);
+                        if (checkpoint.isPresent() && checkpoint.get() == lastRow) {
+                            log.info("Batch {} chunk up to row {} was already committed; skipping", batchId, lastRow);
+                            return;
+                        }
+                        throw new IllegalStateException(
+                                "Batch " + batchId + " is no longer PROCESSING at row " + previousRow);
+                    }
+                    records.insert(organizationId, chunk.valid());
+                    errorWriter.insert(organizationId, batchId, chunk.errors());
+                    faults.at(FaultPoints.IMPORT_BEFORE_CHUNK_COMMIT);
+                }));
+        faults.at(FaultPoints.IMPORT_AFTER_CHUNK_COMMIT);
         log.debug(
                 "Committed batch {} up to row {}: {} valid, {} invalid",
                 batchId,
@@ -218,23 +252,29 @@ public class ImportProcessor {
      * back and the worker that now owns the job finishes it instead.
      */
     private void finish(UUID organizationId, UUID batchId, int lastRow, Job job, JobContext context) {
-        tx.executeWithoutResult(s -> {
-            ImportBatch batch = batches.lockByIdAndOrganizationId(batchId, organizationId)
-                    .orElseThrow(() -> new PermanentJobFailure("batch-not-found"));
-            if (batch.getStatus() != ImportBatchStatus.PROCESSING) {
-                return; // finished or failed by someone else meanwhile
-            }
-            context.fence();
-            records.markDuplicatesInBatch(organizationId, batchId);
-            long stored = records.countBatch(organizationId, batchId);
-            if (stored != batch.getValidRows()) {
-                // Should never happen: rows and counters commit together. Loud, not fatal.
-                log.error("Batch {} counts {} valid rows but has {} records", batchId, batch.getValidRows(), stored);
-            }
-            hook.beforeFinishCommit(batchId);
-            outcomes.finished(batch, lastRow, job);
-            context.complete();
-        });
+        retry.run(
+                "import.finish",
+                () -> tx.executeWithoutResult(s -> {
+                    ImportBatch batch = batches.lockByIdAndOrganizationId(batchId, organizationId)
+                            .orElseThrow(() -> new PermanentJobFailure("batch-not-found"));
+                    if (batch.getStatus() != ImportBatchStatus.PROCESSING) {
+                        return; // finished or failed by someone else meanwhile
+                    }
+                    context.fence();
+                    records.markDuplicatesInBatch(organizationId, batchId);
+                    long stored = records.countBatch(organizationId, batchId);
+                    if (stored != batch.getValidRows()) {
+                        // Should never happen: rows and counters commit together. Loud, not fatal.
+                        log.error(
+                                "Batch {} counts {} valid rows but has {} records",
+                                batchId,
+                                batch.getValidRows(),
+                                stored);
+                    }
+                    hook.beforeFinishCommit(batchId);
+                    outcomes.finished(batch, lastRow, job);
+                    context.complete();
+                }));
     }
 
     private void download(String key, Path file) {

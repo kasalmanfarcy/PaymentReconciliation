@@ -221,7 +221,123 @@ If K4 proves noisy (a written-off item re-raised by every overlapping run), the 
 
 ## 7. State machines
 
-_Added in M1.7._
+Each table lists **every** allowed transition. Anything not listed is rejected with `409 invalid-transition` (the body carries the current status). Each machine is enforced in exactly one place in the code (M5.15 `ImportBatchStatus`, M6.10 `RunLifecycle`, M7.5 the exception transition table), and every audited transition writes its audit event in the same transaction as the change (`AuditService.record`, `Propagation.MANDATORY`).
+
+"Who" is a permission from [plans/authentication.plan §5](../plans/authentication.plan), never a role name, or "system" for the worker. The state names are exactly the CHECK constraint values in V1.
+
+### 7.1 Import batch
+
+`import_batch.status`: `RECEIVED`, `PROCESSING`, `COMPLETED`, `COMPLETED_WITH_ERRORS`, `FAILED`.
+
+```mermaid
+stateDiagram-v2
+    [*] --> RECEIVED : upload accepted
+    RECEIVED --> PROCESSING : worker claims job
+    PROCESSING --> PROCESSING : lease expired, resumed
+    PROCESSING --> COMPLETED : no row errors
+    PROCESSING --> COMPLETED_WITH_ERRORS : some rows invalid
+    PROCESSING --> FAILED : unreadable, too many rows, all invalid, retries exhausted
+    FAILED --> RECEIVED : retry (reason)
+    COMPLETED --> [*]
+    COMPLETED_WITH_ERRORS --> [*]
+```
+
+| From | To | Triggered by | Reason? | Audit event |
+|---|---|---|---|---|
+| — | `RECEIVED` | `IMPORT_CREATE` (`POST /imports`) | No | `IMPORT_RECEIVED` |
+| `RECEIVED` | `PROCESSING` | System: a worker claims the job | No | — (logged, not audited) |
+| `PROCESSING` | `COMPLETED` | System: every row valid | No | `IMPORT_COMPLETED` |
+| `PROCESSING` | `COMPLETED_WITH_ERRORS` | System: ≥ 1 row error and ≥ 1 valid row | No | `IMPORT_COMPLETED` (payload carries the status and counts) |
+| `PROCESSING` | `FAILED` | System: unreadable file (encoding), more than 500,000 rows, every row invalid, file missing from storage, or job attempts exhausted | `failure_reason` | `IMPORT_FAILED` |
+| `PROCESSING` | `PROCESSING` | System: the sweeper re-queues the job after an expired lease; the next worker resumes after `last_committed_row` | No | — |
+| `FAILED` | `RECEIVED` | `IMPORT_CREATE` (`POST /imports/{id}/retry`) | Yes | `IMPORT_RETRY_REQUESTED` |
+
+`COMPLETED` and `COMPLETED_WITH_ERRORS` are terminal. A completed import is never re-run or replaced in v1 ([ADR 0005](adr/0005-duplicate-import-policy.md)).
+
+The `PROCESSING → PROCESSING` row isn't a status change: it's listed so nobody "fixes" a resumed job by moving it back to `RECEIVED`. A retry from `FAILED` reprocesses from scratch: in the same transaction it deletes the batch's records and row errors, resets the counters and the checkpoint, and enqueues a new job (M5.20). That is safe because rows of a `FAILED` batch were never accepted (P3), so no run has used them.
+
+### 7.2 Reconciliation run
+
+`reconciliation_run.status`: `PENDING`, `RUNNING`, `COMPLETED`, `FAILED`.
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING : run requested
+    PENDING --> RUNNING : worker starts
+    RUNNING --> RUNNING : lease expired, resumed
+    RUNNING --> COMPLETED : last day done
+    RUNNING --> FAILED : permanent error or attempts exhausted
+    FAILED --> PENDING : retry (reason)
+    COMPLETED --> [*]
+```
+
+| From | To | Triggered by | Reason? | Audit event |
+|---|---|---|---|---|
+| — | `PENDING` | `RUN_CREATE` (`POST /reconciliation-runs`) | No | `RUN_REQUESTED` |
+| `PENDING` | `RUNNING` | System: a worker claims the job | No | `RUN_STARTED` |
+| `RUNNING` | `RUNNING` | System: job re-delivered after a crash or expired lease; resumes after `last_completed_date` | No | — (not a transition) |
+| `RUNNING` | `COMPLETED` | System: the last day of the period is done | No | `RUN_COMPLETED` (payload: summary) |
+| `RUNNING` | `FAILED` | System: a non-retryable error, or the job runner gave up after `max_attempts` | `failure_reason` | `RUN_FAILED` |
+| `FAILED` | `PENDING` | `RUN_CREATE` (`POST /reconciliation-runs/{id}/retry`) | Yes | `RUN_RETRY_REQUESTED` |
+
+`COMPLETED` is terminal. To reconcile the same period again (say, after a late gateway file), the client starts a new run with a fresh `Idempotency-Key` ([ADR 0006](adr/0006-reconciliation-run-idempotency.md)). A retried run keeps `last_completed_date` and skips the days it had already committed, so it never duplicates their matches. There is no `CANCELLED` state in v1: every state needs tests, permissions and audit, so it gets added when a user needs it.
+
+### 7.3 Exception case
+
+`exception_case.status`: `OPEN`, `IN_REVIEW`, `RESOLVED`.
+
+```mermaid
+stateDiagram-v2
+    [*] --> OPEN : created by a run
+    OPEN --> IN_REVIEW : start review
+    IN_REVIEW --> OPEN : back to open (reason)
+    OPEN --> RESOLVED : resolve (code)
+    IN_REVIEW --> RESOLVED : resolve (code)
+    RESOLVED --> OPEN : reopen (admin, reason)
+```
+
+| From | To | Who (permission) | Reason? | Audit event |
+|---|---|---|---|---|
+| — | `OPEN` | System (the engine, through `DiscrepancyRecorder`) | No | `EXCEPTION_CREATED` |
+| `OPEN` | `IN_REVIEW` | `EXCEPTION_UPDATE` | No | `EXCEPTION_STATUS_CHANGED` |
+| `IN_REVIEW` | `OPEN` | `EXCEPTION_UPDATE` | Yes | `EXCEPTION_STATUS_CHANGED` |
+| `OPEN` or `IN_REVIEW` | `RESOLVED` | `EXCEPTION_RESOLVE` | Resolution code, plus a note where §5.3 requires one | `EXCEPTION_RESOLVED` |
+| `RESOLVED` | `OPEN` | `EXCEPTION_REOPEN` (org admins only) | Yes | `EXCEPTION_REOPENED` |
+| `OPEN` or `IN_REVIEW` | same | `EXCEPTION_UPDATE`: change of assignee | No | `EXCEPTION_ASSIGNED` |
+| any | same | `EXCEPTION_UPDATE`: note added | — (the note is the content) | `EXCEPTION_NOTE_ADDED` |
+
+Rules that go with the table:
+
+- **Every status change** also writes an `exception_status_history` row (from, to, reason, actor), so "what happened to this case?" is a query, not an audit-log parse. Assignments and notes are audited but don't change the status.
+- **Resolving** sets `resolution_code`, `resolution_note`, `resolved_by` and `resolved_at` together. V1's CHECK constraint requires them to be set exactly when the status is `RESOLVED`.
+- **Reopening** clears those four fields (the same CHECK requires it). The earlier resolution survives in `exception_status_history`, whose reopen row also carries the previous code and note, so a reopen never erases history.
+- **Assigning a resolved case** is rejected (`409 invalid-transition`): reopen it first. The assignee must be a member of the same organization with `EXCEPTION_UPDATE`.
+- **Reopen collision.** If a later run created a new active case with the same `discrepancy_key` while this one was resolved (K4), reopening would make two active cases for one key, which `exception_case_active_uk` forbids. The reopen is rejected with `409 active-case-exists`, pointing to the existing case.
+- **Concurrent edits** are caught by optimistic locking: every state change and assignment needs the current version in `If-Match` ([ADR 0007](adr/0007-optimistic-locking-on-exceptions.md)). Adding a note doesn't change the case row, so it needs no version and two people can add notes at once.
+- `RESOLVED → RESOLVED` isn't in the table, so resolving twice is rejected by the transition check, and if two resolves race, optimistic locking makes exactly one win.
+
+### 7.4 Job (internal)
+
+`job.status`: `QUEUED`, `RUNNING`, `DONE`, `FAILED`. Not exposed through the API and not audited; observable through metrics (M9.9).
+
+```mermaid
+stateDiagram-v2
+    [*] --> QUEUED
+    QUEUED --> RUNNING : claimed (FOR UPDATE SKIP LOCKED)
+    RUNNING --> DONE
+    RUNNING --> QUEUED : lease expired, or transient error with attempts left
+    RUNNING --> FAILED : attempts exhausted or permanent error
+```
+
+| From | To | Triggered by |
+|---|---|---|
+| — | `QUEUED` | The same transaction that creates the batch or run |
+| `QUEUED` | `RUNNING` | A worker claims it, sets `locked_by` and `lease_until` (V1's CHECK requires both while `RUNNING`) |
+| `RUNNING` | `DONE` | The handler finished |
+| `RUNNING` | `QUEUED` | The sweeper found an expired lease, or a transient error with attempts left; `run_after` is backed off exponentially |
+| `RUNNING` | `FAILED` | Attempts exhausted, or a permanent error (validation-type failures are never retried) |
+
+When a job ends `FAILED`, its handler moves the business entity (batch or run) to `FAILED` in the same transaction. A retry of the business entity creates a **new** job row; the failed one stays for history. Details: [scalability.md §4](scalability.md#4-background-processing) and [ADR 0004](adr/0004-postgresql-job-queue.md).
 
 ---
 

@@ -209,7 +209,7 @@ erDiagram
 
 **`membership`** (owner: `security`). `PRIMARY KEY (user_id, organization_id)`: one role per user per organization. `role` CHECK: `ORG_ADMIN`, `INVESTIGATOR`, `UPLOADER`, `VIEWER`. `created_by` is NULL only for seeded and bootstrap users. Index `membership_org_idx (organization_id)` serves "list the members of an org".
 
-**`refresh_token`** (owner: `security`). Only the SHA-256 hash of each refresh token is stored (`token_hash CHAR(64) UNIQUE`). `family_id` groups every token descended from one login, so a reused token can revoke its whole family. V2 added `family_expires_at` (the 30-day cap, copied on each rotation) and `revoked_reason`; V3 made the revocation fields consistent (§4). Indexes: `refresh_token_family_idx`, `refresh_token_user_idx`, and V3's `refresh_token_family_expiry_idx (family_expires_at)` for the sweeper.
+**`refresh_token`** (owner: `security`). Only the SHA-256 hash of each refresh token is stored (`token_hash CHAR(64) UNIQUE`). `family_id` groups every token descended from one login, so a reused token can revoke its whole family. V2 added `family_expires_at` (the 30-day cap, copied on each rotation) and `revoked_reason` (CHECK `ROTATED`, `LOGOUT`, `REUSE_DETECTED`, `PASSWORD_CHANGED`, `ADMIN_REVOKED`, `USER_DISABLED`; NULL while the token is live); V3 made the revocation fields consistent (§4). Indexes: `refresh_token_family_idx`, `refresh_token_user_idx`, and V3's `refresh_token_family_expiry_idx (family_expires_at)` for the sweeper.
 
 ### 3.2 Cross-cutting
 

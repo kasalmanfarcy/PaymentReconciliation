@@ -127,7 +127,7 @@ jobs:
 
       - name: Tags and labels
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           # Written out in lowercase: the repository name has capitals and GHCR refuses them.
           images: ghcr.io/kasalmanfarcy/reconflow

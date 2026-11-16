@@ -23,6 +23,7 @@ import java.util.Objects;
 import java.util.UUID;
 import java.util.function.Consumer;
 import org.hibernate.StaleStateException;
+import org.jspecify.annotations.Nullable;
 import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.security.access.AccessDeniedException;
 import org.springframework.stereotype.Service;
@@ -120,6 +121,15 @@ public class ExceptionCommands {
                 machine.apply(c, transitionFor(c.getStatus(), patch.status()), TransitionInput.reason(patch.reason()));
             }
         });
+    }
+
+    /**
+     * OPEN or IN_REVIEW → RESOLVED with a code and, where the code needs one, a note
+     * (reconciliation-rules.md §5.3). Resolving doesn't unassign: the assignee is part of the record
+     * of who worked the case. Any user with EXCEPTION_RESOLVE may resolve, assignee or not (v1).
+     */
+    public void resolve(UUID id, long expectedVersion, @Nullable String code, @Nullable String note) {
+        write(id, expectedVersion, c -> machine.apply(c, Transition.RESOLVE, TransitionInput.resolution(code, note)));
     }
 
     /** PATCH moves only between OPEN and IN_REVIEW; resolve and reopen have their own endpoints. */

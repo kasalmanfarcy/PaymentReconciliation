@@ -126,6 +126,29 @@ class ExceptionController {
                 .body(note);
     }
 
+    /**
+     * The code is a string, validated by the state machine (an unknown code is a 400 field error,
+     * not a JSON parse failure), which also applies the code-dependent "note required" rule.
+     */
+    record ResolveRequest(
+            @Nullable String resolutionCode,
+            @Nullable @Size(max = 4000) String note) {}
+
+    /**
+     * A command, not {@code PATCH {status: RESOLVED}}: resolving has its own permission, its own
+     * required inputs and its own audit event, which a generic patch handler would bury.
+     */
+    @PostMapping("/{id}/resolve")
+    @RequiresPermission(Permission.EXCEPTION_RESOLVE)
+    ResponseEntity<ExceptionDetailView> resolve(
+            @PathVariable UUID id,
+            @RequestHeader(name = HttpHeaders.IF_MATCH, required = false) @Nullable String ifMatch,
+            @Valid @RequestBody ResolveRequest request) {
+        long expected = IfMatch.parseRequired(ifMatch);
+        commands.resolve(id, expected, request.resolutionCode(), request.note());
+        return withETag(queries.detail(id));
+    }
+
     static ResponseEntity<ExceptionDetailView> withETag(ExceptionDetailView view) {
         return ResponseEntity.ok().eTag(Long.toString(view.version())).body(view);
     }

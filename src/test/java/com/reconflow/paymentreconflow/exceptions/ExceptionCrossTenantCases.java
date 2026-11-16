@@ -76,6 +76,14 @@ class ExceptionCrossTenantCases implements CrossTenantCases {
                 f -> Map.of("id", f.orgBCase()),
                 f -> Map.of("body", "planted"),
                 NOT_FOUND));
+        cases.add(new CrossTenantCase(
+                "resolve org B's exception",
+                HttpMethod.POST,
+                "/api/v1/exceptions/{id}/resolve",
+                f -> Map.of("id", f.orgBCase()),
+                f -> Map.of("resolutionCode", "GATEWAY_FEE"),
+                NOT_FOUND,
+                IF_MATCH_0));
         return cases;
     }
 }

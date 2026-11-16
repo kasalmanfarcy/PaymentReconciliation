@@ -202,7 +202,7 @@ applied.
 | # | Milestone | Status |
 | - | --------- | ------ |
 | M0 | Repository hygiene: license, conventions, protected `main` | In progress |
-| M1 | Requirements and system design: docs, ADRs, sample data | Not started |
+| M1 | Requirements and system design: docs, ADRs, sample data | Done |
 | M2 | Project foundation: profiles, error model, logging, CI | Partly done — JPA, Flyway, schema, Testcontainers |
 | M3 | Organizations, users, authentication, tenant isolation | Not started |
 | M4 | Append-only audit | Not started |

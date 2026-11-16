@@ -1,6 +1,6 @@
 # Phase M1 — Requirements and system design
 
-**Status:** Not started · **Tasks:** TASKS.md M1.1–M1.12 · **Depends on:** M0 (repository on GitHub, PR workflow) · **Date:** 2026-11-01
+**Status:** Done · **Tasks:** TASKS.md M1.1–M1.12 · **Depends on:** M0 (repository on GitHub, PR workflow) · **Date:** 2026-11-01
 
 This phase produces documents, not code: five design docs, a set of sample files and a folder of Architecture Decision Records (ADRs). Every later phase implements something these documents define. If a rule isn't written here, two parts of the code will end up disagreeing about it, and the disagreement surfaces as a bug in M6 or M7.
 
@@ -879,16 +879,16 @@ The real tests of this phase come later: M5.21 (one test per normalization rule 
 
 ## 6. Exit criteria checklist
 
-- [ ] `docs/requirements.md` with personas, FR-xx, NFR-xx, scope, assumptions A1–A8, CSV contracts
-- [ ] `docs/samples/` with every file in §4.4 and `samples/README.md` giving every record's expected outcome
-- [ ] `docs/reconciliation-rules.md` with N1–N11, participation, match key, ordered outcomes, invariant, exception types, resolution codes, `discrepancy_key`, state machines, money rules
-- [ ] `docs/architecture.md` with module/table ownership, allowed dependencies, sequence diagrams
-- [ ] `docs/database-design.md` with ERD, constraint table, known partition-key gap, partitioning, migration policy
-- [ ] `docs/api-design.md` with conventions, error catalogue, pagination, idempotency, concurrency, status codes
-- [ ] `docs/adr/0000`–`0012` merged, all `Accepted`
-- [ ] README "Open design questions" replaced by the decisions table
-- [ ] TASKS.md updated with the scalability.md §9 changes and the corrected M2 exit criterion
-- [ ] `ls docs/*.md docs/adr/*.md docs/samples/* | wc -l` matches the expected file count
+- [x] `docs/requirements.md` with personas, FR-xx, NFR-xx, scope, assumptions A1–A8, CSV contracts
+- [x] `docs/samples/` with every file in §4.4 and `samples/README.md` giving every record's expected outcome
+- [x] `docs/reconciliation-rules.md` with N1–N11, participation, match key, ordered outcomes, invariant, exception types, resolution codes, `discrepancy_key`, state machines, money rules
+- [x] `docs/architecture.md` with module/table ownership, allowed dependencies, sequence diagrams
+- [x] `docs/database-design.md` with ERD, constraint table, known partition-key gap, partitioning, migration policy
+- [x] `docs/api-design.md` with conventions, error catalogue, pagination, idempotency, concurrency, status codes
+- [x] `docs/adr/0000`–`0012` merged, all `Accepted`
+- [x] README "Open design questions" replaced by the decisions table
+- [x] TASKS.md updated with the scalability.md §9 changes and the corrected M2 exit criterion
+- [x] `ls docs/*.md docs/adr/*.md docs/samples/* | wc -l` matches the expected file count
 
 ---
 

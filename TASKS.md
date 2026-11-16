@@ -29,31 +29,31 @@ The full build plan, from an empty Spring Boot skeleton to a deployed, documente
 Design docs come before code. Each one answers questions from projectoverview.md §11.
 
 ### Requirements
-- [ ] **M1.1** Write `docs/requirements.md`: problem statement, personas (uploader, investigator, org admin, platform admin), functional requirements, non-functional requirements, and v1 scope versus out of scope.
-- [ ] **M1.2** List the v1 assumptions explicitly: one-to-one matching, a single currency per transaction, CSV uploads only, synthetic data.
-- [ ] **M1.3** Define the CSV contracts: required and optional columns for the internal ledger and the gateway settlement, the date format, amount format, encoding, and the maximum file size and row count.
-- [ ] **M1.4** Write sample CSVs under `docs/samples/` covering every scenario: matched, missing on each side, amount mismatch, duplicate within a file, malformed rows.
+- [x] **M1.1** Write `docs/requirements.md`: problem statement, personas (uploader, investigator, org admin, platform admin), functional requirements, non-functional requirements, and v1 scope versus out of scope.
+- [x] **M1.2** List the v1 assumptions explicitly: one-to-one matching, a single currency per transaction, CSV uploads only, synthetic data.
+- [x] **M1.3** Define the CSV contracts: required and optional columns for the internal ledger and the gateway settlement, the date format, amount format, encoding, and the maximum file size and row count.
+- [x] **M1.4** Write sample CSVs under `docs/samples/` covering every scenario: matched, missing on each side, amount mismatch, duplicate within a file, malformed rows.
 
 ### Reconciliation rules
-- [ ] **M1.5** Write `docs/reconciliation-rules.md`: normalization rules (trim, case, currency ISO-4217, timezone to UTC, status mapping), the match key, mismatch definitions, duplicate definitions, and tie-breaking.
-- [ ] **M1.6** Define the exception types and reason codes, e.g. `MISSING_IN_GATEWAY`, `MISSING_IN_LEDGER`, `AMOUNT_MISMATCH`, `CURRENCY_MISMATCH`, `DUPLICATE_IN_SOURCE`.
-- [ ] **M1.7** Document the state machines for import batches, runs and exceptions. For every transition, record who may trigger it, whether it needs a reason, and which audit event it emits.
-- [ ] **M1.8** Specify money handling: `BigDecimal` scale and rounding mode, and `NUMERIC(19,4)` or a justified alternative.
+- [x] **M1.5** Write `docs/reconciliation-rules.md`: normalization rules (trim, case, currency ISO-4217, timezone to UTC, status mapping), the match key, mismatch definitions, duplicate definitions, and tie-breaking.
+- [x] **M1.6** Define the exception types and reason codes, e.g. `MISSING_IN_GATEWAY`, `MISSING_IN_LEDGER`, `AMOUNT_MISMATCH`, `CURRENCY_MISMATCH`, `DUPLICATE_IN_SOURCE`.
+- [x] **M1.7** Document the state machines for import batches, runs and exceptions. For every transition, record who may trigger it, whether it needs a reason, and which audit event it emits.
+- [x] **M1.8** Specify money handling: `BigDecimal` scale and rounding mode, and `NUMERIC(19,4)` or a justified alternative.
 
 ### Architecture and data
-- [ ] **M1.9** Write `docs/architecture.md`: module boundaries (ingestion, ledger, reconciliation, exceptions, reporting/audit, plus shared/security), allowed dependencies between modules, request flow diagrams, and the deferred async design.
-- [ ] **M1.10** Write `docs/database-design.md`: ERD, tables, FKs, unique constraints (including the ones that enforce idempotency), indexes and retention.
-- [ ] **M1.11** Write `docs/api-design.md`: endpoint contracts, error model (RFC 9457 `ProblemDetail`), pagination, filtering, `Idempotency-Key` semantics, `ETag`/`If-Match` or version-based concurrency, and when to return `201` versus `202`.
+- [x] **M1.9** Write `docs/architecture.md`: module boundaries (ingestion, ledger, reconciliation, exceptions, reporting/audit, plus shared/security), allowed dependencies between modules, request flow diagrams, and the deferred async design.
+- [x] **M1.10** Write `docs/database-design.md`: ERD, tables, FKs, unique constraints (including the ones that enforce idempotency), indexes and retention.
+- [x] **M1.11** Write `docs/api-design.md`: endpoint contracts, error model (RFC 9457 `ProblemDetail`), pagination, filtering, `Idempotency-Key` semantics, `ETag`/`If-Match` or version-based concurrency, and when to return `201` versus `202`.
 
 ### Decisions (close the README's open questions)
-- [ ] **M1.12** Add `docs/adr/` with an ADR for each decision:
-  - [ ] Duplicate-import policy: content hash, natural key, or both. What a deliberate re-import looks like.
-  - [ ] Reconciliation run idempotency key: what makes two runs "the same run".
-  - [ ] Sync or async processing in v1, and its status codes.
-  - [ ] Concurrency control on exceptions (working assumption: `@Version` returning `409`).
-  - [ ] Tenant enforcement mechanism.
-  - [ ] Whether a run can span currencies or is pinned to one.
-  - [ ] Modular monolith over microservices.
+- [x] **M1.12** Add `docs/adr/` with an ADR for each decision:
+  - [x] Duplicate-import policy: content hash, natural key, or both. What a deliberate re-import looks like.
+  - [x] Reconciliation run idempotency key: what makes two runs "the same run".
+  - [x] Sync or async processing in v1, and its status codes.
+  - [x] Concurrency control on exceptions (working assumption: `@Version` returning `409`).
+  - [x] Tenant enforcement mechanism.
+  - [x] Whether a run can span currencies or is pinned to one.
+  - [x] Modular monolith over microservices.
 
 **Exit criteria:** all five docs plus the ADRs are merged, and the README's "Open design questions" section is replaced with links to the ADRs.
 

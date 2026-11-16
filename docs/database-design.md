@@ -237,6 +237,27 @@ erDiagram
 | `transaction_record_batch_idx (organization_id, batch_id)` | Import detail, search by batch, the within-file duplicate update, retry deletes |
 | `transaction_record_reference_idx (organization_id, normalized_reference, transaction_type, transaction_date)` | *Added by the M6 migration.* The engine looks a group up by reference across the whole period; the match index leads with the date, so it can't |
 
+**Query plans (M5.6).** `TransactionQueryPlanIT` loads 120,000 rows for one organization over September and October 2026, runs `ANALYZE`, and checks the plans (PostgreSQL 16):
+
+```text
+-- GET /transactions shape: org + source + one month, join to the batch for rule P3, first page
+Limit (rows=51)
+  ->  Incremental Sort  (Sort Key: t.transaction_date, t.id; Presorted Key: t.transaction_date)
+        ->  Nested Loop
+              ->  Index Scan using transaction_record_2026_10_organization_id_source_type_tran_idx on transaction_record_2026_10 t
+                    Index Cond: ((organization_id = …) AND (source_type = 'GATEWAY') AND (transaction_date >= '2026-10-01') AND (transaction_date <= '2026-10-31'))
+              ->  Memoize (Cache Key: t.batch_id; Hits: 984  Misses: 1)
+                    ->  Index Scan using import_batch_pkey on import_batch b  (Filter: status = ANY ('{COMPLETED,COMPLETED_WITH_ERRORS}'))
+Execution Time: 0.6 ms
+
+-- the engine's per-day lookup (M6)
+Index Scan using transaction_record_2026_10_organization_id_source_type_tran_idx on transaction_record_2026_10 t
+  Index Cond: ((organization_id = …) AND (source_type = 'GATEWAY') AND (transaction_date = '2026-10-15') AND (normalized_reference = 'PAY-1000'))
+Execution Time: 0.01 ms
+```
+
+Only the October partition is touched (pruning), the match index serves both shapes, and the batch join is one memoized primary-key lookup per batch. Not served well: a `reference` search across a wide date range **without** `sourceType`, which can only use the index's `organization_id` prefix and then filters. No index is added for it speculatively; M9.7 measures it on realistic data, and M6's `transaction_record_reference_idx` (leading with `organization_id, normalized_reference`) will serve it anyway.
+
 ### 3.4 Reconciliation
 
 **`reconciliation_run`** (owner: `reconciliation`). One execution of the rules. `idempotency_key` with `UNIQUE (organization_id, idempotency_key)` (§4); `period_start`, `period_end` (inclusive) with `CHECK (period_end >= period_start)`; `left_source`, `right_source` (defaults ledger and gateway) with `CHECK (left_source <> right_source)`; one `currency` ([ADR 0009](adr/0009-run-pinned-to-one-currency.md)); `status` CHECK `PENDING | RUNNING | COMPLETED | FAILED`; `last_completed_date` is the resume checkpoint, since runs commit one day at a time. Summary columns are computed once at completion: `matched_count/amount`, `mismatch_count`, `mismatch_net_difference`, `unmatched_left_count/amount`, `unmatched_right_count/amount`, `duplicate_count`. Counts are **cases**, not records. The M6 migration adds `currency_mismatch_count` and `request_fingerprint` (to detect an `Idempotency-Key` reused with a different body). Index `reconciliation_run_list_idx (organization_id, created_at DESC)`.

@@ -1,6 +1,7 @@
 package com.reconflow.paymentreconflow.reconciliation.api;
 
 import com.reconflow.paymentreconflow.reconciliation.application.ReconciliationRunService;
+import com.reconflow.paymentreconflow.reconciliation.application.RunQueries;
 import com.reconflow.paymentreconflow.reconciliation.application.RunRequest;
 import com.reconflow.paymentreconflow.reconciliation.application.RunView;
 import com.reconflow.paymentreconflow.shared.context.Permission;
@@ -12,6 +13,7 @@ import java.net.URI;
 import java.util.UUID;
 import org.jspecify.annotations.Nullable;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -31,9 +33,18 @@ class ReconciliationRunController {
     static final String RETRY_AFTER_SECONDS = "2";
 
     private final ReconciliationRunService runs;
+    private final RunQueries queries;
 
-    ReconciliationRunController(ReconciliationRunService runs) {
+    ReconciliationRunController(ReconciliationRunService runs, RunQueries queries) {
         this.runs = runs;
+        this.queries = queries;
+    }
+
+    /** Status, progress and summary; cheap to poll, with Retry-After until the run is terminal. */
+    @GetMapping("/{id}")
+    @RequiresPermission(Permission.RUN_READ)
+    ResponseEntity<RunView> get(@PathVariable UUID id) {
+        return withRetryAfter(ResponseEntity.ok(), queries.get(id));
     }
 
     /**

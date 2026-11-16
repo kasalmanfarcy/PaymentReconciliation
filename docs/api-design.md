@@ -451,6 +451,41 @@ Retry a `FAILED` run (M6.12), with an audited reason.
 
 **Errors:** `400 validation-failed` (no reason), `404 not-found`, `409 invalid-transition` (the run isn't `FAILED`; `currentStatus`), `409 run-in-progress` (another run of the same scope became active meanwhile).
 
+### 8.10 `GET /api/v1/reconciliation-runs/{id}`
+
+A run's status, progress and, once `COMPLETED`, its summary (M6.15). Cheap to poll: one primary-key lookup. Non-terminal runs (`PENDING`, `RUNNING`) carry `Retry-After: 2`.
+
+```json
+{
+  "id": "0193c0a1-…",
+  "status": "COMPLETED",
+  "periodStart": "2026-10-01", "periodEnd": "2026-10-02",
+  "currency": "AED", "leftSource": "INTERNAL_LEDGER", "rightSource": "GATEWAY",
+  "progress": { "lastCompletedDate": "2026-10-02" },
+  "summary": {
+    "matched":            { "count": 3, "amount": "1420.5000" },
+    "amountMismatch":     { "count": 1, "netDifference": "-50.0000" },
+    "unmatchedLeft":      { "count": 1, "amount": "500.0000" },
+    "unmatchedRight":     { "count": 1, "amount": "200.0000" },
+    "duplicates":         { "count": 1 },
+    "currencyMismatches": { "count": 0 },
+    "excluded":           { "count": 1 }
+  },
+  "failureReason": null,
+  "triggeredBy": "0193b9e2-1111-7a10-8d2e-000000000001",
+  "createdAt": "2026-11-16T09:12:44Z", "startedAt": "2026-11-16T09:12:45Z", "completedAt": "2026-11-16T09:12:45Z"
+}
+```
+
+- `summary` is `null` until `COMPLETED`; it is computed once, from scratch, in the completing transaction, so a resumed or retried run shows exactly what a clean run would.
+- Counts are **cases**, not records (a duplicate case linking three records counts once), except `excluded`, which counts **records** that failed rule P4 or P5 ([reconciliation-rules.md §2](reconciliation-rules.md#2-which-records-take-part-in-a-run)).
+- `unmatchedLeft` / `unmatchedRight` follow the run's sources: with the defaults, left is the ledger, so `unmatchedLeft` is `MISSING_IN_GATEWAY`. Their `amount` is the sum of the cases' `amount`.
+- `amountMismatch.netDifference` is the sum of `gateway − ledger` over the run's amount-mismatch cases.
+- `progress.lastCompletedDate` is the resume checkpoint: the last day whose matches and cases are committed.
+- `failureReason` is a short code (`internal-error`, `retries-exhausted`, `engine-invariant-violated: …`), never a stack trace.
+
+**Errors:** `404 not-found`.
+
 ### 8.13 Notes for later sections
 
 Decisions already made that the later endpoint sections must reflect:

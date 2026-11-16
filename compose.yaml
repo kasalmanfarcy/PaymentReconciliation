@@ -210,7 +210,7 @@ services:
       - "host.docker.internal:${HOST_GATEWAY:-host-gateway}"
 
   grafana:
-    image: grafana/grafana:12.1.1
+    image: grafana/grafana:13.3.1
     profiles: [observability]
     depends_on: [prometheus]
     environment:

@@ -117,6 +117,22 @@
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
             </plugin>
+            <!-- Unit tests (*Test) run in the test phase via Surefire: fast, no Docker.
+                 Integration tests (*IT) run here, in integration-test, so ./mvnw verify runs
+                 everything and a failing IT still lets post-integration-test clean up.
+                 Version managed by the Boot parent. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>integration-test</goal>
+                            <goal>verify</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
         </plugins>
     </build>
 

@@ -23,6 +23,7 @@ import com.reconflow.paymentreconflow.shared.jobs.PermanentJobFailure;
 import com.reconflow.paymentreconflow.shared.jobs.TransientJobFailure;
 import com.reconflow.paymentreconflow.shared.jobs.TransientRetry;
 import com.reconflow.paymentreconflow.shared.storage.FileStorage;
+import com.reconflow.paymentreconflow.shared.storage.StorageUnavailableException;
 import com.reconflow.paymentreconflow.shared.storage.StoredFileMissingException;
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -282,7 +283,7 @@ public class ImportProcessor {
             storage.download(key, file);
         } catch (StoredFileMissingException e) {
             throw new PermanentJobFailure("file-missing", e);
-        } catch (SdkException e) {
+        } catch (StorageUnavailableException | SdkException e) {
             // A 503 or a dropped connection: a later attempt may well succeed.
             throw new TransientJobFailure("storage unavailable", e);
         }

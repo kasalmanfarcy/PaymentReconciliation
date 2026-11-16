@@ -120,6 +120,7 @@ Validation errors add an `errors` array, one entry per problem:
 | `precondition-required` | 428 | `If-Match` missing on a versioned update |
 | `rate-limited` | 429 | Too many requests (login: M3.3f; uploads and runs: M10.4); with `Retry-After` |
 | `internal-error` | 500 | Anything unexpected; no details in the body |
+| `storage-unavailable` | 503 | Object storage didn't answer (an outage, not a problem with the request): an upload stored nothing and created nothing; retry after `Retry-After` seconds. Added in M9.4 (it was a `500` before) |
 
 The codes live in one class, `shared.error.ProblemCodes`, kept in sync with this table. An error Spring raises itself with a status that has no row here gets `http-<status>` (for example `http-408`); clients should fall back on the HTTP status for any code they don't recognise.
 

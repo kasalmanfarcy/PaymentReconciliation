@@ -1,6 +1,8 @@
 package com.reconflow.paymentreconflow.shared.storage;
 
 import com.reconflow.paymentreconflow.shared.config.StorageProperties;
+import com.reconflow.paymentreconflow.shared.fault.FaultInjector;
+import com.reconflow.paymentreconflow.shared.fault.FaultPoints;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -14,6 +16,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 import software.amazon.awssdk.core.ResponseInputStream;
+import software.amazon.awssdk.core.exception.SdkClientException;
 import software.amazon.awssdk.core.exception.SdkException;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.services.s3.S3Client;
@@ -30,29 +33,54 @@ class S3FileStorage implements FileStorage {
 
     private final S3Client s3;
     private final String bucket;
+    private final FaultInjector faults;
 
-    S3FileStorage(S3Client s3, StorageProperties props) {
+    S3FileStorage(S3Client s3, StorageProperties props, FaultInjector faults) {
         this.s3 = s3;
         this.bucket = props.bucket();
+        this.faults = faults;
     }
 
     @Override
     public void put(String key, InputStream content, long size, String contentType) {
-        // Streams the content with its known length: never buffers the whole file in heap.
-        s3.putObject(
-                r -> r.bucket(bucket).key(key).contentType(contentType), RequestBody.fromInputStream(content, size));
+        try {
+            faults.at(FaultPoints.STORAGE_PUT);
+            // Streams the content with its known length: never buffers the whole file in heap.
+            s3.putObject(
+                    r -> r.bucket(bucket).key(key).contentType(contentType),
+                    RequestBody.fromInputStream(content, size));
+        } catch (SdkException e) {
+            throw unavailableOrRethrow(e);
+        }
     }
 
     @Override
     public void download(String key, Path target) {
-        try (ResponseInputStream<GetObjectResponse> in =
-                s3.getObject(r -> r.bucket(bucket).key(key))) {
-            Files.copy(in, target, StandardCopyOption.REPLACE_EXISTING);
+        try {
+            faults.at(FaultPoints.STORAGE_DOWNLOAD);
+            try (ResponseInputStream<GetObjectResponse> in =
+                    s3.getObject(r -> r.bucket(bucket).key(key))) {
+                Files.copy(in, target, StandardCopyOption.REPLACE_EXISTING);
+            }
         } catch (NoSuchKeyException e) {
             throw new StoredFileMissingException(key);
+        } catch (SdkException e) {
+            throw unavailableOrRethrow(e);
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
+    }
+
+    /**
+     * An outage (no connection, a timeout, a 5xx after the SDK's own retries) becomes
+     * {@link StorageUnavailableException}, which callers treat as transient; a 4xx is a bug or a
+     * configuration problem (wrong bucket, bad credentials) and stays as it is.
+     */
+    private static RuntimeException unavailableOrRethrow(SdkException e) {
+        if (e instanceof SdkClientException || (e instanceof S3Exception s && s.statusCode() >= 500)) {
+            return new StorageUnavailableException("Object storage unavailable", e);
+        }
+        return e;
     }
 
     @Override

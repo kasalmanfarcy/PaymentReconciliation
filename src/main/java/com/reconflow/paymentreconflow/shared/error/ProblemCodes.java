@@ -49,8 +49,9 @@ public final class ProblemCodes {
     // 428, 429
     public static final String PRECONDITION_REQUIRED = "precondition-required";
     public static final String RATE_LIMITED = "rate-limited";
-    // 500
+    // 500, 503
     public static final String INTERNAL_ERROR = "internal-error";
+    public static final String STORAGE_UNAVAILABLE = "storage-unavailable";
 
     /**
      * The code for an error Spring raised itself (no {@link ApiException}), chosen by status.

@@ -1,5 +1,6 @@
 package com.reconflow.paymentreconflow.shared.error;
 
+import com.reconflow.paymentreconflow.shared.storage.StorageUnavailableException;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -61,6 +62,22 @@ class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
                 HttpStatus.CONFLICT,
                 ProblemCodes.STALE_VERSION,
                 "The resource was changed by someone else. Reload it and retry.");
+    }
+
+    /**
+     * Object storage is down (M9.4; a 500 until M9): the request was fine and nothing was created
+     * (the file is stored before the batch row exists), so the honest answer is 503 with a hint
+     * when to try again, not "an unexpected error".
+     */
+    @ExceptionHandler(StorageUnavailableException.class)
+    ResponseEntity<ProblemDetail> handleStorageUnavailable(StorageUnavailableException ex) {
+        log.warn("Object storage unavailable", ex);
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                .header(HttpHeaders.RETRY_AFTER, "30")
+                .body(ProblemDetails.of(
+                        HttpStatus.SERVICE_UNAVAILABLE,
+                        ProblemCodes.STORAGE_UNAVAILABLE,
+                        "File storage is temporarily unavailable. Nothing was saved; retry the request later."));
     }
 
     /**

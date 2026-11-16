@@ -57,7 +57,12 @@ public class ScriptedFaultInjector implements FaultInjector {
         hits.remove(point);
     }
 
-    /** How many times the point was reached since it was scripted. */
+    /** Forgets every hit count (scripts stay): to count a clean run's points from zero. */
+    public void resetHits() {
+        hits.clear();
+    }
+
+    /** How many times the point was reached since it was scripted (or since the last reset). */
     public int hits(String point) {
         AtomicInteger n = hits.get(point);
         return n == null ? 0 : n.get();
@@ -70,11 +75,11 @@ public class ScriptedFaultInjector implements FaultInjector {
 
     @Override
     public void at(String point) {
+        int n = hits.computeIfAbsent(point, p -> new AtomicInteger()).incrementAndGet();
         Script script = scripts.get(point);
         if (script == null) {
             return;
         }
-        int n = hits.computeIfAbsent(point, p -> new AtomicInteger()).incrementAndGet();
         if (n == script.onHit() || (script.repeat() && n > script.onHit())) {
             script.action().run();
         }

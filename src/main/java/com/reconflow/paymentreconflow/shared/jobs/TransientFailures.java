@@ -1,5 +1,6 @@
 package com.reconflow.paymentreconflow.shared.jobs;
 
+import com.reconflow.paymentreconflow.shared.storage.StorageUnavailableException;
 import java.sql.SQLException;
 import java.util.Set;
 import org.springframework.dao.DataIntegrityViolationException;
@@ -64,6 +65,7 @@ public final class TransientFailures {
         }
         for (Throwable c = failure; c != null; c = c.getCause()) {
             if (c instanceof TransientJobFailure
+                    || c instanceof StorageUnavailableException
                     || c instanceof TransientDataAccessException
                     || c instanceof RecoverableDataAccessException
                     || c instanceof CannotCreateTransactionException) {

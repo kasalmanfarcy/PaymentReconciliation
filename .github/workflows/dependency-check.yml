@@ -36,7 +36,7 @@ jobs:
       # local `./mvnw dependency-check:check` runs exactly what CI runs.
       - name: Dependency-Check
         run: ./mvnw -B -ntp dependency-check:check -DnvdApiKey=${{ secrets.NVD_API_KEY }}
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: dependency-check-report

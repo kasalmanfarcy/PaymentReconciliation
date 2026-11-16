@@ -100,10 +100,12 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
         </dependency>
+        <!-- Compile scope (not runtime) for one class: shared.error.UniqueViolations reads the
+             violated constraint's name from PSQLException's server error message, the only
+             reliable way to tell which unique constraint fired (M5.4, M5.9). -->
         <dependency>
             <groupId>org.postgresql</groupId>
             <artifactId>postgresql</artifactId>
-            <scope>runtime</scope>
         </dependency>
         <!-- Boot 4 splits autoconfiguration into modules: flyway-core alone gives no
              FlywayAutoConfiguration. The starter brings spring-boot-flyway. -->

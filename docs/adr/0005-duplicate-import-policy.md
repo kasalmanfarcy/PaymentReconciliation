@@ -26,6 +26,7 @@ We will **identify a file by the SHA-256 of its bytes**, per organization and so
 
 - One file, one batch, one audit trail. No question of which of two identical batches is authoritative.
 - Client retries are safe and informative.
+- The key includes the source type, so the same bytes uploaded once as `INTERNAL_LEDGER` and once as `GATEWAY` are two accepted imports. That's almost certainly a mistake, but it's a different import, and the engine then reports every reference as a duplicate or mismatch, which is visible. The violation is recognised by constraint name (`import_batch_content_uk`, SQL state `23505`), never by message text (M5.4).
 - A file that differs by a single byte (one extra row, a different line ending) is a different file. Overlap between different files isn't caught here; the engine catches it as duplicates (rule D2), loudly. That's deliberate: silently deduplicating across files could hide a real double charge.
 - Deliberate re-imports of a completed batch aren't supported in v1. Users who need to correct data must resolve the resulting cases. Recorded as a v2 feature.
 

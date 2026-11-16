@@ -253,4 +253,6 @@ One jar; behaviour is selected by Spring profiles. A process runs one **role** p
 | `test` | Environment | Testcontainers PostgreSQL via `@ServiceConnection`; each test creates a fresh organization instead of truncating tables (audit tables can't be truncated) |
 | `prod` | Environment | JSON logs, secrets only from environment variables, `ddl-auto=validate`, Swagger UI off |
 
+**Ports (M9.10).** `server.port` (8080) serves the API and is the only port behind the load balancer. In `local` and `prod`, actuator moves to `management.server.port` (8081, `MANAGEMENT_PORT`): the liveness and readiness probes and `/actuator/prometheus`, which the security chain permits only on that port and refuses on 8080 even to a logged-in user. Prometheus and Grafana run under compose's `observability` profile (`ops/prometheus`, `ops/grafana`: a provisioned dashboard and alert rules, including the default-partition alert and its runbook in `docs/runbooks/`).
+
 Locally, a single `local,api,worker` process does everything. In production, the same image is deployed twice: two instances with `prod,api` behind the load balancer, and two with `prod,worker`.

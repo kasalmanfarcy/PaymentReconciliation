@@ -1,0 +1,7 @@
+apiVersion: 1
+providers:
+  - name: reconflow
+    folder: ReconFlow
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards

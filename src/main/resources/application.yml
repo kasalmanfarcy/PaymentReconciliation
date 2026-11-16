@@ -107,7 +107,9 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info
+        # prometheus is reachable only on the management port, never through the public one
+        # (SecurityConfig); application-local.yml and application-prod.yml set that port (M9.10).
+        include: health,info,prometheus
   endpoint:
     health:
       # Anonymous callers see only {"status":"UP"}; component details help attackers.

@@ -17,6 +17,10 @@ logging:
     correlation: "[%X{requestId:-}] "
 
 management:
+  server:
+    # As in prod: actuator (probes, /actuator/prometheus) on its own port, scraped by compose's
+    # Prometheus (observability profile). M9.10.
+    port: ${MANAGEMENT_PORT:8081}
   endpoint:
     health:
       show-details: always

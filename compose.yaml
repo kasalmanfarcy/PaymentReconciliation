@@ -73,6 +73,36 @@ services:
       S3_BUCKET: ${S3_BUCKET:-reconflow-imports}
     restart: "no"
 
+  # --- Observability (M9.10): `docker compose --profile observability up -d` -------------------
+  # Off by default, so a plain `docker compose up` stays light. Scrapes the app running on the host
+  # (its management port, 8081). Docker Desktop resolves host-gateway to the host; on Colima set
+  # HOST_GATEWAY=192.168.5.2 (host.lima.internal) in .env.
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    profiles: [observability]
+    volumes:
+      - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./ops/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports:
+      - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:${HOST_GATEWAY:-host-gateway}"
+
+  grafana:
+    image: grafana/grafana:12.1.1
+    profiles: [observability]
+    depends_on: [prometheus]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+
 volumes:
   postgres-data:
   minio-data:
+  grafana-data:

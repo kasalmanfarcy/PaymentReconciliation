@@ -47,7 +47,8 @@ class SecurityConfig {
             AuthenticationEntryPoint problemEntryPoint,
             AccessDeniedHandler problemDeniedHandler,
             ProblemDetailWriter problemWriter,
-            TenantLookup tenantLookup) {
+            TenantLookup tenantLookup,
+            ManagementPort managementPort) {
         http.sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 // Bearer tokens aren't sent automatically by browsers, so CSRF can't use them. The
                 // refresh cookie is: SameSite=Strict plus Path=/api/v1/auth confine it to
@@ -63,6 +64,14 @@ class SecurityConfig {
                         .permitAll()
                         .requestMatchers("/actuator/health", "/actuator/health/**", "/actuator/info")
                         .permitAll()
+                        // Metrics (M9.10): open to the scraper on the internal management port only;
+                        // on the public port they're refused even to a logged-in user (metric
+                        // names, routes and volumes are reconnaissance).
+                        .requestMatchers(request -> "/actuator/prometheus".equals(request.getRequestURI())
+                                && managementPort.is(request.getLocalPort()))
+                        .permitAll()
+                        .requestMatchers("/actuator/prometheus")
+                        .denyAll()
                         .requestMatchers(
                                 HttpMethod.POST, "/api/v1/auth/login", "/api/v1/auth/refresh", "/api/v1/auth/logout")
                         .permitAll()

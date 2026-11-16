@@ -1,0 +1,39 @@
+# Alert rules (M9.10). Alertmanager routing is out of scope for v1: they show in the Prometheus UI.
+groups:
+  - name: reconflow
+    rules:
+      - alert: DefaultPartitionNotEmpty
+        expr: reconflow_partitions_default_rows > 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "transaction_record_default holds rows"
+          runbook: docs/runbooks/default-partition.md
+      - alert: JobQueueWaitHigh
+        # SLO (scalability.md §6): job queue wait p95 < 2 min at the 09:00 peak.
+        expr: histogram_quantile(0.95, sum by (le) (rate(reconflow_jobs_queue_wait_seconds_bucket[10m]))) > 120
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "Job queue wait p95 above 2 minutes; add workers (scalability.md §8)"}
+      - alert: JobsFailing
+        expr: increase(reconflow_jobs_completed_total{outcome="failed"}[15m]) > 0
+        labels: {severity: warning}
+        annotations: {summary: "A job failed permanently; see its last_error"}
+      - alert: LeaseLost
+        # Fencing stopped a worker that lost its lease. Should never happen: GC pauses or chunks
+        # approaching the 2-minute lease.
+        expr: increase(reconflow_jobs_lease_lost_total[1h]) > 0
+        labels: {severity: warning}
+        annotations: {summary: "A worker lost a job lease"}
+      - alert: OrphanedWork
+        expr: increase(reconflow_jobs_orphaned_total[1h]) > 0
+        labels: {severity: critical}
+        annotations: {summary: "A batch or run was in flight with no job (a bug in the enqueue path)"}
+      - alert: ApiReadLatencyAboveSlo
+        # SLO: read p95 < 300 ms. Uses the exact 300 ms SLO bucket.
+        expr: |
+          1 - (sum(rate(http_server_requests_seconds_bucket{method="GET",le="0.3"}[5m]))
+               / sum(rate(http_server_requests_seconds_count{method="GET"}[5m]))) > 0.05
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "More than 5% of reads slower than 300 ms"}

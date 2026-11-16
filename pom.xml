@@ -90,6 +90,12 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
+        <!-- /actuator/prometheus (M9.10): Micrometer meters in Prometheus' text format, scraped from
+             the internal management port. Version managed by Boot. -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
         <!-- Secured by default from the start (M2.2): everything but health/info is 401 until
              real authentication arrives in M3.3. -->
         <dependency>

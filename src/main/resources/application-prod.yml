@@ -30,3 +30,10 @@ logging:
         version: "@project.version@" # filled in at build time by Maven resource filtering
         environment: prod
         node-name: ${HOSTNAME:}
+
+management:
+  server:
+    # Actuator (health probes, /actuator/prometheus) on its own port (M9.10): the load balancer
+    # forwards only server.port, so metrics are never public; Prometheus and the orchestrator's
+    # probes reach this one on the internal network.
+    port: ${MANAGEMENT_PORT:8081}

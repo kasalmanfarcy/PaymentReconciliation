@@ -50,9 +50,6 @@ nobody has seen fail. Accepted risks are listed too, marked as such, with the re
 | S-32 | Weekly full scan: OWASP Dependency-Check (CVSS ≥ 7 fails), Trivy over the packaged jar | New CVEs in versions we already ship | [dependency-check.yml](../.github/workflows/dependency-check.yml), `dependency-check-maven` in [pom.xml](../pom.xml), [suppressions](../config/dependency-check-suppressions.xml) (each with a reason and an expiry) | Trivy run locally on the M10 jar: 0 HIGH/CRITICAL/MEDIUM findings (2026-11-16); the scheduled run's report artifact | ✅ Trivy · ⏳ Dependency-Check needs `NVD_API_KEY` |
 | S-33 | Secret scanning of the full git history on every PR and push | A committed key | [secret-scan.yml](../.github/workflows/secret-scan.yml) (gitleaks), [.gitleaks.toml](../.gitleaks.toml) | Run locally over all 164 commits: two findings, both `Idempotency-Key` example UUIDs in docs, allowlisted by a line-precise regex; no secrets | ✅ |
 | S-34 | GitHub secret scanning with push protection | A key pushed before CI runs | Repository setting | — | ⏳ user step (§3) |
-
----
-
 | S-35 | No secret in git, the image or `application.yml`; a missing secret fails startup in `prod` | Leaked or silently defaulted credentials | `.gitignore` (`.env`), [RequiredPropertiesCheck](../src/main/java/com/reconflow/paymentreconflow/shared/config/RequiredPropertiesCheck.java) with `reconflow.required-properties` in [application-prod.yml](../src/main/resources/application-prod.yml); test passwords generated per run ([TestDatabase](../src/test/java/com/reconflow/paymentreconflow/support/TestDatabase.java)) | [RequiredPropertiesCheckTest](../src/test/java/com/reconflow/paymentreconflow/shared/config/RequiredPropertiesCheckTest.java), gitleaks (S-33) | ✅ |
 
 ### 1.5 Secrets and their rotation
@@ -63,6 +60,14 @@ nobody has seen fail. Accepted risks are listed too, marked as such, with the re
 | `DB_USER`/`DB_PASSWORD` (superuser) | `.env` | container default | break-glass only, never in an app config | the platform's procedure |
 | `S3_ACCESS_KEY`/`S3_SECRET_KEY` | `.env` (MinIO) | Testcontainers MinIO | a key scoped to one bucket | issue new key, update store, restart, revoke old |
 | `NVD_API_KEY` | — | GitHub Actions secret | — | request a new one, replace the secret |
+
+### 1.6 Logs (M10.6)
+
+| ID | Control | Threat | Enforced by | Proven by | Status |
+|----|---------|--------|-------------|-----------|--------|
+| S-50 | No references, emails, notes, raw rows, tokens or passwords in logs, at any level | Personal and financial data escaping every access control (logs are copied further, kept longer and read by more people than the database) | §4 policy; [Masked](../src/main/java/com/reconflow/paymentreconflow/shared/logging/Masked.java) at the call site; pgjdbc `logServerErrorDetail: false` and `org.hibernate.orm.jdbc.bind: INFO` in [application.yml](../src/main/resources/application.yml); no request-body logging filter exists; MDC holds only `requestId` | [LogLeakIT](../src/test/java/com/reconflow/paymentreconflow/reliability/LogLeakIT.java) (canaries through upload, bad rows, run, resolve with a note, export, a duplicate-upload race and an unexpected constraint violation, at DEBUG; seen failing with `logServerErrorDetail: true`), [MaskedTest](../src/test/java/com/reconflow/paymentreconflow/shared/logging/MaskedTest.java) | ✅ |
+
+---
 
 ## 2. Accepted risks
 
@@ -87,3 +92,23 @@ These can't be done from code; until they are, the rows above that depend on the
    `build`.
 4. **Prove the gate once:** open a throwaway PR that adds `org.apache.commons:commons-text:1.9`
    (CVE-2022-42889, "Text4Shell"); dependency review must fail it. Close it unmerged.
+
+---
+
+## 4. Logging policy (M10.6)
+
+| Category | Examples | Rule |
+|---|---|---|
+| Always fine | Our UUIDs (organization, user, batch, run, case, job, request), status names, counts, durations, error codes, months | Log freely: they let an operator find the real values in the database, under access control |
+| Mask | Transaction references (`****1234`), emails (`j***@example.com`), display names, client IPs | `Masked.reference`, `Masked.email`; IPs only in access logs with short retention |
+| Never | Passwords (temporary ones included), access/refresh tokens, client secrets, `Authorization` and `Cookie` headers, raw CSV rows, file contents, amounts tied to a reference, resolution notes, DB passwords | Not even at DEBUG |
+
+Where leaks come from that aren't our own `log` calls, and what closes each:
+
+- **Database errors.** PostgreSQL's `DETAIL` carries the values (`Key (lower(email))=(jane@acme.com) already exists`, `Failing row contains (...)`), and pgjdbc's message for a failed batch entry inlines every bound value. `logServerErrorDetail: false` removes both at the driver; the constraint name and SQLState remain for `UniqueViolations`. Expected violations are translated to domain errors before anything is logged; the `500` body never contains the message (S-12).
+- **SQL logging.** `org.hibernate.SQL` is DEBUG in `local` only and prints statements with `?` placeholders; bind-parameter logging is pinned off in every profile.
+- **Request logging.** There is no request/response body logging. `RequestIdFilter` puts only `requestId` in the MDC; structured `prod` logs include every MDC entry as a field, so nothing else goes there.
+- **Exception messages from our own code** must not interpolate user data (an ID, yes; a reference, no).
+- **Audit payloads** live in the database under tenant isolation, so they may hold references, never passwords or tokens.
+- **Local-only exception:** the local seeder logs the documented demo accounts and their demo password (`reconflow-local-demo`), which are not secrets and exist only in the `local` profile.
+- **Known exception until M10.1:** the in-house bootstrap runner prints the first platform admin's temporary password once; M10.1 removes password generation from the application entirely.

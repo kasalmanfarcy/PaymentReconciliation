@@ -7,6 +7,7 @@ import com.reconflow.paymentreconflow.audit.AuditService;
 import com.reconflow.paymentreconflow.security.user.AppUser;
 import com.reconflow.paymentreconflow.security.user.AppUserRepository;
 import com.reconflow.paymentreconflow.security.user.TemporaryPasswords;
+import com.reconflow.paymentreconflow.shared.logging.Masked;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -73,7 +74,7 @@ public class BootstrapRunner implements ApplicationRunner {
                                 AuditEntityType.USER,
                                 existing.get().getId())
                         .with("existingAccount", true));
-                log.warn("Bootstrap: granted platform admin to the existing user {}", adminEmail);
+                log.warn("Bootstrap: granted platform admin to the existing user {}", Masked.email(adminEmail));
                 return true;
             }
             String temporaryPassword = TemporaryPasswords.generate();

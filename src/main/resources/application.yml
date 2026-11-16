@@ -23,6 +23,11 @@ spring:
         # pgjdbc rewrites a JDBC batch of single-row INSERTs into multi-row INSERTs (M5.3): the
         # import's hot path sends 500 rows in a handful of statements instead of 500.
         reWriteBatchedInserts: true
+        # M10.6: pgjdbc otherwise puts data into exception messages, which end up in logs: the
+        # server's DETAIL ("Key (lower(email))=(jane@acme.com) already exists") and, for a failed
+        # batch, every bound value of the entry (a whole raw CSV row). The constraint name and
+        # SQLState are still available (shared.error.UniqueViolations), which is all the code needs.
+        logServerErrorDetail: false
 
   jpa:
     # Flyway owns the schema. Hibernate only checks that the entities match it.
@@ -210,3 +215,5 @@ reconflow:
 logging:
   level:
     org.flywaydb: INFO
+    # M10.6: bind parameters (every value of every statement) are never logged, in any profile.
+    org.hibernate.orm.jdbc.bind: INFO

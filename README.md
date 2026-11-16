@@ -2,7 +2,7 @@
 
 A payment reconciliation and exception resolution platform. ReconFlow compares a business's internal payment ledger against payment gateway settlements, surfaces the discrepancies, and tracks how each one was investigated and resolved.
 
-> **Project status: foundation done (M2).** Schema (Flyway V1–V3), profiles, module boundaries, error model, request IDs, security defaults, quality gates and CI are in place. No domain code or business endpoints exist yet. See [Roadmap](#roadmap).
+> **Project status: tenancy, authentication and audit done (M3, M4).** On top of the M2 foundation: in-house JWT authentication (RS256 access tokens, rotating refresh tokens with reuse detection, lockout, rate limiting), per-request tenant resolution, PostgreSQL row-level security as a second isolation layer, a permission matrix, member and organization management, and an append-only, transactional audit log. No financial endpoints yet: ingestion starts in M5. See [Roadmap](#roadmap).
 
 ---
 
@@ -126,9 +126,9 @@ Explicitly **out of scope for v1**: one-to-many matching for aggregated settleme
 | Concern | Choice | Notes |
 | ------- | ------ | ----- |
 | Language | Java 25 | LTS |
-| Framework | Spring Boot 4.1.2 | Web MVC, validation, data JPA, security, actuator; Spring Modulith 2.1 for module boundaries |
+| Framework | Spring Boot 4.1.2 | Web MVC, validation, data JPA, security (OAuth2 resource server, Nimbus JWT), actuator; Spring Modulith 2.1 for module boundaries |
 | Database | PostgreSQL | `NUMERIC` for money, FK + unique constraints, transactional writes |
-| Migrations | Flyway | V1–V3 applied on startup; applied migrations are never edited |
+| Migrations | Flyway | V1–V4 applied on startup (V4: row-level security); applied migrations are never edited |
 | Build | Maven (wrapper) | `./mvnw`, no system Maven required |
 | Testing | JUnit + Testcontainers | Unit tests (`*Test`) need no Docker; integration tests (`*IT`) start their own PostgreSQL 16 |
 | Quality gates | Spotless, JaCoCo, GitHub Actions | Palantir Java Format check, coverage reports (no threshold yet), `./mvnw verify` on every PR |
@@ -193,7 +193,7 @@ S3 API on `localhost:9000` and its console on `http://localhost:9001` (log in wi
 SPRING_PROFILES_ACTIVE=local,api,worker ./mvnw spring-boot:run
 ```
 
-Flyway applies `V1`–`V3` on first startup. Hibernate runs in `validate` mode, so a mismatch between
+Flyway applies `V1`–`V4` on first startup. Hibernate runs in `validate` mode, so a mismatch between
 the entities and the schema fails the boot rather than silently altering it.
 
 | Profile | Kind | Effect |
@@ -208,12 +208,50 @@ There is deliberately no default profile. Locally one process runs both roles.
 
 ```bash
 curl -s localhost:8080/actuator/health        # {"status":"UP",...}
-curl -si localhost:8080/api/v1/anything       # 401, application/problem+json, X-Request-Id
+curl -si localhost:8080/api/v1/members        # 401, application/problem+json, X-Request-Id
 ```
 
-Everything except `/actuator/health` and `/actuator/info` returns `401` until authentication
-arrives in M3. Errors are RFC 9457 Problem Details with `code` and `requestId`
+Errors are RFC 9457 Problem Details with `code` and `requestId`
 ([api-design.md §3](docs/api-design.md#3-error-model)).
+
+### Log in (local)
+
+The `local` profile seeds demo data on first start (once; a second start seeds nothing) and
+generates a fresh JWT signing key at every start, so tokens die on restart. Every seeded user's
+password is `reconflow-local-demo` (override with `RECONFLOW_SEED_PASSWORD`).
+
+| Account | Organization(s) and role |
+|---|---|
+| `admin@acme.test`, `investigator@acme.test`, `uploader@acme.test`, `viewer@acme.test` | Acme Payments (`0193b9e2-7c41-7a10-8d2e-5f6a7b8c9d0e`), one role each |
+| `admin@globex.test`, `investigator@globex.test`, `uploader@globex.test`, `viewer@globex.test` | Globex Retail (`0193b9e2-7c41-7a10-8d2e-5f6a7b8c9d0f`), one role each |
+| `consultant@both.test` | Investigator at Acme, viewer at Globex: must send `X-Organization-Id` |
+| `platform@reconflow.test` | Platform admin: manages organizations, sees no tenant data |
+
+```bash
+TOKEN=$(curl -s -c cookies.txt localhost:8080/api/v1/auth/login -H 'Content-Type: application/json' \
+  -d '{"email":"admin@acme.test","password":"reconflow-local-demo"}' | jq -r .accessToken)
+curl -s localhost:8080/api/v1/members -H "Authorization: Bearer $TOKEN" | jq
+curl -s -b cookies.txt -X POST localhost:8080/api/v1/auth/refresh | jq      # rotates the refresh cookie
+```
+
+Access tokens last 15 minutes; the refresh token is an `HttpOnly` cookie scoped to `/api/v1/auth`.
+Users never sign up: an org admin creates them with a temporary password (`POST /api/v1/members`),
+which must be changed at first login. Design: [authentication.plan](plans/authentication.plan),
+[ADR 0013](docs/adr/0013-build-authentication-in-house.md).
+
+### Configure a non-local environment
+
+| Variable | Purpose |
+|---|---|
+| `JWT_PRIVATE_KEY`, `JWT_PUBLIC_KEY` | RS256 key pair as PEM (PKCS#8 private, X.509 public). Required in `prod`: startup fails without them. Never commit them |
+| `RECONFLOW_BOOTSTRAP_ADMIN_EMAIL` | One-time: if set and no platform admin exists, creates one and logs its temporary password once. It then creates organizations through `POST /api/v1/platform/organizations` |
+
+For example: `openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out jwt.pem` and
+`openssl pkey -in jwt.pem -pubout -out jwt.pub.pem`, then load the files into the variables.
+
+Row-level security only takes effect when the application connects as a non-superuser that
+doesn't own the tables (M10.7); local and test databases connect as superusers, so the RLS tests
+switch roles explicitly.
 
 `./mvnw spring-boot:test-run` runs the application against a Testcontainers PostgreSQL instead of
 Compose.
@@ -241,8 +279,8 @@ request.
 | M0 | Repository hygiene: license, conventions, protected `main` | In progress |
 | M1 | Requirements and system design: docs, ADRs, sample data | Done |
 | M2 | Project foundation: profiles, error model, logging, CI | Done |
-| M3 | Organizations, users, authentication, tenant isolation | Not started |
-| M4 | Append-only audit | Not started |
+| M3 | Organizations, users, authentication, tenant isolation | Done |
+| M4 | Append-only audit | Done |
 | M5 | Transaction ingestion: CSV upload, job queue, validation | Not started |
 | M6 | Reconciliation engine: matching, idempotent runs | Not started |
 | M7 | Exception management: workflow, optimistic locking | Not started |
@@ -252,6 +290,16 @@ request.
 | M11 | Deployment and portfolio | Not started |
 
 [TASKS.md](TASKS.md) lists every task; [plans/](plans/README.md) explains how each phase is built.
+
+### API so far
+
+| Endpoint | Purpose |
+| -------- | ------- |
+| `POST /api/v1/auth/login`, `/refresh`, `/logout`, `/change-password` | Session lifecycle |
+| `GET/POST /api/v1/members`, `PATCH /api/v1/members/{userId}`, `POST …/reset-password`, `POST …/disable` | Member management (`MEMBER_MANAGE`) |
+| `GET/POST /api/v1/platform/organizations` | Organizations (platform admins only) |
+
+Permissions per endpoint: [api-design.md §8.1](docs/api-design.md#81-index) and §9.
 
 ### Planned API surface
 
@@ -290,6 +338,7 @@ Build order is ingestion → reconciliation → exceptions. Not every endpoint i
 | Sync vs async processing | [ADR 0003](docs/adr/0003-asynchronous-imports-and-runs.md) |
 | Concurrency on exceptions | [ADR 0007](docs/adr/0007-optimistic-locking-on-exceptions.md) |
 | Tenant enforcement | [ADR 0008](docs/adr/0008-tenant-isolation.md) |
+| Building authentication in-house | [ADR 0013](docs/adr/0013-build-authentication-in-house.md) |
 | Currencies per run | [ADR 0009](docs/adr/0009-run-pinned-to-one-currency.md) |
 
 All decisions: [docs/adr/](docs/adr/).
@@ -309,7 +358,7 @@ paymentreconflow/
 │   └── shared/           # ids, json, error, web, config, jobs
 ├── src/main/resources/
 │   ├── application.yml   # shared defaults; application-<profile>.yml overlays
-│   └── db/migration/     # Flyway V1–V3
+│   └── db/migration/     # Flyway V1–V4
 ├── src/test/java/...     # *Test unit tests, *IT Testcontainers integration tests
 ├── compose.yaml          # local PostgreSQL 16 and MinIO
 ├── .github/workflows/    # CI

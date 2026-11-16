@@ -91,25 +91,25 @@ Design docs come before code. Each one answers questions from projectoverview.md
 
 Tenant isolation comes before any financial data exists, not after.
 
-- [ ] **M3.1** Write a migration and entity for `organization`.
-- [ ] **M3.2** Write a migration and entity for `app_user`, plus user–organization membership with a role: `ORG_ADMIN`, `INVESTIGATOR`, `UPLOADER`, `VIEWER`.
-- [ ] **M3.3** Authentication, built in-house as a learning exercise (ADR: why we build it, and what we'd delegate in production). Spring Security does the cryptography; we never hand-roll hashing or JWT parsing.
-  - [ ] **M3.3a** Password storage: `DelegatingPasswordEncoder` (bcrypt). Document the cost factor and how stored hashes get upgraded.
-  - [ ] **M3.3b** `POST /api/v1/auth/login` issues a short-lived access JWT (15 min), signed with `NimbusJwtEncoder` (RS256), plus a refresh token.
-  - [ ] **M3.3c** Refresh tokens: random, stored **hashed** in `refresh_token`, rotated on every use, with reuse detection that revokes the whole token family.
-  - [ ] **M3.3d** `POST /api/v1/auth/refresh` and `POST /api/v1/auth/logout` (revokes the refresh token).
-  - [ ] **M3.3e** Configure the app as an OAuth2 resource server that validates our own JWTs. The same config later accepts Keycloak's tokens (M10.1).
-  - [ ] **M3.3f** Brute-force protection: lock the account after 5 failures, return the same error for an unknown user and a wrong password, and rate-limit the login endpoint.
-  - [ ] **M3.3g** Users are created by an admin with a temporary password and must change it on first login. No public sign-up.
-  - [ ] **M3.3h** Record login success, failure, lockout, refresh-token reuse and logout in `audit_event`.
-  - [ ] **M3.3i** All code reads identity only through `CurrentUser` / `TenantContext`, never from the `SecurityContext` directly.
-  - [ ] **M3.3j** Tests: an expired token gives `401`, a tampered signature gives `401`, a reused refresh token revokes its family, lockout triggers after N failures, and the error messages for unknown user and wrong password are identical.
-- [ ] **M3.4** Tenant context: resolve the caller's `organizationId` once per request and expose it through a request-scoped bean.
-- [ ] **M3.5** Repository convention: every tenant-owned query takes `organizationId`. Add an ArchUnit rule or a review checklist item for it. Add PostgreSQL row-level security policies on every tenant-owned table as a second layer, with `app.org_id` set per transaction (`SET LOCAL` / `set_config(..., true)`).
-- [ ] **M3.6** Return `404` (not `403`) for another tenant's resource IDs, so IDs can't be probed.
-- [ ] **M3.7** Add a role-based authorization matrix (`@PreAuthorize`) and document it in `api-design.md`.
-- [ ] **M3.8** Seed data: Flyway `R__` scripts or a `local`-profile seeder creating two organizations and users for each role.
-- [ ] **M3.9** **Test:** a user in Organization A cannot read, list, update or resolve any of Organization B's resources. Write one test per endpoint and keep adding them as endpoints appear.
+- [x] **M3.1** Write a migration and entity for `organization`. *(Entity only: V1 already creates the table.)*
+- [x] **M3.2** Write a migration and entity for `app_user`, plus user–organization membership with a role: `ORG_ADMIN`, `INVESTIGATOR`, `UPLOADER`, `VIEWER`. *(Entities only: V1 has the tables. `Role` lives in `shared.context`, since `TenantContext.role()` returns it.)*
+- [x] **M3.3** Authentication, built in-house as a learning exercise (ADR: why we build it, and what we'd delegate in production). Spring Security does the cryptography; we never hand-roll hashing or JWT parsing.
+  - [x] **M3.3a** Password storage: `DelegatingPasswordEncoder` (bcrypt). Document the cost factor and how stored hashes get upgraded.
+  - [x] **M3.3b** `POST /api/v1/auth/login` issues a short-lived access JWT (15 min), signed with `NimbusJwtEncoder` (RS256), plus a refresh token.
+  - [x] **M3.3c** Refresh tokens: random, stored **hashed** in `refresh_token`, rotated on every use, with reuse detection that revokes the whole token family.
+  - [x] **M3.3d** `POST /api/v1/auth/refresh` and `POST /api/v1/auth/logout` (revokes the refresh token).
+  - [x] **M3.3e** Configure the app as an OAuth2 resource server that validates our own JWTs. The same config later accepts Keycloak's tokens (M10.1).
+  - [x] **M3.3f** Brute-force protection: lock the account after 5 failures, return the same error for an unknown user and a wrong password, and rate-limit the login endpoint.
+  - [x] **M3.3g** Users are created by an admin with a temporary password and must change it on first login. No public sign-up.
+  - [x] **M3.3h** Record login success, failure, lockout, refresh-token reuse and logout in `audit_event`.
+  - [x] **M3.3i** All code reads identity only through `CurrentUser` / `TenantContext`, never from the `SecurityContext` directly.
+  - [x] **M3.3j** Tests: an expired token gives `401`, a tampered signature gives `401`, a reused refresh token revokes its family, lockout triggers after N failures, and the error messages for unknown user and wrong password are identical.
+- [x] **M3.4** Tenant context: resolve the caller's `organizationId` once per request and expose it through a request-scoped bean. *(A `ScopedValue` bound by `TenantContextFilter` instead of a request-scoped bean, so the same mechanism works on worker threads.)*
+- [x] **M3.5** Repository convention: every tenant-owned query takes `organizationId`. Add an ArchUnit rule or a review checklist item for it. Add PostgreSQL row-level security policies on every tenant-owned table as a second layer, with `app.org_id` set per transaction (`SET LOCAL` / `set_config(..., true)`).
+- [x] **M3.6** Return `404` (not `403`) for another tenant's resource IDs, so IDs can't be probed.
+- [x] **M3.7** Add a role-based authorization matrix (`@PreAuthorize`) and document it in `api-design.md`.
+- [x] **M3.8** Seed data: Flyway `R__` scripts or a `local`-profile seeder creating two organizations and users for each role. *(A Java seeder switched on by `reconflow.seed.enabled`, which only the `local` profile sets.)*
+- [x] **M3.9** **Test:** a user in Organization A cannot read, list, update or resolve any of Organization B's resources. Write one test per endpoint and keep adding them as endpoints appear.
 
 **Exit criteria:** authenticated requests carry a tenant context, and the cross-tenant test suite exists and passes.
 
@@ -119,10 +119,10 @@ Tenant isolation comes before any financial data exists, not after.
 
 Built early so later milestones emit events as they go, instead of retrofitting them.
 
-- [ ] **M4.1** Write a migration and entity for `audit_event`: `organization_id`, `actor_id`, `action`, `entity_type`, `entity_id`, `payload` (JSONB), `request_id`, `created_at`.
-- [ ] **M4.2** Make it append-only: no update or delete paths in code, and revoke `UPDATE`/`DELETE` from the app's DB role (or add a trigger).
-- [ ] **M4.3** Add an `AuditService.record(...)` that writes in the **same transaction** as the business change.
-- [ ] **M4.4** **Test:** a rolled-back business transaction leaves no audit row.
+- [x] **M4.1** Write a migration and entity for `audit_event` *(entity only: V1 has the table)*: `organization_id`, `actor_id`, `action`, `entity_type`, `entity_id`, `payload` (JSONB), `request_id`, `created_at`.
+- [x] **M4.2** Make it append-only: no update or delete paths in code, and revoke `UPDATE`/`DELETE` from the app's DB role (or add a trigger). *(V1's triggers, now tested; the REVOKE is listed under M10.7.)*
+- [x] **M4.3** Add an `AuditService.record(...)` that writes in the **same transaction** as the business change.
+- [x] **M4.4** **Test:** a rolled-back business transaction leaves no audit row.
 
 **Exit criteria:** any module can emit audit events transactionally.
 

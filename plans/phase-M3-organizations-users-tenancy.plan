@@ -1,6 +1,6 @@
 # Phase M3 — Organizations, users and tenant isolation
 
-**Status:** Not started · **Tasks:** TASKS.md M3.1–M3.9 · **Depends on:** M2 (security starter, Testcontainers base test, ProblemDetail advice, request-ID filter), M4.1–M4.3 (pulled forward, see §4.0) · **Date:** 2026-11-01
+**Status:** Done (2026-11-16; built as M3.1, M3.2, M3.4 interfaces, M4, M3.3a–f, M3.4 filter, M3.3g–j, M3.5–M3.9: the filter moved ahead of M3.3g because the member endpoints need a tenant) · **Tasks:** TASKS.md M3.1–M3.9 · **Depends on:** M2 (security starter, Testcontainers base test, ProblemDetail advice, request-ID filter), M4.1–M4.3 (pulled forward, see §4.0) · **Date:** 2026-11-01
 
 This phase makes every request answer two questions before it touches data: *who is calling* and *which organization are they acting for*. It comes before any financial data exists because tenant isolation can't be bolted on later: every query written without it is a bug waiting to be found.
 

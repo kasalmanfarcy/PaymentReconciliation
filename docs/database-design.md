@@ -2,7 +2,7 @@
 
 **Status:** Accepted for v1 · **Task:** TASKS.md M1.10 · **Date:** 2026-11-16
 
-This documents and justifies the schema that already exists in `src/main/resources/db/migration/V1__initial_schema.sql`, `V2__auth_hardening.sql` and `V3__refresh_token_constraints.sql`. The schema was written before this document, so most decisions were already made in SQL; this is the paperwork that explains them, plus the changes later phases are planned to make.
+This documents and justifies the schema that already exists in `src/main/resources/db/migration/V1__initial_schema.sql`, `V2__auth_hardening.sql` and `V3__refresh_token_constraints.sql`, plus the row-level security policies of `V4__row_level_security.sql` (M3.5, §tenancy below). The schema was written before this document, so most decisions were already made in SQL; this is the paperwork that explains them, plus the changes later phases are planned to make.
 
 PostgreSQL 16. Flyway owns the schema; Hibernate runs with `ddl-auto=validate` and never changes it.
 

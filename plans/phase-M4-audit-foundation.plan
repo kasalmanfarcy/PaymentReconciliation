@@ -1,6 +1,6 @@
 # Phase M4 — Audit foundation
 
-**Status:** Not started · **Tasks:** TASKS.md M4.1–M4.4 · **Depends on:** M2 (request-ID filter and MDC, Testcontainers base test), M3.1–M3.2 entities and the `shared` context interfaces from M3.4 · **Date:** 2026-11-01
+**Status:** Done (2026-11-16, built after M3.1, M3.2 and the M3.4 interfaces) · **Tasks:** TASKS.md M4.1–M4.4 · **Depends on:** M2 (request-ID filter and MDC, Testcontainers base test), M3.1–M3.2 entities and the `shared` context interfaces from M3.4 · **Date:** 2026-11-01
 
 M4 is small, and it's built **before most of M3.3** (see phase-M3-organizations-users-tenancy.plan §4.0), because login events are the first things that need auditing. After this phase, any module can write an audit event with one call, and that event commits or rolls back together with the change it describes.
 

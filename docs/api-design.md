@@ -35,6 +35,8 @@ Full design: [authentication.plan §3–§4](../plans/authentication.plan).
   - Header not a UUID → `400 validation-failed`.
 - **Platform routes** (`/api/v1/platform/**`) take no organization header and require `PLATFORM_ORG_MANAGE`, granted only from `app_user.is_platform_admin` read from the database. A platform admin has **no** access to org-scoped routes (`404` on all of them).
 - While a temporary password is pending (`pwd_change` claim), every route except `POST /auth/change-password` and `POST /auth/logout` returns `403 password-change-required`.
+- `POST /auth/change-password` is about the caller, not an organization: it needs only an active user and takes no `X-Organization-Id`, so a user with several memberships (or none) can still change their password.
+- Login answers `200 {accessToken, expiresIn, memberships: [{organizationId, name, role}]}` plus the refresh cookie; `memberships` lists active organizations only. Login is rate-limited per client IP (10 attempts, refilled at 10 a minute): over the limit is `429 rate-limited` with `Retry-After`.
 
 ---
 

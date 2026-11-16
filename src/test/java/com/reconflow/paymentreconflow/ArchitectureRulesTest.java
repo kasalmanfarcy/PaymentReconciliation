@@ -56,4 +56,17 @@ class ArchitectureRulesTest {
                 .allowEmptyShould(true)
                 .check(classes);
     }
+
+    @Test
+    void onlyTheAuditModuleTouchesAuditEvents() {
+        // M4.2: the append-only log has exactly one write path, AuditService. Modulith already
+        // hides audit.internal; this names the rule so the failure says what went wrong.
+        noClasses()
+                .that()
+                .resideOutsideOfPackage(ROOT + ".audit..")
+                .should()
+                .dependOnClassesThat()
+                .resideInAPackage(ROOT + ".audit.internal..")
+                .check(classes);
+    }
 }

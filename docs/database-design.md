@@ -311,7 +311,7 @@ The interview-relevant part: each constraint below exists because of a specific 
 | `transaction_record` partitions | 13 months | A monthly job exports the partition to Parquet in object storage, verifies row counts and checksums, then `DETACH PARTITION` and `DROP`. Kept 7+ years in archive ([scalability.md §5.3](scalability.md#53-data-lifecycle)) |
 | Matches and exception links | Until their records' partition is archived | A partition can't be detached while `reconciliation_match` or `exception_case_record` rows reference it (the foreign keys). The archival job exports and removes those first |
 | Original CSV files | — | Object storage, moved to a cold tier after 90 days |
-| `audit_event` | Kept (append-only, ~5 GB a year at target load) | Partitioning or archiving audit history needs its own decision; triggers forbid deleting it today |
+| `audit_event` | Kept (append-only, ~5 GB a year at target load) | `DELETE` is blocked forever, so retention can never be a nightly delete. When it is needed: partition `audit_event` by month in a new migration, archive old partitions to object storage, then `DETACH` and `DROP` each partition as a privileged role. Out of scope for v1 |
 | `refresh_token` | Until 30 days past the family cap | The sweeper deletes `WHERE family_expires_at < now() - interval '30 days'` (V3) |
 
 ---

@@ -10,3 +10,9 @@ logging:
   level:
     org.testcontainers: INFO
     com.github.dockerjava: WARN
+
+reconflow:
+  auth:
+    jwt:
+      # Tests never use a committed key: a pair is generated when the context starts.
+      generate-ephemeral-key: true

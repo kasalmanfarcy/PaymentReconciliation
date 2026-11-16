@@ -65,6 +65,15 @@ management:
         enabled: true
 
 reconflow:
+  auth:
+    jwt:
+      issuer: reconflow
+      audience: reconflow-api
+      access-token-ttl: 15m
+      # PEM, from the environment only (authentication.plan §7). Without them, startup fails
+      # unless generate-ephemeral-key is on, which only the local and test profiles set.
+      private-key: ${JWT_PRIVATE_KEY:}
+      public-key: ${JWT_PUBLIC_KEY:}
   storage:
     endpoint: ${S3_ENDPOINT:}
     region: ${S3_REGION:us-east-1}

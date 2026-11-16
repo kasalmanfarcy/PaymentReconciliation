@@ -4,10 +4,12 @@ import com.reconflow.paymentreconflow.ingestion.application.ImportQueries;
 import com.reconflow.paymentreconflow.ingestion.application.ImportReceiver;
 import com.reconflow.paymentreconflow.ingestion.application.ImportView;
 import com.reconflow.paymentreconflow.ingestion.application.RowErrorView;
+import com.reconflow.paymentreconflow.ingestion.domain.ImportBatchStatus;
 import com.reconflow.paymentreconflow.ledger.SourceType;
 import com.reconflow.paymentreconflow.shared.context.Permission;
 import com.reconflow.paymentreconflow.shared.context.RequiresPermission;
 import java.net.URI;
+import java.util.List;
 import java.util.UUID;
 import org.jspecify.annotations.Nullable;
 import org.springframework.data.web.PagedModel;
@@ -56,6 +58,17 @@ class ImportController {
                 .location(URI.create("/api/v1/imports/" + batch.id()))
                 .header("Retry-After", RETRY_AFTER_SECONDS)
                 .body(batch);
+    }
+
+    @GetMapping
+    @RequiresPermission(Permission.IMPORT_READ)
+    PagedModel<ImportView> list(
+            @RequestParam(required = false) @Nullable List<ImportBatchStatus> status,
+            @RequestParam(required = false) @Nullable SourceType sourceType,
+            @RequestParam(required = false) @Nullable List<String> sort,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "50") int size) {
+        return new PagedModel<>(queries.list(status, sourceType, sort, page, size));
     }
 
     /** Cheap to poll: one primary-key lookup and one index count. */

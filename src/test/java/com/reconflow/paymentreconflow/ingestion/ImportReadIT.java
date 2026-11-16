@@ -88,6 +88,54 @@ class ImportReadIT extends AbstractImportIT {
         assertThat(json(unknown)).containsEntry("code", "not-found");
     }
 
+    @Test
+    @SuppressWarnings("unchecked")
+    void theListIsNewestFirstPaginatedFilteredAndClamped() throws Exception {
+        Tenant t = newTenant();
+        UUID ledger = uploadOk(t, "ledger-basic.csv", sample("ledger-basic.csv"), "INTERNAL_LEDGER");
+        UUID gateway = uploadOk(t, "gateway-basic.csv", sample("gateway-basic.csv"), "GATEWAY");
+        UUID dupes = uploadOk(t, "gateway-duplicates.csv", sample("gateway-duplicates.csv"), "GATEWAY");
+        runQueue(t);
+        UUID received =
+                uploadOk(t, "ledger-currency-mismatch.csv", sample("ledger-currency-mismatch.csv"), "INTERNAL_LEDGER");
+
+        Map<String, Object> all = json(getAs(t, "/api/v1/imports"));
+        assertThat((List<Map<String, Object>>) all.get("content"))
+                .extracting(b -> b.get("id"))
+                .containsExactly(received.toString(), dupes.toString(), gateway.toString(), ledger.toString());
+        assertThat(((List<Map<String, Object>>) all.get("content")).getFirst())
+                .doesNotContainKeys("storageKey", "contentHash");
+
+        Map<String, Object> oldestFirst = json(getAs(t, "/api/v1/imports?sort=createdAt,asc&size=2"));
+        assertThat((List<Map<String, Object>>) oldestFirst.get("content"))
+                .extracting(b -> b.get("id"))
+                .containsExactly(ledger.toString(), gateway.toString());
+        assertThat((Map<String, Object>) oldestFirst.get("page"))
+                .containsEntry("totalElements", 4)
+                .containsEntry("totalPages", 2);
+
+        Map<String, Object> gateways = json(getAs(t, "/api/v1/imports?sourceType=GATEWAY&status=COMPLETED"));
+        assertThat((List<Map<String, Object>>) gateways.get("content"))
+                .extracting(b -> b.get("id"))
+                .containsExactly(dupes.toString(), gateway.toString());
+        Map<String, Object> twoStatuses =
+                json(getAs(t, "/api/v1/imports?status=RECEIVED&status=COMPLETED&sourceType=INTERNAL_LEDGER"));
+        assertThat((List<Map<String, Object>>) twoStatuses.get("content")).hasSize(2);
+
+        Map<String, Object> clamped = json(getAs(t, "/api/v1/imports?size=100000"));
+        assertThat((Map<String, Object>) clamped.get("page")).containsEntry("size", 200);
+    }
+
+    @Test
+    void anUnknownSortFieldIsRejected() throws Exception {
+        Tenant t = newTenant();
+
+        MockHttpServletResponse res = getAs(t, "/api/v1/imports?sort=storageKey");
+
+        assertThat(res.getStatus()).isEqualTo(400);
+        assertThat(json(res)).containsEntry("code", "validation-failed");
+    }
+
     protected MockHttpServletResponse getAs(Tenant t, String url) throws Exception {
         return mockMvc.perform(get(url).with(as(t.uploader())).with(org(t.org())))
                 .andReturn()

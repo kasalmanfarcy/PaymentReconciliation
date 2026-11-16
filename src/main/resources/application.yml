@@ -43,6 +43,13 @@ spring:
     # If Flyway refuses to start, the database was set up by hand: recreate it.
     baseline-on-migrate: false
 
+  data:
+    web:
+      pageable:
+        # api-design.md §4, for any endpoint that binds a Pageable: larger sizes are clamped.
+        default-page-size: 50
+        max-page-size: 200
+
   mvc:
     problemdetails:
       # Spring MVC's own exceptions render as RFC 9457 ProblemDetail (GlobalExceptionHandler adds code/requestId).

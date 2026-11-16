@@ -75,6 +75,7 @@ class AuthorizationMatrixIT extends AbstractIntegrationTest {
                                                 + ",1.00,AED,SUCCESS,2026-10-01\n")
                                         .getBytes(StandardCharsets.UTF_8)))
                         .param("sourceType", "INTERNAL_LEDGER")),
+        new Endpoint("GET /imports", Permission.IMPORT_READ, target -> get("/api/v1/imports")),
         new Endpoint("GET /imports/{id}", Permission.IMPORT_READ, target -> get("/api/v1/imports/" + target.batchId())),
         new Endpoint(
                 "GET /imports/{id}/errors",

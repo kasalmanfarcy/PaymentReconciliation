@@ -1,6 +1,7 @@
 package com.reconflow.paymentreconflow.ingestion;
 
 import static com.reconflow.paymentreconflow.tenancy.CrossTenantCase.Expectation.AFFECTS_ONLY_A;
+import static com.reconflow.paymentreconflow.tenancy.CrossTenantCase.Expectation.LIST_EXCLUDES_B;
 import static com.reconflow.paymentreconflow.tenancy.CrossTenantCase.Expectation.NOT_FOUND;
 
 import com.reconflow.paymentreconflow.tenancy.CrossTenantCase;
@@ -34,6 +35,8 @@ class ImportCrossTenantCases implements CrossTenantCases {
                         f -> new MultipartBody(
                                 "ledger.csv", "text/csv", LEDGER, Map.of("sourceType", "INTERNAL_LEDGER")),
                         AFFECTS_ONLY_A),
+                new CrossTenantCase(
+                        "list imports", HttpMethod.GET, "/api/v1/imports", f -> Map.of(), null, LIST_EXCLUDES_B),
                 new CrossTenantCase(
                         "read org B's import",
                         HttpMethod.GET,

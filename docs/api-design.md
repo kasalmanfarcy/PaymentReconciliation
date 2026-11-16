@@ -157,6 +157,12 @@ GET /api/v1/transactions?transactionDateFrom=2026-10-01&transactionDateTo=2026-1
 
 `assignedTo` also accepts `me` and `unassigned`. A filter value that names something outside the caller's organization (a user, a batch) simply matches nothing; it never confirms the thing exists elsewhere.
 
+**IDs of other organizations (ADR 0008, M3.6).** Every lookup is by `(id, organization_id)` in one indexed query, so another organization's resource is simply not found:
+
+- In a **path**, it is `404 not-found` with the same body as an ID that never existed; the body mentions only the ID the caller sent, and both cases cost the same single query, so neither the status, the body nor the timing tells them apart. Never `403`, which would confirm the ID is real.
+- In a **request body** (an assignee, the batches a run should use), it is treated exactly like an unknown ID: the endpoint's own rule for an unknown reference applies, `422 invalid-assignee` for an assignee and `404 not-found` for a referenced resource. Never a separate "belongs to another organization" error.
+- The organization itself is checked first: a non-member's `X-Organization-Id` is `404 organization-not-found` before any permission check, so a non-member never learns whether they'd have had the right.
+
 Offset pagination slows down deep into a large list (`OFFSET 100000` still reads 100,000 rows). That's acceptable for v1's work queues; keyset pagination (`WHERE (created_at, id) < (:lastCreatedAt, :lastId)`) is the known fix if deep paging is ever needed.
 
 ---

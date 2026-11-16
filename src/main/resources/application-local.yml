@@ -12,6 +12,9 @@ logging:
     com.reconflow: DEBUG
     # Every SQL statement while developing.
     org.hibernate.SQL: DEBUG
+  pattern:
+    # Prefix every line with the request ID (blank outside a request): "[4f1c2a9e8b7d4c3a] ".
+    correlation: "[%X{requestId:-}] "
 
 management:
   endpoint:

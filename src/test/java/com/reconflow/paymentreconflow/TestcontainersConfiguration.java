@@ -33,7 +33,11 @@ public class TestcontainersConfiguration {
     @Bean
     @ServiceConnection
     PostgreSQLContainer postgres() {
-        return new PostgreSQLContainer(POSTGRES);
+        // fsync=off is Testcontainers' default command; pg_stat_statements is preloaded for M9.7's
+        // query counter (support.QueryCounter), which counts every statement the server ran,
+        // Hibernate's and JdbcClient's alike, with no proxy around the DataSource.
+        return new PostgreSQLContainer(POSTGRES)
+                .withCommand("postgres", "-c", "fsync=off", "-c", "shared_preload_libraries=pg_stat_statements");
     }
 
     /**

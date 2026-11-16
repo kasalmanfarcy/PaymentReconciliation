@@ -94,14 +94,19 @@ public class RunExecutor {
             DayResult result = retry.call(
                     "reconcile.day",
                     () -> tx.execute(s -> {
-                        context.fence(); // fence 1: we still hold the job's lease (and extend it)
-                        if (!lifecycle.lockForChunk(run, d)) { // fence 2: the checkpoint is where we expect
-                            return DayResult.ALREADY_COMMITTED; // our own retried commit had landed
+                        if (!lifecycle.lockForChunk(run, d)) { // fence 1: the checkpoint is where we expect
+                            context.fence(); // ...and it was our own retried commit that moved it
+                            return DayResult.ALREADY_COMMITTED;
                         }
                         DayResult r = strategy.reconcileDay(run, d);
                         discrepancies.record(run.organizationId(), run.runId(), d, r.discrepancies());
                         lifecycle.recordDay(run, d, r); // M8.1: the day's totals, for date-range reports
                         hook.beforeCheckpoint(run.runId(), d);
+                        // Fence 2, last (M9.7): we still hold the job's lease, checked in this
+                        // transaction, so a zombie still can't commit. Last, because the fence locks
+                        // the job row until commit: taken first, it blocked the heartbeat thread for
+                        // the whole chunk (docs/benchmarks.md §2.2).
+                        context.fence();
                         lifecycle.advanceCheckpoint(run, d);
                         return r;
                     }));

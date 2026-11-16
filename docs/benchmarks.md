@@ -96,3 +96,43 @@ Top statements by total time after the four baseline runs:
 
 The same classify statement, re-run by hand with `EXPLAIN (ANALYZE, BUFFERS)` a minute later, took **17 ms** (index scans on `transaction_record_reference_idx`, 3,215 candidate rows). So the plan, not the query, was the problem: each run started seconds after its organization's 100,000 rows were bulk-loaded, before autovacuum had analyzed them, and the planner, believing the organization had no rows, chose a plan that is catastrophic for 100,000 (one day per run paid for it, until autoanalyze caught up). The 28 s fence/heartbeat `UPDATE` is not slow work but waiting: the day-chunk took the job row's lock with its fence at the start and held it for the whole 45 s transaction, so the heartbeat thread's `UPDATE` of the same row queued behind it. Both are fixed in M9.7 (§2.3).
 
+
+### 2.3 After tuning (M9.7): one change per finding, re-measured the same way
+
+Two changes, each aimed at one finding of §2.2:
+
+1. **`ANALYZE` after a bulk import.** An import that wrote at least 10,000 rows runs `ANALYZE` on the monthly partitions it touched, after the batch is `COMPLETED` (best effort; `ImportStatisticsIT`). `ANALYZE` samples a fixed number of rows (30,000 at the default statistics target), so it costs about the same on a 45M-row partition as on this one: 112 ms mean here.
+2. **The day-chunk's lease fence moved to the end of its transaction.** It still runs inside the transaction, so a worker that lost its lease still can't commit; it no longer holds the job row's lock for the whole chunk, so the heartbeat thread isn't blocked behind it.
+
+Fresh database, same dataset, same sequence (first repetition = warm-up):
+
+| Rep | Ledger import (DB) | Ledger rows/s | Gateway import (DB) | Run 30 days (DB) | Records reconciled/s |
+|---|---|---|---|---|---|
+| warm-up | 1.64 s | 30,337 | 1.48 s | 6.25 s | 15,941 |
+| 1 | 1.45 s | 34,312 | 1.46 s | 6.49 s | 15,351 |
+| 2 | 1.56 s | 31,892 | 1.45 s | 6.29 s | 15,839 |
+| 3 | 1.43 s | 34,792 | 1.45 s | 6.51 s | 15,304 |
+
+| Measure (median of 3) | Before (`165111c`) | After (M9.7) | Target (scalability.md §6) |
+|---|---|---|---|
+| Import 50k ledger rows | 1.30 s (38,271 rows/s) | 1.45 s (34,312 rows/s) | ≥ 1,700 rows/s; 100k rows < 2 min |
+| Reconcile 50k × 50k, 30 days | 53.3 s (45.4–98.0) | **6.49 s** (6.29–6.51) | 100k × 100k day < 1 min |
+| Slowest single classify statement | 47.3 s | 0.1 s | — |
+| Fence/heartbeat `UPDATE`, max | 28.3 s | < 0.1 s | — |
+
+The import is ~10% slower (within run-to-run noise on this laptop; nothing on its path changed). The run is 8× faster and, more importantly, steady: the spread between repetitions fell from 116% to 3.5%, which is what confirms the diagnosis (a plan problem, not a capacity one). With fresh statistics the whole 30-day run spends little time in the database: across the four runs, `pg_stat_statements` totals 0.4 s for the excluded-records count and 0.2 s for the match totals, and the classify statements are each well under 100 ms. The rest is the per-case statements of the exception recorder (insert, history, audit, links: about 1,100 cases per run) and round trips; at 15,000 records/s that is far inside the SLO, so it was left alone (tuning without a failing target is guessing).
+
+Not changed, deliberately: JDBC batch sizes (imports already run at 20× the target; the plan's 100/500/1,000/5,000 sweep would tune a non-bottleneck) and indexes (every report and engine plan already uses one; §1 and §2.4).
+
+**N+1 checks (M9.7).** `NPlusOneIT` calls every list and detail endpoint for an organization with 20 references and one with 200 (full pages, `size=200`) and counts the statements PostgreSQL executed (`pg_stat_statements` in the test container, so Hibernate's and `JdbcClient`'s alike). Every endpoint runs the same number for both, and none needs more than 9:
+
+| Endpoint | Statements |
+|---|---|
+| `GET /imports`, `/imports/{id}`, `/imports/{id}/errors` | 5, 5, 5 |
+| `GET /transactions` (a `Slice`, no count) | 4 |
+| `GET /reconciliation-runs`, `/{id}`, `/{id}/matches` | 6, 4, 6 |
+| `GET /exceptions`, `/exceptions/{id}` (a duplicate case with three records) | 5, 8 |
+| `GET /audit-events`, `GET /members` | 4, 5 |
+| `GET /reports/reconciliation`, `/import-quality`, `/exception-ageing` | 9, 8, 8 |
+
+Each count includes the transaction's `set_config('app.org_id', …)` for row-level security. No N+1 was found: the read paths were written as projections and joins from M5 on (`spring.jpa.open-in-view=false` since M2.7 keeps it that way). `GET /platform/organizations` (cross-tenant, platform admin) and the streamed CSV export aren't in the check.

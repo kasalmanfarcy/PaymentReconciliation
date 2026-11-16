@@ -120,7 +120,7 @@ public class RunLifecycle {
      *
      * @return false if the checkpoint is already on {@code day}: this worker's own retried commit
      *     whose first attempt did land (a connection lost during COMMIT, M9.3), so the day is done.
-     *     Only reachable after the caller's lease fence passed, so it is never someone else's day.
+     *     The caller then fences on the job's lease, so it is never taken for someone else's day.
      */
     @Transactional(propagation = Propagation.MANDATORY)
     public boolean lockForChunk(RunContext run, LocalDate day) {

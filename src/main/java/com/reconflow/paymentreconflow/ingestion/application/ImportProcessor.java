@@ -110,6 +110,9 @@ public class ImportProcessor {
     /** What the first transaction found: the batch to work on, and where it stopped last time. */
     private record Start(SourceType sourceType, String storageKey, int lastCommittedRow, long storedErrors) {}
 
+    /** Below this many new rows an import barely moves the statistics; autovacuum is soon enough. */
+    static final int ANALYZE_AFTER_ROWS = 10_000;
+
     public void process(Job job, JobContext context) {
         UUID organizationId = job.organizationId();
         UUID batchId = job.uuid(ImportJobs.BATCH_ID);
@@ -123,9 +126,13 @@ public class ImportProcessor {
             Path file = createTempFile();
             try {
                 download(start.storageKey(), file);
-                int lastRow = readAndCommit(file, organizationId, batchId, start, context);
+                java.util.Set<java.time.YearMonth> months = new java.util.HashSet<>();
+                int lastRow = readAndCommit(file, organizationId, batchId, start, context, months);
                 faults.at(FaultPoints.IMPORT_AFTER_LAST_CHUNK);
                 finish(organizationId, batchId, lastRow, job, context);
+                if (lastRow - start.lastCommittedRow() >= ANALYZE_AFTER_ROWS) {
+                    refreshStatistics(batchId, months);
+                }
             } finally {
                 deleteQuietly(file);
             }
@@ -160,7 +167,13 @@ public class ImportProcessor {
                 errors.countByOrganizationIdAndBatchId(organizationId, batchId));
     }
 
-    private int readAndCommit(Path file, UUID organizationId, UUID batchId, Start start, JobContext context) {
+    private int readAndCommit(
+            Path file,
+            UUID organizationId,
+            UUID batchId,
+            Start start,
+            JobContext context,
+            java.util.Set<java.time.YearMonth> months) {
         int lastRow = start.lastCommittedRow();
         int committedThrough = start.lastCommittedRow();
         int errorBudget = (int) Math.max(0, props.maxStoredErrors() - start.storedErrors());
@@ -184,6 +197,7 @@ public class ImportProcessor {
                 lastRow = number;
                 hook.afterRow(batchId, number);
                 if (chunk.rows() >= props.chunkSize()) {
+                    months.addAll(chunk.months());
                     errorBudget -= commit(organizationId, batchId, chunk, committedThrough, lastRow, context);
                     committedThrough = lastRow;
                     chunk = new Chunk(errorBudget);
@@ -193,6 +207,7 @@ public class ImportProcessor {
                 }
             }
             if (!chunk.isEmpty()) {
+                months.addAll(chunk.months());
                 commit(organizationId, batchId, chunk, committedThrough, lastRow, context);
             }
         } catch (CsvEncodingException e) {
@@ -276,6 +291,19 @@ public class ImportProcessor {
                     outcomes.finished(batch, lastRow, job);
                     context.complete();
                 }));
+    }
+
+    /**
+     * M9.7: a bulk load leaves the planner's statistics stale until autovacuum catches up, and a run
+     * started in that window was planned as if the organization had no rows (docs/benchmarks.md
+     * §2.2). Best effort, after the batch is COMPLETED: the import has succeeded either way.
+     */
+    private void refreshStatistics(UUID batchId, java.util.Set<java.time.YearMonth> months) {
+        try {
+            records.refreshStatistics(months);
+        } catch (RuntimeException e) {
+            log.warn("Could not refresh statistics after batch {}; autovacuum will", batchId, e);
+        }
     }
 
     private void download(String key, Path file) {

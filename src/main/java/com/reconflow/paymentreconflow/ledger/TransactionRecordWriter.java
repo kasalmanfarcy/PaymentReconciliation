@@ -35,6 +35,15 @@ public interface TransactionRecordWriter {
 
     long countBatch(UUID organizationId, UUID batchId);
 
+    /**
+     * Refreshes the planner's statistics for these months' partitions ({@code ANALYZE}), outside any
+     * transaction, after a bulk load (M9.7). Autovacuum would get there, but seconds to minutes
+     * later: a run started right after an import was planned as if the organization had no rows,
+     * and one of its days took 45 s instead of 20 ms (docs/benchmarks.md §2.2). {@code ANALYZE}
+     * samples a fixed number of rows, so it costs the same on a big partition as on a small one.
+     */
+    void refreshStatistics(Collection<YearMonth> months);
+
     /** Deletes every record of the batch; only for an explicit retry of a FAILED batch (M5.20). */
     int deleteBatch(UUID organizationId, UUID batchId);
 }

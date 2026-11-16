@@ -71,6 +71,16 @@ class JdbcTransactionRecordWriter implements TransactionRecordWriter {
     }
 
     @Override
+    public void refreshStatistics(Collection<YearMonth> months) {
+        for (YearMonth month : new java.util.TreeSet<>(months)) {
+            if (partitions.exists(month)) {
+                // The name is built by PartitionManager from a YearMonth, never from user input.
+                jdbc.execute("ANALYZE " + PartitionManager.partitionName(month));
+            }
+        }
+    }
+
+    @Override
     @Transactional(propagation = Propagation.MANDATORY)
     public int insert(UUID organizationId, List<NewTransactionRecord> rows) {
         if (rows.isEmpty()) {

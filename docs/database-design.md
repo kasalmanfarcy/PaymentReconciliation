@@ -281,9 +281,9 @@ Only the October partition is touched (pruning), the match index serves both sha
 
 **`uuid_generate_v7()`** (V5). A SQL function producing UUIDv7 with the same layout as the Java generator (millisecond timestamp in the first 48 bits, version nibble 7), so set-based `INSERT … SELECT` can generate ids inside the database; `ReconciliationRunRepositoryIT` checks the version and timestamp.
 
-**`exception_note`** (owner: `exceptions`). Investigation notes, append-only by convention (no update or delete paths; M7.2 may add a trigger). `CHECK (length(btrim(body)) > 0)` rejects blank notes in the database too.
+**`exception_note`** (owner: `exceptions`). Investigation notes, append-only: `V6__exception_history_append_only.sql` adds row triggers that reject `UPDATE`/`DELETE` and a statement trigger that rejects `TRUNCATE` (function `block_history_changes()`, message `<table> is append-only: <op> is not allowed`). `CHECK (length(btrim(body)) > 0)` rejects blank notes in the database too. Notes are retained with the case; there is no delete path (an accepted v1 limit for data-deletion requests: a real system would pseudonymise authors or crypto-shred).
 
-**`exception_status_history`** (owner: `exceptions`). One row per status change: `from_status` (NULL on creation), `to_status` (CHECK on the three statuses), `reason`, `resolution_code` and `resolution_note` (copied so a reopen doesn't lose them), `actor_id` (NULL for system transitions). `audit_event` records the same change for compliance; this table answers "what happened to this case?" with a simple query instead of parsing audit payloads.
+**`exception_status_history`** (owner: `exceptions`). One row per status change: `from_status` (NULL on creation), `to_status` (CHECK on the three statuses), `reason`, `resolution_code` and `resolution_note` (copied so a reopen doesn't lose them), `actor_id` (NULL for system transitions). `audit_event` records the same change for compliance; this table answers "what happened to this case?" with a simple query instead of parsing audit payloads. Append-only with the same V6 triggers as `exception_note`.
 
 ---
 
@@ -303,6 +303,7 @@ The interview-relevant part: each constraint below exists because of a specific 
 | `exception_case CHECK ((status = 'RESOLVED') = (resolution_code, resolved_by, resolved_at all set))` | A resolved case without a resolution, or a stale resolution left on a reopened case | M7.4 |
 | `exception_case.version` | Lost updates (read by `@Version`, exposed as `ETag`) | M7.8, [ADR 0007](adr/0007-optimistic-locking-on-exceptions.md) |
 | `audit_event` triggers `audit_event_no_update_delete` (row) and `audit_event_no_truncate` (statement) | Any `UPDATE`, `DELETE` or `TRUNCATE` of audit history. Row triggers don't fire on `TRUNCATE`, hence the second | M4.2 |
+| `exception_note_no_update_delete` / `exception_note_no_truncate` and `exception_status_history_no_update_delete` / `exception_status_history_no_truncate` (V6) | Rewriting investigation evidence or erasing how a case was resolved before a reopen | M7.2, M7.4 |
 | `job CHECK (status <> 'RUNNING' OR (locked_by IS NOT NULL AND lease_until IS NOT NULL))` | A running job with no owner and no lease, which the sweeper could never recover | M9.1 |
 | `refresh_token_revocation_consistent CHECK ((revoked_at IS NULL) = (revoked_reason IS NULL))` and `refresh_token_replaced_only_when_rotated CHECK (replaced_by IS NULL OR revoked_reason = 'ROTATED')` (V3) | Inconsistent revocation state. Reuse detection keys off `revoked_reason = 'ROTATED'`, so a wrong reason would silently disable it or raise false alarms | M3.3c |
 | `import_batch CHECK (valid_rows + error_rows <= total_rows)` and the `>= 0` checks | Counters that can't be right | M5.14 |

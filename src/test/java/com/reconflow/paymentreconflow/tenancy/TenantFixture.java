@@ -24,6 +24,8 @@ public final class TenantFixture {
     private final UUID orgBBatch;
     private final UUID orgBFailedBatch;
     private final UUID orgBRecord;
+    private final UUID orgBRun;
+    private final UUID orgBFailedRun;
 
     private TenantFixture(JdbcTemplate jdbc) {
         this.jdbc = jdbc;
@@ -51,6 +53,30 @@ public final class TenantFixture {
                 UUID.randomUUID(),
                 orgB,
                 orgBBatch);
+        // Org B's runs: a completed one with a match, and a failed, retryable one.
+        UUID admin = orgBMembers.get(Role.ORG_ADMIN).id();
+        orgBRun = newRun(orgB, admin, "COMPLETED");
+        orgBFailedRun = newRun(orgB, admin, "FAILED");
+        UUID gatewayRecord = UUID.randomUUID();
+        jdbc.update("""
+                INSERT INTO transaction_record (id, organization_id, batch_id, source_type, source_row_number,
+                       raw_reference, normalized_reference, amount, currency, status, transaction_date, raw_values)
+                VALUES (?, ?, ?, 'GATEWAY', 2, 'PAY-B', 'PAY-B', 10.0000, 'AED', 'SUCCESS',
+                        DATE '2026-10-01', '{}'::jsonb)""", gatewayRecord, orgB, orgBBatch);
+        jdbc.update("""
+                INSERT INTO reconciliation_match (id, organization_id, run_id, ledger_record_id, ledger_txn_date,
+                       gateway_record_id, gateway_txn_date)
+                VALUES (uuid_generate_v7(), ?, ?, ?, DATE '2026-10-01', ?, DATE '2026-10-01')""", orgB, orgBRun, orgBRecord, gatewayRecord);
+    }
+
+    /** A run row of org B in the given status, written with SQL as the API would have. */
+    private UUID newRun(UUID org, UUID triggeredBy, String status) {
+        UUID id = UUID.randomUUID();
+        jdbc.update("""
+                INSERT INTO reconciliation_run (id, organization_id, idempotency_key, request_fingerprint,
+                       period_start, period_end, currency, status, triggered_by)
+                VALUES (?, ?, ?, ?, DATE '2026-10-01', DATE '2026-10-31', 'AED', ?, ?)""", id, org, "client:" + id, "0".repeat(64), status, triggeredBy);
+        return id;
     }
 
     public static TenantFixture twoOrgs(JdbcTemplate jdbc) {
@@ -87,6 +113,16 @@ public final class TenantFixture {
         return orgBRecord;
     }
 
+    /** Org B's completed run (with one match). */
+    public UUID orgBRun() {
+        return orgBRun;
+    }
+
+    /** Org B's failed, retryable run. */
+    public UUID orgBFailedRun() {
+        return orgBFailedRun;
+    }
+
     /** Every ID of org B that must never appear in a response to org A. */
     public List<UUID> orgBIds() {
         List<UUID> ids = new ArrayList<>();
@@ -94,11 +130,13 @@ public final class TenantFixture {
         ids.add(orgBBatch);
         ids.add(orgBFailedBatch);
         ids.add(orgBRecord);
+        ids.add(orgBRun);
+        ids.add(orgBFailedRun);
         orgBMembers.values().forEach(u -> ids.add(u.id()));
         return ids;
     }
 
-    /** Org B's row, memberships, members' accounts, imports, records and jobs, as plain values. */
+    /** Org B's row, memberships, members' accounts, imports, runs, records and jobs, as plain values. */
     public List<Map<String, Object>> snapshotOrgB() {
         List<Map<String, Object>> rows = new ArrayList<>();
         rows.addAll(jdbc.queryForList("select name, status from organization where id = ?", orgB));
@@ -112,6 +150,10 @@ public final class TenantFixture {
         rows.addAll(jdbc.queryForList("""
                 select id, status, total_rows, valid_rows, error_rows, last_committed_row, failure_reason
                   from import_batch where organization_id = ? order by id
+                """, orgB));
+        rows.addAll(jdbc.queryForList("""
+                select id, status, last_completed_date, failure_reason, matched_count
+                  from reconciliation_run where organization_id = ? order by id
                 """, orgB));
         rows.addAll(jdbc.queryForList("""
                 select (select count(*) from transaction_record where organization_id = ?) as records,

@@ -1,0 +1,32 @@
+package com.reconflow.paymentreconflow.reconciliation;
+
+import static com.reconflow.paymentreconflow.tenancy.CrossTenantCase.Expectation.AFFECTS_ONLY_A;
+
+import com.reconflow.paymentreconflow.tenancy.CrossTenantCase;
+import com.reconflow.paymentreconflow.tenancy.CrossTenantCases;
+import java.util.List;
+import java.util.Map;
+import org.springframework.http.HttpMethod;
+import org.springframework.stereotype.Component;
+
+/**
+ * The /reconciliation-runs endpoints' cross-tenant cases (M3.9, M6.21). Org B has a completed run
+ * with a match and a failed run (TenantFixture).
+ */
+@Component
+class ReconciliationCrossTenantCases implements CrossTenantCases {
+
+    @Override
+    public List<CrossTenantCase> cases() {
+        return List.of(
+                // A run always lands in the caller's organization and only ever reads its records;
+                // org B's identical scope doesn't make A's request a repeat of B's run.
+                new CrossTenantCase(
+                        "request a run",
+                        HttpMethod.POST,
+                        "/api/v1/reconciliation-runs",
+                        f -> Map.of(),
+                        f -> Map.of("periodStart", "2026-10-01", "periodEnd", "2026-10-31", "currency", "AED"),
+                        AFFECTS_ONLY_A));
+    }
+}

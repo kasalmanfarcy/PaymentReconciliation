@@ -88,6 +88,12 @@ class AuthorizationMatrixIT extends AbstractIntegrationTest {
                 target -> get("/api/v1/transactions?transactionDateFrom=2026-10-01&transactionDateTo=2026-10-31")),
         new Endpoint("GET /imports/{id}", Permission.IMPORT_READ, target -> get("/api/v1/imports/" + target.batchId())),
         new Endpoint(
+                "POST /reconciliation-runs",
+                Permission.RUN_CREATE,
+                target -> post("/api/v1/reconciliation-runs")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"periodStart\":\"2026-10-01\",\"periodEnd\":\"2026-10-31\",\"currency\":\"AED\"}")),
+        new Endpoint(
                 "GET /imports/{id}/errors",
                 Permission.IMPORT_READ,
                 target -> get("/api/v1/imports/" + target.batchId() + "/errors")),

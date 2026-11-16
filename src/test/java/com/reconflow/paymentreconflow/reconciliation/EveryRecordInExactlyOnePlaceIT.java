@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import com.reconflow.paymentreconflow.ledger.SourceType;
 import com.reconflow.paymentreconflow.support.AbstractIntegrationTest;
+import com.reconflow.paymentreconflow.support.TestDatabase;
 import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -68,7 +69,8 @@ class EveryRecordInExactlyOnePlaceIT {
 
     @Property(tries = 100)
     void everyInScopeRecordLandsInExactlyOneBucket(@ForAll("recordSets") List<Spec> specs) {
-        JdbcTemplate jdbc = context().getBean(JdbcTemplate.class);
+        // Fixtures as the superuser (M10.7): the app's own JdbcTemplate is subject to RLS.
+        JdbcTemplate jdbc = context().getBean(TestDatabase.class).superuser();
         RunDriver driver = context().getBean(RunDriver.class);
         var f = new ReconFixture(jdbc); // a fresh tenant per try: no cleanup needed
         Map<UUID, Spec> inserted = new HashMap<>();

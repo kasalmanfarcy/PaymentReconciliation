@@ -32,18 +32,20 @@ class DuplicateFileConstraintIT extends AbstractIntegrationTest {
         UUID org = data().newOrganization();
         UUID user = data().newMember(org, Role.UPLOADER).id();
         String hash = "c".repeat(64);
-        batches.saveAndFlush(batch(org, user, SourceType.GATEWAY, hash));
+        asTenant(org, () -> batches.saveAndFlush(batch(org, user, SourceType.GATEWAY, hash)));
 
-        Throwable failure = catchThrowable(() -> batches.saveAndFlush(batch(org, user, SourceType.GATEWAY, hash)));
+        Throwable failure = catchThrowable(() ->
+                asTenant(org, () -> batches.saveAndFlush(batch(org, user, SourceType.GATEWAY, hash))));
 
         assertThat(failure).isInstanceOf(DataIntegrityViolationException.class);
         assertThat(UniqueViolations.isViolationOf(failure, DuplicateFileException.CONSTRAINT))
                 .isTrue();
         // Same bytes uploaded as the other source type: a different import, accepted.
-        batches.saveAndFlush(batch(org, user, SourceType.INTERNAL_LEDGER, hash));
+        asTenant(org, () -> batches.saveAndFlush(batch(org, user, SourceType.INTERNAL_LEDGER, hash)));
         // ...and as the same source type in another organization.
         UUID other = data().newOrganization();
-        batches.saveAndFlush(batch(other, data().newMember(other, Role.UPLOADER).id(), SourceType.GATEWAY, hash));
+        UUID otherUser = data().newMember(other, Role.UPLOADER).id();
+        asTenant(other, () -> batches.saveAndFlush(batch(other, otherUser, SourceType.GATEWAY, hash)));
     }
 
     @Test

@@ -24,10 +24,17 @@ services:
       # Require passwords even for local connections, so credential mistakes show up here,
       # not on the first deploy. Only applied when the volume is first initialised.
       POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
+      # M10.7: read by infra/db/initdb/10-reconflow-roles.sh on first initialisation only.
+      DB_MIGRATOR_PASSWORD: ${DB_MIGRATOR_PASSWORD:?set DB_MIGRATOR_PASSWORD in .env}
+      DB_APP_PASSWORD: ${DB_APP_PASSWORD:?set DB_APP_PASSWORD in .env}
     ports:
       - "${DB_PORT:-5432}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      # Creates reconflow_migrator (Flyway) and reconflow_app (the application) when the volume is
+      # first initialised (M10.7). The superuser above is for humans only.
+      - ./infra/db/initdb:/docker-entrypoint-initdb.d:ro
+      - ./infra/db/bootstrap-roles.sql:/reconflow/bootstrap-roles.sql:ro
     healthcheck:
       # $$ passes a literal $ to the container shell (expanded there, not by Compose).
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]

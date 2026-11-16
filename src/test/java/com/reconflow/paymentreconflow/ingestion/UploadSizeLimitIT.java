@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.reconflow.paymentreconflow.TestcontainersConfiguration;
 import com.reconflow.paymentreconflow.shared.context.Role;
 import com.reconflow.paymentreconflow.support.TestData;
+import com.reconflow.paymentreconflow.support.TestDatabase;
 import com.reconflow.paymentreconflow.support.TestTokens;
 import java.io.ByteArrayOutputStream;
 import java.net.URI;
@@ -41,8 +42,12 @@ class UploadSizeLimitIT {
     @LocalServerPort
     int port;
 
-    @Autowired
     JdbcTemplate jdbc;
+
+    @Autowired
+    void superuser(TestDatabase database) {
+        this.jdbc = database.superuser(); // fixtures and assertions see every tenant (M10.7)
+    }
 
     @Autowired
     JwtEncoder jwtEncoder;

@@ -28,6 +28,7 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.util.HexFormat;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import org.jspecify.annotations.Nullable;
@@ -103,10 +104,9 @@ public class ImportReceiver {
         inspectHeader(file, sourceType);
         // Duplicate fast path (M5.9): a friendly 409 before uploading anything. Not the guarantee:
         // two concurrent uploads can both pass it. The unique constraint below is.
-        batches.findByOrganizationIdAndSourceTypeAndContentHash(organizationId, sourceType, hash)
-                .ifPresent(existing -> {
-                    throw new DuplicateFileException(existing.getId());
-                });
+        existingBatch(sourceType, hash).ifPresent(existing -> {
+            throw new DuplicateFileException(existing);
+        });
 
         UUID batchId = Ids.newId();
         // Server-generated IDs only: the original file name is user input and never touches a key.
@@ -148,12 +148,26 @@ public class ImportReceiver {
             // lookup runs in a new transaction: the failed one is rolled back and unusable.
             log.info("Lost a duplicate-upload race for {}; deleting the stored copy", key);
             storage.deleteQuietly(key);
-            UUID winner = batches.findByOrganizationIdAndSourceTypeAndContentHash(organizationId, sourceType, hash)
-                    .map(ImportBatch::getId)
-                    .orElseThrow(() -> e);
+            UUID winner = existingBatch(sourceType, hash).orElseThrow(() -> e);
             throw new DuplicateFileException(winner);
         }
         return ImportView.of(batch, 0);
+    }
+
+    /**
+     * In a transaction of its own, because the tenant reaches the database only through a
+     * transaction (TenantTransactionListener sets {@code app.org_id} as it begins). A derived query
+     * on a plain {@code Repository} interface isn't transactional by itself: before M10.7 it ran as
+     * a superuser and RLS didn't apply, so it worked; as the application role it saw no rows, the
+     * friendly 409 silently stopped happening, and the race path's lookup of the winner threw (a
+     * 500). Found by running the suite as the real application role.
+     */
+    private Optional<UUID> existingBatch(SourceType sourceType, String hash) {
+        UUID organizationId = tenant.organizationId();
+        return Optional.ofNullable(tx.execute(
+                s -> batches.findByOrganizationIdAndSourceTypeAndContentHash(organizationId, sourceType, hash)
+                        .map(ImportBatch::getId)
+                        .orElse(null)));
     }
 
     /**

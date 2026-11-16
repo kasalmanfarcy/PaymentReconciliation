@@ -2,6 +2,7 @@ package com.reconflow.paymentreconflow.reconciliation;
 
 import com.reconflow.paymentreconflow.shared.id.Ids;
 import com.reconflow.paymentreconflow.shared.jobs.JobRunner;
+import com.reconflow.paymentreconflow.support.TestDatabase;
 import java.time.LocalDate;
 import java.util.List;
 import java.util.Map;
@@ -22,8 +23,10 @@ class RunDriver {
     private final JdbcTemplate jdbc;
     private final JobRunner jobs;
 
-    RunDriver(JdbcTemplate jdbc, JobRunner jobs) {
-        this.jdbc = jdbc;
+    RunDriver(TestDatabase database, JobRunner jobs) {
+        // Test-side reads and fixture writes as the superuser: they must see the run whatever
+        // tenant is bound (M10.7); the work itself goes through the real queue as the app role.
+        this.jdbc = database.superuser();
         this.jobs = jobs;
     }
 

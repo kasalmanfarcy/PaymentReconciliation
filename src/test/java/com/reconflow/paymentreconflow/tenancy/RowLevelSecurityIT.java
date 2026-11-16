@@ -14,8 +14,8 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.JdbcTemplate;
 
 /**
- * M3.5, layer 2 on its own: the V4 policies, exercised with plain SQL as a role that RLS applies
- * to. Each assertion would fail if the policy were dropped, because these queries deliberately
+ * M3.5, layer 2 on its own: the V4 policies, exercised with plain SQL on the application's own
+ * connection (reconflow_app since M10.7, a role RLS applies to). Each assertion would fail if the policy were dropped, because these queries deliberately
  * have no (or the wrong) organization filter: that is the mistake RLS exists to contain.
  */
 class RowLevelSecurityIT extends AbstractIntegrationTest {
@@ -31,7 +31,7 @@ class RowLevelSecurityIT extends AbstractIntegrationTest {
 
     @BeforeEach
     void twoTenantsWithOneBatchEach() {
-        probe = new RlsProbe(dataSource, jdbc);
+        probe = new RlsProbe(dataSource);
         orgA = data().newOrganization();
         orgB = data().newOrganization();
         UUID uploader = data().newUser().id();
@@ -95,7 +95,6 @@ class RowLevelSecurityIT extends AbstractIntegrationTest {
         probe.onOneConnection(db -> {
             var connection = db.getDataSource().getConnection();
             connection.setAutoCommit(false);
-            db.execute("SET LOCAL ROLE rls_probe");
             db.queryForObject("SELECT set_config('app.org_id', ?, true)", String.class, orgA.toString());
             assertThat(db.queryForObject("select count(*) from import_batch where id = ?", Long.class, batchA))
                     .isEqualTo(1);
@@ -103,7 +102,6 @@ class RowLevelSecurityIT extends AbstractIntegrationTest {
 
             // Next transaction, same connection: SET LOCAL is gone. current_setting now returns ''
             // rather than NULL, which NULLIF turns back into "no tenant" instead of a cast error.
-            db.execute("SET LOCAL ROLE rls_probe");
             assertThat(db.queryForObject("select current_setting('app.org_id', true)", String.class))
                     .isEmpty();
             assertThat(db.queryForObject("select app_current_org()", UUID.class))

@@ -33,8 +33,9 @@ class ExceptionCaseRepositoryIT extends AbstractIntegrationTest {
         var f = new ExceptionFixture(jdbc, jobs);
         UUID id = f.amountMismatch("PAY-103");
 
-        ExceptionCase c =
-                tx.execute(s -> cases.findByIdAndOrganizationId(id, f.org).orElseThrow());
+        ExceptionCase c = asTenant(
+                f.org,
+                () -> tx.execute(s -> cases.findByIdAndOrganizationId(id, f.org).orElseThrow()));
 
         assertThat(c.getType()).isEqualTo(ExceptionType.AMOUNT_MISMATCH);
         assertThat(c.getStatus()).isEqualTo(ExceptionStatus.OPEN);
@@ -55,9 +56,13 @@ class ExceptionCaseRepositoryIT extends AbstractIntegrationTest {
         UUID otherOrg = data().newOrganization();
 
         String key = "AMOUNT_MISMATCH:PAY-103:PAYMENT:AED";
-        Optional<ExceptionCase> foreign = tx.execute(s -> cases.findByIdAndOrganizationId(id, otherOrg));
-        Optional<UUID> foreignActive = tx.execute(s -> cases.findActiveIdByOrganizationIdAndKey(otherOrg, key));
-        Optional<UUID> ownActive = tx.execute(s -> cases.findActiveIdByOrganizationIdAndKey(f.org, key));
+        // The other organization's view: bound to it, as its own requests would be.
+        Optional<ExceptionCase> foreign =
+                asTenant(otherOrg, () -> tx.execute(s -> cases.findByIdAndOrganizationId(id, otherOrg)));
+        Optional<UUID> foreignActive =
+                asTenant(otherOrg, () -> tx.execute(s -> cases.findActiveIdByOrganizationIdAndKey(otherOrg, key)));
+        Optional<UUID> ownActive =
+                asTenant(f.org, () -> tx.execute(s -> cases.findActiveIdByOrganizationIdAndKey(f.org, key)));
 
         assertThat(foreign).isEmpty();
         assertThat(foreignActive).isEmpty();

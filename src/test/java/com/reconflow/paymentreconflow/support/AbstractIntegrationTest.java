@@ -3,9 +3,11 @@ package com.reconflow.paymentreconflow.support;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 
 import com.reconflow.paymentreconflow.TestcontainersConfiguration;
+import com.reconflow.paymentreconflow.shared.context.TenantScope;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.Supplier;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -41,8 +43,21 @@ public abstract class AbstractIntegrationTest {
     @Autowired
     protected MockMvc mockMvc;
 
-    @Autowired
+    /**
+     * The test's own window on the database, as the superuser (M10.7): fixtures and assertions see
+     * every tenant's rows. It is a separate connection pool, so it never takes part in the
+     * application's transactions; use {@link #appJdbc} for that.
+     */
     protected JdbcTemplate jdbc;
+
+    /** The application's JdbcTemplate: reconflow_app, row-level security applies. */
+    @Autowired
+    protected JdbcTemplate appJdbc;
+
+    @Autowired
+    void useSuperuserForFixtures(TestDatabase database) {
+        this.jdbc = database.superuser();
+    }
 
     @Autowired
     protected JsonMapper jsonMapper;
@@ -76,6 +91,25 @@ public abstract class AbstractIntegrationTest {
             request.addHeader("X-Organization-Id", organizationId.toString());
             return request;
         };
+    }
+
+    @Autowired
+    private TenantScope tenantScope;
+
+    /**
+     * Runs application code (repositories, services) bound to an organization, the way a request
+     * or a job would. Since M10.7 the application's connection is subject to row-level security,
+     * so tenant-owned rows are invisible, and can't be written, with no tenant bound.
+     */
+    protected <T> T asTenant(UUID organizationId, Supplier<T> work) {
+        return tenantScope.call(organizationId, work);
+    }
+
+    protected void inTenant(UUID organizationId, Runnable work) {
+        tenantScope.call(organizationId, () -> {
+            work.run();
+            return null;
+        });
     }
 
     /** Fresh organizations and users, written with plain SQL. */

@@ -4,13 +4,16 @@ spring:
   datasource:
     # No defaults: nothing should quietly fall back to localhost in production.
     url: ${DB_URL}
-    username: ${DB_USER}
-    password: ${DB_PASSWORD}
+    username: ${DB_APP_USER}
+    password: ${DB_APP_PASSWORD}
+  flyway:
+    user: ${DB_MIGRATOR_USER}
+    password: ${DB_MIGRATOR_PASSWORD}
 
 reconflow:
   # Checked at startup by shared.config.RequiredPropertiesCheck: a missing one stops the
   # boot with a message naming it, before any bean is created.
-  required-properties: DB_URL, DB_USER, DB_PASSWORD, JWT_PRIVATE_KEY, JWT_PUBLIC_KEY
+  required-properties: DB_URL, DB_APP_USER, DB_APP_PASSWORD, DB_MIGRATOR_USER, DB_MIGRATOR_PASSWORD, JWT_PRIVATE_KEY, JWT_PUBLIC_KEY
 
 server:
   error:

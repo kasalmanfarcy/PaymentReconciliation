@@ -59,7 +59,7 @@ class TransactionRecordWriterIT extends AbstractIntegrationTest {
         }
 
         writer.ensurePartitions(Set.of(YearMonth.of(2025, 3), YearMonth.of(2025, 4), YearMonth.of(2026, 10)));
-        int inserted = tx.execute(s -> writer.insert(org, rows));
+        int inserted = asTenant(org, () -> tx.execute(s -> writer.insert(org, rows)));
 
         assertThat(inserted).isEqualTo(10);
         List<Map<String, Object>> placement = jdbc.queryForList("""
@@ -80,15 +80,16 @@ class TransactionRecordWriterIT extends AbstractIntegrationTest {
         List<NewTransactionRecord> rows = List.of(
                 record(batch, 1, "PAY-1", "1.0000", LocalDate.of(2026, 10, 1)),
                 record(batch, 2, "PAY-2", "2.0000", LocalDate.of(2026, 10, 1)));
-        tx.executeWithoutResult(s -> writer.insert(org, rows));
+        inTenant(org, () -> tx.executeWithoutResult(s -> writer.insert(org, rows)));
 
         // A resumed chunk re-reads the same rows: new UUIDs, same (batch, row, date).
         List<NewTransactionRecord> again = List.of(
                 record(batch, 1, "PAY-1", "1.0000", LocalDate.of(2026, 10, 1)),
                 record(batch, 3, "PAY-3", "3.0000", LocalDate.of(2026, 10, 1)));
-        tx.executeWithoutResult(s -> writer.insert(org, again));
+        inTenant(org, () -> tx.executeWithoutResult(s -> writer.insert(org, again)));
 
-        assertThat((long) tx.execute(s -> writer.countBatch(org, batch))).isEqualTo(3);
+        assertThat((long) asTenant(org, () -> tx.execute(s -> writer.countBatch(org, batch))))
+                .isEqualTo(3);
     }
 
     @Test
@@ -103,9 +104,9 @@ class TransactionRecordWriterIT extends AbstractIntegrationTest {
                 record(batch, 4, "PAY-302", "60.0000", day),
                 record(batch, 5, "PAY-302", "65.0000", day), // same reference, different amount: not D1
                 record(batch, 6, "PAY-303", "45.0000", day));
-        tx.executeWithoutResult(s -> writer.insert(org, rows));
+        inTenant(org, () -> tx.executeWithoutResult(s -> writer.insert(org, rows)));
 
-        int flagged = tx.execute(s -> writer.markDuplicatesInBatch(org, batch));
+        int flagged = asTenant(org, () -> tx.execute(s -> writer.markDuplicatesInBatch(org, batch)));
 
         assertThat(flagged).isEqualTo(3);
         assertThat(jdbc.queryForList(
@@ -114,7 +115,8 @@ class TransactionRecordWriterIT extends AbstractIntegrationTest {
                         Integer.class,
                         batch))
                 .containsExactly(1, 2, 3);
-        assertThat((long) tx.execute(s -> writer.countBatch(org, batch))).isEqualTo(6);
+        assertThat((long) asTenant(org, () -> tx.execute(s -> writer.countBatch(org, batch))))
+                .isEqualTo(6);
     }
 
     @Test
@@ -122,10 +124,12 @@ class TransactionRecordWriterIT extends AbstractIntegrationTest {
         UUID org = data().newOrganization();
         UUID batch = batch(org);
         NewTransactionRecord row = record(batch, 1, "PAY-106", "120.5000", LocalDate.of(2026, 10, 2));
-        tx.executeWithoutResult(s -> writer.insert(org, List.of(row)));
+        inTenant(org, () -> tx.executeWithoutResult(s -> writer.insert(org, List.of(row))));
 
-        TransactionRecord loaded = tx.execute(
-                s -> em.find(TransactionRecord.class, new TransactionRecordId(row.id(), row.transactionDate())));
+        TransactionRecord loaded = asTenant(
+                org,
+                () -> tx.execute(s ->
+                        em.find(TransactionRecord.class, new TransactionRecordId(row.id(), row.transactionDate()))));
 
         assertThat(loaded.getAmount()).isEqualByComparingTo("120.5");
         assertThat(loaded.getAmount().scale()).isEqualTo(4);

@@ -14,7 +14,7 @@ Locally: `scripts/restore_drill.sh <org-id> <run-id>` (with `SOURCE_BASE=http://
 
 Once deployed (M11), the same steps against the managed provider's point-in-time recovery: restore to a timestamp into a new instance, point a staging app at it, run steps 4–5.
 
-**Roles.** `pg_dump` carries no roles. Today the app connects as the database owner, so `--no-owner` is enough. Once M10.7 gives the application a separate non-owner role, the drill must also restore roles (`pg_dumpall --roles-only`) and grants, or row-level security will either block everything or, worse, be bypassed by an owner connection. That is the classic drill finding, noted here before it happens.
+**Roles.** `pg_dump` carries grants but no roles. Since M10.7 the application connects as `reconflow_app` and Flyway as `reconflow_migrator`, so the drill first runs `infra/db/bootstrap-roles.sql` on the fresh instance (new passwords), then restores with `--no-owner --role=reconflow_migrator`, which makes the migrator the owner of everything whoever owned it at the source, while the dump's `GRANT`/`REVOKE` statements restore the app role's privileges. Skipping the roles fails one of two ways: the grants fail and the app can read nothing, or someone "fixes" it by pointing the app at the owner and row-level security is silently bypassed. That was the drill finding predicted in M9; `scripts/restore_drill.sh` now does it.
 
 ## Log
 

@@ -10,7 +10,7 @@
 # postgres:16.4-alpine container (target, removed at the end), the packaged jar (./mvnw package).
 #
 # Environment: SOURCE_PSQL / SOURCE_DUMP (how to reach the source; defaults: the compose postgres),
-# DB_USER, DB_PASSWORD (the source's), RECONFLOW_SEED_PASSWORD, EMAIL, SOURCE_BASE (the running source
+# DB_USER, DB_PASSWORD (the source's superuser, for pg_dump), RECONFLOW_SEED_PASSWORD, EMAIL, SOURCE_BASE (the running source
 # app: its report is compared byte for byte), S3_* (the app's storage, for its readiness check).
 # Writes target/drill/.
 set -euo pipefail
@@ -61,11 +61,19 @@ sleep 2 # the image restarts the server once after initdb
 until docker exec $TARGET pg_isready -U postgres -d paymentreconflow >/dev/null 2>&1; do sleep 0.5; done
 instance_s=$(since "$t"); echo "   ready in ${instance_s}s"
 
-echo "3. restore (pg_restore --no-owner: pg_dump carries no roles; M10.7's separate roles need pg_dumpall --roles-only)"
+echo "3. roles, then restore (pg_dump carries grants but no roles: M10.7's roles come from bootstrap-roles.sql)"
 t=$(now)
+# Roles first, or the dump's GRANTs to reconflow_app fail and the app can read nothing (or, restored as
+# a superuser-owned schema, the app would be pointed at an owner and RLS bypassed). Fresh passwords:
+# the drill's copy never shares credentials with the source.
+docker cp infra/db/bootstrap-roles.sql $TARGET:/tmp/bootstrap-roles.sql
+docker exec -e PGPASSWORD=$TARGET_PASSWORD $TARGET psql -U postgres -d paymentreconflow -q \
+  -v migrator_pw=$TARGET_PASSWORD -v app_pw=$TARGET_PASSWORD -f /tmp/bootstrap-roles.sql
 docker cp "$OUT/backup.dump" $TARGET:/tmp/backup.dump # parallel restore (--jobs) needs a file, not stdin
+# --no-owner --role: every object is owned by the migrator, whoever owned it at the source.
 docker exec -e PGPASSWORD=$TARGET_PASSWORD $TARGET \
-  pg_restore -U postgres -d paymentreconflow --no-owner --jobs 4 /tmp/backup.dump 2> "$OUT/restore-warnings.txt" || true
+  pg_restore -U postgres -d paymentreconflow --no-owner --role=reconflow_migrator --jobs 4 /tmp/backup.dump \
+  2> "$OUT/restore-warnings.txt" || true
 target_psql -c "ANALYZE" >/dev/null
 restore_s=$(since "$t"); echo "   restored and analyzed in ${restore_s}s"
 
@@ -75,7 +83,8 @@ if diff -u "$OUT/source-checks.txt" "$OUT/target-checks.txt"; then echo "   iden
 
 echo "5. the app against the copy (Flyway validates every applied migration, Hibernate the schema)"
 t=$(now)
-DB_URL=jdbc:postgresql://localhost:$TARGET_PORT/paymentreconflow DB_USER=postgres DB_PASSWORD=$TARGET_PASSWORD \
+DB_URL=jdbc:postgresql://localhost:$TARGET_PORT/paymentreconflow \
+  DB_APP_PASSWORD=$TARGET_PASSWORD DB_MIGRATOR_PASSWORD=$TARGET_PASSWORD \
   java -Xmx512m -jar target/paymentreconflow-0.0.1-SNAPSHOT.jar --spring.profiles.active=local,api \
   --server.port=8090 --management.server.port=8091 --reconflow.seed.enabled=false \
   --logging.level.com.reconflow=INFO --logging.level.org.hibernate.SQL=INFO > "$OUT/app.log" 2>&1 &

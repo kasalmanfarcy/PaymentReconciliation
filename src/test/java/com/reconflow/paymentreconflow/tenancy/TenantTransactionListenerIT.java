@@ -37,10 +37,12 @@ class TenantTransactionListenerIT extends AbstractIntegrationTest {
     void everyTransactionCarriesTheBoundTenant() {
         UUID org = data().newOrganization();
 
+        // appJdbc: the application's connection, so the query runs inside tx's transaction.
         String inside = tenantScope.call(
                 org,
-                () -> tx.execute(s -> jdbc.queryForObject("select current_setting('app.org_id', true)", String.class)));
-        UUID afterwards = tx.execute(s -> jdbc.queryForObject("select app_current_org()", UUID.class));
+                () -> tx.execute(
+                        s -> appJdbc.queryForObject("select current_setting('app.org_id', true)", String.class)));
+        UUID afterwards = tx.execute(s -> appJdbc.queryForObject("select app_current_org()", UUID.class));
 
         assertThat(inside).isEqualTo(org.toString());
         assertThat(afterwards).isNull(); // no tenant bound, nothing set: SET LOCAL didn't leak
@@ -48,7 +50,7 @@ class TenantTransactionListenerIT extends AbstractIntegrationTest {
 
     @Test
     void aQueryForAnotherTenantsRowsIsEmptiedByTheDatabase() {
-        new RlsProbe(dataSource, jdbc); // ensures the role exists
+        new RlsProbe(dataSource); // asserts the app really connects as an unprivileged role
         UUID orgA = data().newOrganization();
         UUID orgB = data().newOrganization();
         UUID entity = Ids.newId();
@@ -58,26 +60,18 @@ class TenantTransactionListenerIT extends AbstractIntegrationTest {
                 orgB,
                 entity);
 
-        // Layer 1 "forgotten": bound to A, but the code passes B's ID. As the superuser (today's
-        // connection) the row comes back, which proves the query really asks for B's data...
-        int asSuperuser = tenantScope.call(
+        // The row exists (the test's superuser connection sees it)...
+        long exists = jdbc.queryForObject("select count(*) from audit_event where entity_id = ?", Long.class, entity);
+        // ...and layer 1 is "forgotten": bound to A, but the code passes B's ID. The application
+        // connects as reconflow_app (M10.7), so the database hides the row.
+        int asApplicationRole = tenantScope.call(
                 orgA,
                 () -> tx.execute(s -> auditEvents
                         .findByOrganizationIdAndEntityTypeAndEntityIdOrderByCreatedAtAscIdAsc(
                                 orgB, AuditEntityType.USER, entity)
                         .size()));
-        // ...and as a role RLS applies to (M10.7's application role), the database hides it.
-        int asApplicationRole = tenantScope.call(
-                orgA,
-                () -> tx.execute(s -> {
-                    jdbc.execute("SET LOCAL ROLE " + RlsProbe.ROLE);
-                    return auditEvents
-                            .findByOrganizationIdAndEntityTypeAndEntityIdOrderByCreatedAtAscIdAsc(
-                                    orgB, AuditEntityType.USER, entity)
-                            .size();
-                }));
 
-        assertThat(asSuperuser).isEqualTo(1);
+        assertThat(exists).isEqualTo(1);
         assertThat(asApplicationRole).isZero();
     }
 }

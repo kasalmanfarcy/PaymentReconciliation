@@ -47,7 +47,8 @@ public class PartitionManager {
                 // The cheap check first: an existing partition needs no lock on the parent.
                 if (!exists(month)) {
                     jdbc.queryForObject("SELECT pg_advisory_xact_lock(hashtext(?))", Object.class, LOCK_KEY);
-                    // V1's function is idempotent (CREATE TABLE IF NOT EXISTS).
+                    // Idempotent (CREATE TABLE IF NOT EXISTS); SECURITY DEFINER since V10, because only
+                    // the owner may add a partition and the app role isn't the owner (M10.7).
                     jdbc.queryForObject("SELECT create_transaction_record_partition(?)", Object.class, month.atDay(1));
                 }
             });
@@ -62,9 +63,10 @@ public class PartitionManager {
 
     /** Rows in the default partition; anything above zero needs a manual repair. */
     public long defaultPartitionRows() {
-        // Counted on the partition itself, which has no RLS policy of its own: a monitoring count
-        // across every tenant that returns nothing but a number.
-        Long rows = jdbc.queryForObject("SELECT count(*) FROM transaction_record_default", Long.class);
+        // Counted across every tenant by a SECURITY DEFINER function (V10): the application role has
+        // no rights on partitions themselves, because a partition queried by name has no RLS policy.
+        // Only a number comes back.
+        Long rows = jdbc.queryForObject("SELECT transaction_record_default_rows()", Long.class);
         return rows == null ? 0 : rows;
     }
 
@@ -94,9 +96,9 @@ public class PartitionManager {
     public void drop(YearMonth month) {
         requiresNew.executeWithoutResult(status -> {
             jdbc.queryForObject("SELECT pg_advisory_xact_lock(hashtext(?))", Object.class, LOCK_KEY);
-            String name = partitionName(month);
-            jdbc.execute("ALTER TABLE transaction_record DETACH PARTITION " + name);
-            jdbc.execute("DROP TABLE " + name);
+            // DDL needs the owner's rights; the app role gets them only through this one narrow
+            // SECURITY DEFINER function (V10), never as a role attribute.
+            jdbc.queryForObject("SELECT drop_transaction_record_partition(?)", Object.class, month.atDay(1));
         });
         known.remove(month);
     }

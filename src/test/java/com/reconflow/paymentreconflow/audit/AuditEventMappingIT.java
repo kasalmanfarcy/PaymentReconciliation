@@ -46,17 +46,23 @@ class AuditEventMappingIT extends AbstractIntegrationTest {
                 "version",
                 3);
 
-        tx.executeWithoutResult(s -> em.persist(AuditEvent.of(
+        // The application's connection is subject to RLS (M10.7): bind the event's organization.
+        inTenant(
                 org,
-                null,
-                AuditAction.EXCEPTION_RESOLVED,
-                AuditEntityType.EXCEPTION_CASE,
-                entityId,
-                payload,
-                "req-1")));
+                () -> tx.executeWithoutResult(s -> em.persist(AuditEvent.of(
+                        org,
+                        null,
+                        AuditAction.EXCEPTION_RESOLVED,
+                        AuditEntityType.EXCEPTION_CASE,
+                        entityId,
+                        payload,
+                        "req-1"))));
 
-        List<AuditEvent> found = events.findByOrganizationIdAndEntityTypeAndEntityIdOrderByCreatedAtAscIdAsc(
-                org, AuditEntityType.EXCEPTION_CASE, entityId);
+        // Tenant data is read inside a transaction, where the tenant reaches the database.
+        List<AuditEvent> found = asTenant(
+                org,
+                () -> tx.execute(s -> events.findByOrganizationIdAndEntityTypeAndEntityIdOrderByCreatedAtAscIdAsc(
+                        org, AuditEntityType.EXCEPTION_CASE, entityId)));
         assertThat(found).singleElement().satisfies(e -> {
             assertThat(e.getPayload()).isEqualTo(payload);
             assertThat(e.getPayload().get("amount")).isEqualTo("1000.00"); // a string, not 1E+3

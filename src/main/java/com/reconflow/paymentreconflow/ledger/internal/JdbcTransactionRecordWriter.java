@@ -73,10 +73,10 @@ class JdbcTransactionRecordWriter implements TransactionRecordWriter {
     @Override
     public void refreshStatistics(Collection<YearMonth> months) {
         for (YearMonth month : new java.util.TreeSet<>(months)) {
-            if (partitions.exists(month)) {
-                // The name is built by PartitionManager from a YearMonth, never from user input.
-                jdbc.execute("ANALYZE " + PartitionManager.partitionName(month));
-            }
+            // ANALYZE needs the table owner: as the app role a plain ANALYZE only warns and skips
+            // the table, so it goes through V10's SECURITY DEFINER function (a no-op for a month
+            // without a partition).
+            jdbc.queryForObject("SELECT analyze_transaction_record_partition(?)", Object.class, month.atDay(1));
         }
     }
 

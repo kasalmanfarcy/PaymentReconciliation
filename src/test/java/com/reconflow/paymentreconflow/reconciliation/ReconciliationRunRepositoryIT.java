@@ -40,21 +40,24 @@ class ReconciliationRunRepositoryIT extends AbstractIntegrationTest {
         UUID id = Ids.newId();
         Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
 
-        tx.executeWithoutResult(s -> runs.save(ReconciliationRun.pending(
-                id,
+        inTenant(
                 org,
-                "client:abc",
-                "a".repeat(64),
-                LocalDate.of(2026, 10, 1),
-                LocalDate.of(2026, 10, 31),
-                SourceType.INTERNAL_LEDGER,
-                SourceType.GATEWAY,
-                "AED",
-                user,
-                now)));
+                () -> tx.executeWithoutResult(s -> runs.save(ReconciliationRun.pending(
+                        id,
+                        org,
+                        "client:abc",
+                        "a".repeat(64),
+                        LocalDate.of(2026, 10, 1),
+                        LocalDate.of(2026, 10, 31),
+                        SourceType.INTERNAL_LEDGER,
+                        SourceType.GATEWAY,
+                        "AED",
+                        user,
+                        now))));
 
-        ReconciliationRun loaded =
-                tx.execute(s -> runs.findByIdAndOrganizationId(id, org).orElseThrow());
+        ReconciliationRun loaded = asTenant(
+                org,
+                () -> tx.execute(s -> runs.findByIdAndOrganizationId(id, org).orElseThrow()));
         assertThat(loaded.getStatus()).isEqualTo(RunStatus.PENDING);
         assertThat(loaded.getIdempotencyKey()).isEqualTo("client:abc");
         assertThat(loaded.getRequestFingerprint()).isEqualTo("a".repeat(64));
@@ -65,7 +68,8 @@ class ReconciliationRunRepositoryIT extends AbstractIntegrationTest {
         assertThat(loaded.getCreatedAt()).isEqualTo(now);
         // Another organization's id lookup finds nothing.
         UUID otherOrg = data().newOrganization();
-        Optional<ReconciliationRun> elsewhere = tx.execute(s -> runs.findByIdAndOrganizationId(id, otherOrg));
+        Optional<ReconciliationRun> elsewhere =
+                asTenant(otherOrg, () -> tx.execute(s -> runs.findByIdAndOrganizationId(id, otherOrg)));
         assertThat(elsewhere).isEmpty();
     }
 

@@ -104,7 +104,7 @@ class ReconciliationTenantIsolationIT extends AbstractIntegrationTest {
                 .containsAll(aRecords)
                 .containsAll(bRecords);
 
-        RlsProbe probe = new RlsProbe(dataSource, jdbc);
+        RlsProbe probe = new RlsProbe(dataSource);
         List<UUID> asTenantA =
                 probe.asTenant(a.org, j -> recordIds(new NamedParameterJdbcTemplate(j), unscoped, params));
         List<UUID> asNobody = probe.asTenant(null, j -> recordIds(new NamedParameterJdbcTemplate(j), unscoped, params));

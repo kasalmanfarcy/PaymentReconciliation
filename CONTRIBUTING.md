@@ -58,12 +58,23 @@ pushed history on `main` is never rewritten.
 ## Migrations
 
 - Next free `V` number; never edit an applied migration (Flyway rejects the changed checksum).
+- **Migrations run as `reconflow_migrator`**, the schema owner (M10.7); the application runs as
+  `reconflow_app`, which can't run DDL. A new table needs no `GRANT`: `V10`'s default privileges
+  give the app data access to every table the migrator creates. Revoke explicitly what it must not
+  have (an append-only table: `REVOKE UPDATE, DELETE, TRUNCATE ... FROM reconflow_app`).
+- **Anything the application must do that needs ownership** (DDL, `ANALYZE`) goes through a narrow
+  `SECURITY DEFINER` function with `SET search_path = public, pg_temp`, `EXECUTE` revoked from
+  `PUBLIC` and granted to `reconflow_app` (`AppRolePrivilegesIT` checks the last two). Never give the
+  app ownership or `BYPASSRLS`.
 - **Data backfills on tenant-owned tables and row-level security.** Since `V4`, every
-  tenant-owned table has `FORCE ROW LEVEL SECURITY`, so even the table owner sees only the rows
-  of the organization in `app.org_id`, and none when it isn't set. Until M10.7 separates the
-  roles, a migration that reads or updates existing rows must either run as a superuser or loop
-  over organizations with `SELECT set_config('app.org_id', <org>, true)` per organization. Schema
-  changes (DDL) are unaffected.
+  tenant-owned table has `FORCE ROW LEVEL SECURITY`, so even the owner (the migrator) sees only the
+  rows of the organization in `app.org_id`, and none when it isn't set. A migration that reads or
+  updates existing rows must loop over organizations with
+  `SELECT set_config('app.org_id', <org>, true)` per organization. Schema changes (DDL) are
+  unaffected.
+- **Tenant data is touched only inside a transaction.** The tenant reaches the database through
+  `TenantTransactionListener` when a transaction begins; a repository call outside one sees no
+  rows. A derived query on a plain `Repository` interface is not transactional by itself.
 
 ## Local setup
 

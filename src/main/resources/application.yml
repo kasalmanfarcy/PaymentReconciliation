@@ -9,10 +9,13 @@ spring:
 
   datasource:
     url: ${DB_URL:jdbc:postgresql://localhost:5432/paymentreconflow}
-    # Empty defaults keep tests (where @ServiceConnection supplies the real values) free of
-    # placeholders; application-prod.yml re-declares them with no default so prod fails fast.
-    username: ${DB_USER:}
-    password: ${DB_PASSWORD:}
+    # M10.7: the application connects as reconflow_app, which can read and write data but owns
+    # nothing (no DDL, no disabling triggers) and is subject to row-level security. Created by
+    # infra/db/bootstrap-roles.sql. Empty password default keeps tests (whose connection details
+    # come from TestcontainersConfiguration) free of placeholders; application-prod.yml re-declares
+    # it with no default so prod fails fast.
+    username: ${DB_APP_USER:reconflow_app}
+    password: ${DB_APP_PASSWORD:}
     hikari:
       maximum-pool-size: ${DB_POOL_SIZE:10}
       connection-timeout: 5000
@@ -39,6 +42,12 @@ spring:
   flyway:
     enabled: true
     locations: classpath:db/migration
+    # Migrations run as the schema owner, on their own connection (Boot opens it with these
+    # credentials, separate from the app's pool). The app's role could not run them, by design.
+    # In a deployed environment migrations become a separate step (M11.5) and the app's
+    # environment won't hold this password at all.
+    user: ${DB_MIGRATOR_USER:reconflow_migrator}
+    password: ${DB_MIGRATOR_PASSWORD:}
     # The schema is created by migrations, never baselined from an existing one.
     # If Flyway refuses to start, the database was set up by hand: recreate it.
     baseline-on-migrate: false

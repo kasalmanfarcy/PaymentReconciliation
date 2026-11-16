@@ -36,8 +36,10 @@ class ReconciliationMatchIT extends AbstractIntegrationTest {
                        gateway_record_id, gateway_txn_date)
                 VALUES (uuid_generate_v7(), ?, ?, ?, ?, ?, ?) RETURNING id""", UUID.class, f.org, run, ledger, DAY, gateway, DAY.plusDays(1));
 
-        ReconciliationMatch m =
-                tx.execute(s -> matches.findByIdAndOrganizationId(id, f.org).orElseThrow());
+        ReconciliationMatch m = asTenant(
+                f.org,
+                () -> tx.execute(
+                        s -> matches.findByIdAndOrganizationId(id, f.org).orElseThrow()));
 
         assertThat(m.getRunId()).isEqualTo(run);
         assertThat(m.getLedgerRecordId()).isEqualTo(ledger);
@@ -45,8 +47,9 @@ class ReconciliationMatchIT extends AbstractIntegrationTest {
         assertThat(m.getGatewayTxnDate()).isEqualTo(DAY.plusDays(1));
         assertThat(m.getMatchType()).isEqualTo(MatchType.EXACT);
         assertThat(m.getAmountDifference()).isEqualByComparingTo(BigDecimal.ZERO);
-        List<ReconciliationMatch> forLedger =
-                tx.execute(s -> matches.findByOrganizationIdAndRunIdAndLedgerRecordId(f.org, run, ledger));
+        List<ReconciliationMatch> forLedger = asTenant(
+                f.org,
+                () -> tx.execute(s -> matches.findByOrganizationIdAndRunIdAndLedgerRecordId(f.org, run, ledger)));
         assertThat(forLedger).hasSize(1);
     }
 }

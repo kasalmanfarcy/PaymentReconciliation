@@ -2,6 +2,7 @@ package com.reconflow.paymentreconflow.reconciliation;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.reconflow.paymentreconflow.support.TestDatabase;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.UUID;
@@ -40,8 +41,8 @@ class RunOutcomes {
 
     private final JdbcTemplate jdbc;
 
-    RunOutcomes(JdbcTemplate jdbc) {
-        this.jdbc = jdbc;
+    RunOutcomes(TestDatabase database) {
+        this.jdbc = database.superuser(); // an outside view of every record, unaffected by RLS (M10.7)
     }
 
     /** Record id → outcome, for every record of the run's organization, sources and period. */

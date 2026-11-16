@@ -43,10 +43,10 @@ class JdbcRecordArchive implements RecordArchive {
 
     @Override
     public List<UUID> organizationsIn(YearMonth month) {
-        // The partition itself has no RLS policy (only the parent has, V4): a cross-tenant list of
-        // ids for the system job, nothing else.
-        return jdbc.queryForList(
-                "SELECT DISTINCT organization_id FROM " + PartitionManager.partitionName(month), UUID.class);
+        // A cross-tenant list of ids for the system job, nothing else. Through a SECURITY DEFINER
+        // function (V10): the app role has no rights on a partition itself, because a partition
+        // has no RLS policy of its own (only the parent has, V4).
+        return jdbc.queryForList("SELECT transaction_record_partition_organizations(?)", UUID.class, month.atDay(1));
     }
 
     @Override

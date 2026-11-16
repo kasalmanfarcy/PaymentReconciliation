@@ -83,7 +83,8 @@ class TransientRetryIT extends AbstractIntegrationTest {
     }
 
     private void touch(UUID org, String who) {
-        jdbc.update("UPDATE organization SET name = ? WHERE id = ?", "touched by " + who, org);
+        // appJdbc: inside the application's transaction (the test's jdbc is a separate pool).
+        appJdbc.update("UPDATE organization SET name = ? WHERE id = ?", "touched by " + who, org);
     }
 
     private static void await(CyclicBarrier barrier) {

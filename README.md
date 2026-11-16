@@ -167,13 +167,36 @@ Credentials live in a gitignored `.env` in the project root, read by both Docker
 
 ```bash
 cp .env.example .env
-# optionally change DB_PASSWORD and S3_SECRET_KEY
+# optionally change the passwords (DB_*, S3_SECRET_KEY)
 ```
 
 The `local` profile imports it with `spring.config.import: optional:file:.env[.properties]`. Real
 environment variables take precedence over the file. No other profile reads `.env`: tests get
-their database from Testcontainers, and `prod` takes `DB_URL`, `DB_USER` and `DB_PASSWORD` from the
-environment only and refuses to start, naming the variable, if one is missing.
+their database from Testcontainers, and `prod` takes its database settings from the environment
+only and refuses to start, naming the variable, if one is missing.
+
+#### Database roles (M10.7)
+
+Three PostgreSQL roles, so row-level security and the append-only audit trail actually hold:
+
+| Role | Env vars | Used by | Can |
+|---|---|---|---|
+| superuser | `DB_USER`, `DB_PASSWORD` | humans, emergencies, `scripts/*.sh` | everything |
+| `reconflow_migrator` | `DB_MIGRATOR_USER`, `DB_MIGRATOR_PASSWORD` | Flyway | owns the schema (DDL) |
+| `reconflow_app` | `DB_APP_USER`, `DB_APP_PASSWORD` | the application | read and write data, nothing else; RLS applies |
+
+`compose.yaml` creates the two roles when the PostgreSQL volume is first initialised
+(`infra/db/initdb/10-reconflow-roles.sh` runs `infra/db/bootstrap-roles.sql`). A volume created
+before M10.7 is never re-initialised; either recreate it (`docker compose down -v`, local data only)
+or run the script once by hand:
+
+```bash
+docker compose exec -T postgres psql -U "$DB_USER" -d paymentreconflow \
+  -v migrator_pw="$DB_MIGRATOR_PASSWORD" -v app_pw="$DB_APP_PASSWORD" -f - < infra/db/bootstrap-roles.sql
+```
+
+It also hands every existing object to `reconflow_migrator`. Any other environment runs the same
+script once, as a superuser, before the first deploy.
 
 ### Start the dependencies
 

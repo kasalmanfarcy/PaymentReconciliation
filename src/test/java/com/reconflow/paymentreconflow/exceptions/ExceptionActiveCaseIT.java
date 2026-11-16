@@ -119,6 +119,11 @@ class ExceptionActiveCaseIT extends AbstractExceptionApiIT {
         // pre-check can't see it, so only the unique index can stop the second active case.
         try (Connection runTx = dataSource.getConnection()) {
             runTx.setAutoCommit(false);
+            // What the engine's chunk transaction does first: bind its tenant (RLS, M10.7).
+            try (PreparedStatement bind = runTx.prepareStatement("SELECT set_config('app.org_id', ?, true)")) {
+                bind.setString(1, f.org.toString());
+                bind.execute();
+            }
             UUID competing = Ids.newId();
             try (PreparedStatement ps = runTx.prepareStatement("""
                     INSERT INTO exception_case (id, organization_id, run_id, type, discrepancy_key, status, currency, amount)

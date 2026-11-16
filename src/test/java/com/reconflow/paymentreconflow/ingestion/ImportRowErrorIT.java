@@ -45,13 +45,16 @@ class ImportRowErrorIT extends AbstractIntegrationTest {
                 new NewRowError(9, null, RowErrorCode.MALFORMED_ROW, "Quoted field is never closed", "PAY-409,\"60"),
                 new NewRowError(2, "amount", RowErrorCode.INVALID_AMOUNT, "not a plain decimal", "PAY-402"));
 
-        tx.executeWithoutResult(s -> writer.insert(org, batch, twice));
-        tx.executeWithoutResult(s -> writer.insert(org, batch, twice)); // a resumed chunk
+        inTenant(org, () -> tx.executeWithoutResult(s -> writer.insert(org, batch, twice)));
+        inTenant(org, () -> tx.executeWithoutResult(s -> writer.insert(org, batch, twice))); // a resumed chunk
 
-        assertThat(errors.countByOrganizationIdAndBatchId(org, batch)).isEqualTo(2);
-        List<ImportRowError> page = errors.findByOrganizationIdAndBatchId(
-                        org, batch, PageRequest.of(0, 50, Sort.by("rowNumber", "columnName")))
-                .getContent();
+        long stored = asTenant(org, () -> tx.execute(s -> errors.countByOrganizationIdAndBatchId(org, batch)));
+        assertThat(stored).isEqualTo(2);
+        List<ImportRowError> page = asTenant(
+                org,
+                () -> tx.execute(s -> errors.findByOrganizationIdAndBatchId(
+                                org, batch, PageRequest.of(0, 50, Sort.by("rowNumber", "columnName")))
+                        .getContent()));
         assertThat(page).extracting(ImportRowError::getRowNumber).containsExactly(2, 9);
         assertThat(page.get(1).getColumnName()).isNull();
         assertThat(page.get(1).getErrorCode()).isEqualTo("MALFORMED_ROW");
@@ -60,8 +63,18 @@ class ImportRowErrorIT extends AbstractIntegrationTest {
     private UUID newBatch(UUID org) {
         UUID user = data().newMember(org, Role.UPLOADER).id();
         UUID id = Ids.newId();
-        batches.save(ImportBatch.received(
-                id, org, SourceType.INTERNAL_LEDGER, "l.csv", 1, "b".repeat(64), "k/" + id, user, Instant.now()));
+        inTenant(
+                org,
+                () -> tx.executeWithoutResult(s -> batches.save(ImportBatch.received(
+                        id,
+                        org,
+                        SourceType.INTERNAL_LEDGER,
+                        "l.csv",
+                        1,
+                        "b".repeat(64),
+                        "k/" + id,
+                        user,
+                        Instant.now()))));
         return id;
     }
 }

@@ -218,8 +218,13 @@ public class ReconciliationRunService {
         });
     }
 
+    /**
+     * Called after the failed insert's transaction has rolled back, so the lookup needs one of its
+     * own: the tenant reaches the database (RLS) only through a transaction. Outside one, as the
+     * application role (M10.7), it would find nothing and the 409 would lose its existingRunId.
+     */
     private ConflictException runInProgress(Scope scope) {
-        Optional<UUID> active = jdbc.sql(FIND_ACTIVE_IN_SCOPE)
+        Optional<UUID> active = tx.execute(s -> jdbc.sql(FIND_ACTIVE_IN_SCOPE)
                 .param("org", scope.organizationId())
                 .param("currency", scope.currency())
                 .param("left", scope.left().name())
@@ -227,7 +232,7 @@ public class ReconciliationRunService {
                 .param("periodStart", scope.periodStart())
                 .param("periodEnd", scope.periodEnd())
                 .query(UUID.class)
-                .optional();
+                .optional());
         return new ConflictException(
                 ProblemCodes.RUN_IN_PROGRESS,
                 "A run for this period, currency and sources is already pending or running.",

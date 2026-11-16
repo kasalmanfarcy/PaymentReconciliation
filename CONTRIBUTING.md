@@ -43,12 +43,27 @@ pushed history on `main` is never rewritten.
 
 - [ ] `./mvnw verify` passes locally
 - [ ] Money is `BigDecimal` / `NUMERIC`, compared with `compareTo`
-- [ ] Every tenant-owned query is scoped by `organizationId`
+- [ ] Every tenant-owned query is scoped by `organizationId`: tenant repositories extend
+      `Repository` (not `JpaRepository`) and every `find`/`count`/`exists`/`delete` method takes
+      an `organizationId` parameter (`TenantRepositoryConventionTest` enforces it); the ID comes
+      from `TenantContext`, never from the request
+- [ ] A new tenant-owned table gets `ENABLE` + `FORCE ROW LEVEL SECURITY` and a policy in its
+      migration (`RlsCoverageIT` fails otherwise)
 - [ ] New endpoints have cross-tenant and authorization tests
 - [ ] State changes go through the central transition logic and emit an audit event
 - [ ] Schema changes are a new Flyway migration; applied migrations are never edited
 - [ ] List endpoints paginate
 - [ ] Docs in `docs/` are updated when behaviour changes
+
+## Migrations
+
+- Next free `V` number; never edit an applied migration (Flyway rejects the changed checksum).
+- **Data backfills on tenant-owned tables and row-level security.** Since `V4`, every
+  tenant-owned table has `FORCE ROW LEVEL SECURITY`, so even the table owner sees only the rows
+  of the organization in `app.org_id`, and none when it isn't set. Until M10.7 separates the
+  roles, a migration that reads or updates existing rows must either run as a superuser or loop
+  over organizations with `SELECT set_config('app.org_id', <org>, true)` per organization. Schema
+  changes (DDL) are unaffected.
 
 ## Local setup
 

@@ -2,7 +2,7 @@
 
 A payment reconciliation and exception resolution platform. ReconFlow compares a business's internal payment ledger against payment gateway settlements, surfaces the discrepancies, and tracks how each one was investigated and resolved.
 
-> **Project status: foundation.** The database schema (Flyway V1–V3), data layer and test harness are in place. No domain code or business endpoints exist yet. See [Roadmap](#roadmap).
+> **Project status: foundation done (M2).** Schema (Flyway V1–V3), profiles, module boundaries, error model, request IDs, security defaults, quality gates and CI are in place. No domain code or business endpoints exist yet. See [Roadmap](#roadmap).
 
 ---
 
@@ -126,14 +126,15 @@ Explicitly **out of scope for v1**: one-to-many matching for aggregated settleme
 | Concern | Choice | Notes |
 | ------- | ------ | ----- |
 | Language | Java 25 | LTS |
-| Framework | Spring Boot 4.1.2 | `webmvc` + `validation` only, so far |
+| Framework | Spring Boot 4.1.2 | Web MVC, validation, data JPA, security, actuator; Spring Modulith 2.1 for module boundaries |
 | Database | PostgreSQL | `NUMERIC` for money, FK + unique constraints, transactional writes |
 | Migrations | Flyway | V1–V3 applied on startup; applied migrations are never edited |
 | Build | Maven (wrapper) | `./mvnw`, no system Maven required |
-| Testing | JUnit + Testcontainers | Tests start their own PostgreSQL 16 in Docker |
+| Testing | JUnit + Testcontainers | Unit tests (`*Test`) need no Docker; integration tests (`*IT`) start their own PostgreSQL 16 |
+| Quality gates | Spotless, JaCoCo, GitHub Actions | Palantir Java Format check, coverage reports (no threshold yet), `./mvnw verify` on every PR |
 | Async | PostgreSQL job table | Worker processes claim jobs with `SKIP LOCKED` ([ADR 0004](docs/adr/0004-postgresql-job-queue.md)); Kafka deliberately deferred |
 | Cache | Redis | Deliberately deferred; only if a concrete need appears |
-| Local infra | Docker Compose | Planned |
+| Local infra | Docker Compose | PostgreSQL 16 and MinIO (S3-compatible), see `compose.yaml` |
 
 ---
 
@@ -141,59 +142,95 @@ Explicitly **out of scope for v1**: one-to-many matching for aggregated settleme
 
 ### Prerequisites
 
-- **Java 25** — verify with `java -version`
+- **Java 25**: verify with `java -version`
 - No system Maven needed; use the bundled wrapper (`./mvnw`, executable)
-- **PostgreSQL 16** — the schema is owned by Flyway and applied on startup
-- **Docker** (Docker Desktop, OrbStack or Colima) — required by the tests, which start their own PostgreSQL
+- **Docker** with Compose (Docker Desktop, OrbStack or Colima). It runs PostgreSQL 16 and MinIO
+  for local development and the Testcontainers database for integration tests. No locally
+  installed PostgreSQL is needed.
+
+> **Colima.** Docker and Testcontainers look for `/var/run/docker.sock`, which Colima doesn't
+> create. Export these (e.g. in your shell profile) before `docker compose` or `./mvnw verify`:
+>
+> ```bash
+> export DOCKER_HOST=unix://$HOME/.colima/default/docker.sock
+> export TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock   # the path inside the Colima VM
+> ```
+>
+> With Homebrew's standalone `docker-compose`, either run `docker-compose ...` or link it as a
+> CLI plugin so `docker compose` works:
+> `mkdir -p ~/.docker/cli-plugins && ln -sfn "$(brew --prefix)/opt/docker-compose/bin/docker-compose" ~/.docker/cli-plugins/docker-compose`.
 
 ### Configure
 
-Credentials are read from a gitignored `.env` in the project root:
+Credentials live in a gitignored `.env` in the project root, read by both Docker Compose and the
+`local` profile:
 
 ```bash
 cp .env.example .env
-# then edit DB_USER and DB_PASSWORD
+# optionally change DB_PASSWORD and S3_SECRET_KEY
 ```
 
-`application.yml` loads it with `spring.config.import: optional:file:.env[.properties]`. Real
-environment variables take precedence over the file, so CI and production supply `DB_URL`,
-`DB_USER` and `DB_PASSWORD` the usual way and never ship a `.env`.
+The `local` profile imports it with `spring.config.import: optional:file:.env[.properties]`. Real
+environment variables take precedence over the file. No other profile reads `.env`: tests get
+their database from Testcontainers, and `prod` takes `DB_URL`, `DB_USER` and `DB_PASSWORD` from the
+environment only and refuses to start, naming the variable, if one is missing.
 
-### Prepare the database
-
-The application requires a database and a role that can create tables. It does **not** run
-`CREATE DATABASE`:
+### Start the dependencies
 
 ```bash
-createdb -h localhost -U "$DB_USER" paymentreconflow
+docker compose up -d
+docker compose ps        # postgres and minio "healthy"; minio-init exited (0) after creating the bucket
 ```
 
-Flyway applies `V1`–`V3` on first startup. Hibernate runs in `validate` mode, so a mismatch
-between the entities and the schema fails the boot rather than silently altering it.
-
-> **Local auth.** PostgreSQL must require a password. Homebrew's default `pg_hba.conf` uses
-> `trust` for localhost, which accepts any password and hides credential mistakes until
-> deployment. Set the `local` and `host` lines to `scram-sha-256` and reload:
-> `psql -c 'SELECT pg_reload_conf()'`.
+PostgreSQL listens on `localhost:5432` (change `DB_PORT` and `DB_URL` if that's taken), the MinIO
+S3 API on `localhost:9000` and its console on `http://localhost:9001` (log in with `S3_ACCESS_KEY` /
+`S3_SECRET_KEY`; bucket `reconflow-imports`). Data persists in named volumes;
+`docker compose down -v` wipes it.
 
 ### Run
 
 ```bash
-./mvnw spring-boot:run
+SPRING_PROFILES_ACTIVE=local,api,worker ./mvnw spring-boot:run
 ```
 
-The application starts on `http://localhost:8080` and `/actuator/health` returns `UP`. There are
-no business endpoints yet — the next milestone adds the organization and user entities.
+Flyway applies `V1`–`V3` on first startup. Hibernate runs in `validate` mode, so a mismatch between
+the entities and the schema fails the boot rather than silently altering it.
+
+| Profile | Kind | Effect |
+|---|---|---|
+| `local` | Environment | Reads `.env`, readable logs with the request ID, DEBUG SQL, full health details |
+| `prod` | Environment | Secrets from environment variables only, JSON (ECS) logs |
+| `test` | Environment | Used by the tests (Testcontainers); lives in `src/test/resources` |
+| `api` | Role | Serves HTTP traffic |
+| `worker` | Role | Turns on the job worker (`reconflow.jobs.worker.enabled`) |
+
+There is deliberately no default profile. Locally one process runs both roles.
+
+```bash
+curl -s localhost:8080/actuator/health        # {"status":"UP",...}
+curl -si localhost:8080/api/v1/anything       # 401, application/problem+json, X-Request-Id
+```
+
+Everything except `/actuator/health` and `/actuator/info` returns `401` until authentication
+arrives in M3. Errors are RFC 9457 Problem Details with `code` and `requestId`
+([api-design.md §3](docs/api-design.md#3-error-model)).
+
+`./mvnw spring-boot:test-run` runs the application against a Testcontainers PostgreSQL instead of
+Compose.
 
 ### Test
 
 ```bash
-./mvnw test
+./mvnw test       # unit tests only (*Test): fast, no Docker
+./mvnw verify     # everything: unit + integration tests (*IT, Testcontainers), Spotless check, JaCoCo
+./mvnw spotless:apply   # format the code before committing
 ```
 
-Tests need Docker but no local database and no `.env`: Testcontainers starts
-`postgres:16.4-alpine`, Flyway applies the migrations to it, and the context test checks they
-applied.
+Integration tests need Docker but no local database and no `.env`: they start
+`postgres:16.4-alpine`, share one container per run, and Flyway applies the migrations to it.
+Coverage reports land in `target/site/jacoco/` (unit) and `target/site/jacoco-it/` (integration).
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `./mvnw verify` on every pull
+request.
 
 ---
 
@@ -203,7 +240,7 @@ applied.
 | - | --------- | ------ |
 | M0 | Repository hygiene: license, conventions, protected `main` | In progress |
 | M1 | Requirements and system design: docs, ADRs, sample data | Done |
-| M2 | Project foundation: profiles, error model, logging, CI | Partly done — JPA, Flyway, schema, Testcontainers |
+| M2 | Project foundation: profiles, error model, logging, CI | Done |
 | M3 | Organizations, users, authentication, tenant isolation | Not started |
 | M4 | Append-only audit | Not started |
 | M5 | Transaction ingestion: CSV upload, job queue, validation | Not started |
@@ -266,11 +303,16 @@ paymentreconflow/
 ├── docs/                 # scalability plan; requirements, architecture, API, rules (M1)
 ├── plans/                # how each phase is built, and why
 ├── src/main/java/com/reconflow/paymentreconflow/
-│   └── PaymentreconflowApplication.java
+│   ├── PaymentreconflowApplication.java
+│   ├── organization/ security/ ingestion/ ledger/        # one package per module,
+│   ├── reconciliation/ exceptions/ reporting/ audit/     # boundaries checked by ModularityTest
+│   └── shared/           # ids, json, error, web, config, jobs
 ├── src/main/resources/
-│   ├── application.yml
+│   ├── application.yml   # shared defaults; application-<profile>.yml overlays
 │   └── db/migration/     # Flyway V1–V3
-├── src/test/java/...     # Testcontainers-backed tests
+├── src/test/java/...     # *Test unit tests, *IT Testcontainers integration tests
+├── compose.yaml          # local PostgreSQL 16 and MinIO
+├── .github/workflows/    # CI
 ├── projectoverview.md    # full system design brief
 ├── TASKS.md              # every task, M0–M11
 ├── CONTRIBUTING.md       # branch, commit and PR conventions

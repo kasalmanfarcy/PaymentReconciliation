@@ -1,6 +1,6 @@
 # Phase M2 — Project foundation
 
-**Status:** In progress (M2.1, M2.6, M2.7 done) · **Tasks:** TASKS.md M2.1–M2.16 · **Depends on:** M0 (repo, PR workflow), M1 (architecture.md module list, api-design.md error model) · **Date:** 2026-11-01
+**Status:** Done (2026-11-16; GitHub required-check setup is a manual step, see §4.15) · **Tasks:** TASKS.md M2.1–M2.16 · **Depends on:** M0 (repo, PR workflow), M1 (architecture.md module list, api-design.md error model) · **Date:** 2026-11-01
 
 This phase builds the scaffolding every feature will stand on: the database and object storage running locally, configuration per environment, module boundaries enforced by tests, one consistent error format, request IDs in every log line, formatting and coverage checks, and CI that runs it all on every pull request. No business feature ships in M2. What ships is the guarantee that when features arrive in M3–M8, they're built, tested and checked the same way every time.
 
@@ -1191,15 +1191,15 @@ Unit tests run in milliseconds and have no Docker; integration tests share one c
 
 ## 6. Exit criteria checklist
 
-- [ ] `docker compose up -d` → `docker compose ps` shows `postgres` and `minio` healthy; the bucket exists
-- [ ] `SPRING_PROFILES_ACTIVE=local,api,worker ./mvnw spring-boot:run` starts; log shows Flyway validated/applied `V1__initial_schema`, `V2__auth_hardening`, `V3__refresh_token_constraints`
-- [ ] `curl -s localhost:8080/actuator/health` → `{"status":"UP"...}`
-- [ ] `curl -si localhost:8080/api/v1/x` → `401`, `application/problem+json`, `X-Request-Id` header, `requestId` in body
-- [ ] `SPRING_PROFILES_ACTIVE=prod,api` without `DB_URL` fails fast; with it, logs are JSON
-- [ ] `./mvnw test` passes without Docker; `./mvnw verify` passes with Docker, including Spotless check and JaCoCo reports
-- [ ] `ModularityTest` fails on a deliberate boundary violation (try it once, revert)
+- [x] `docker compose up -d` → `docker compose ps` shows `postgres` and `minio` healthy; the bucket exists
+- [x] `SPRING_PROFILES_ACTIVE=local,api,worker ./mvnw spring-boot:run` starts; log shows Flyway validated/applied `V1__initial_schema`, `V2__auth_hardening`, `V3__refresh_token_constraints`
+- [x] `curl -s localhost:8080/actuator/health` → `{"status":"UP"...}`
+- [x] `curl -si localhost:8080/api/v1/x` → `401`, `application/problem+json`, `X-Request-Id` header, `requestId` in body
+- [x] `SPRING_PROFILES_ACTIVE=prod,api` without `DB_URL` fails fast; with it, logs are JSON
+- [x] `./mvnw test` passes without Docker; `./mvnw verify` passes with Docker, including Spotless check and JaCoCo reports
+- [x] `ModularityTest` fails on a deliberate boundary violation (try it once, revert)
 - [ ] GitHub Actions `build` is green on a PR and is a **required** check on `main`
-- [ ] README setup updated; TASKS.md M2.1–M2.16 ticked; exit criterion text corrected to `V1__initial_schema.sql`
+- [x] README setup updated; TASKS.md M2.1–M2.16 ticked; exit criterion text corrected to `V1__initial_schema.sql`
 
 ---
 

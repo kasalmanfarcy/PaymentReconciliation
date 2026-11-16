@@ -62,26 +62,26 @@ Design docs come before code. Each one answers questions from projectoverview.md
 ## M2 — Project foundation
 
 ### Dependencies and infrastructure
-- [ ] **M2.1** Add `spring-boot-starter-data-jpa`, the PostgreSQL driver, `flyway-core` and `flyway-database-postgresql`.
-- [ ] **M2.2** Add `spring-boot-starter-actuator` and `spring-boot-starter-security`.
-- [ ] **M2.3** Add Testcontainers (PostgreSQL) and the `spring-boot-testcontainers` support.
-- [ ] **M2.4** Add `compose.yaml` with PostgreSQL (pinned version, named volume, healthcheck) and MinIO for S3-compatible file storage (bucket `reconflow-imports`).
-- [ ] **M2.5** Switch configuration to `application.yml` with `local`, `test` and `prod` profiles. Secrets come from environment variables, never from committed files.
-- [ ] **M2.6** Set `spring.jpa.hibernate.ddl-auto=validate` so Flyway owns the schema and Hibernate only checks it.
-- [ ] **M2.7** Set `spring.jpa.open-in-view=false`.
+- [x] **M2.1** Add `spring-boot-starter-data-jpa`, the PostgreSQL driver, `flyway-core` and `flyway-database-postgresql`. *(Done with `spring-boot-starter-flyway` instead of `flyway-core`: in Boot 4 the library alone has no auto-configuration.)*
+- [x] **M2.2** Add `spring-boot-starter-actuator` and `spring-boot-starter-security`.
+- [x] **M2.3** Add Testcontainers (PostgreSQL) and the `spring-boot-testcontainers` support.
+- [x] **M2.4** Add `compose.yaml` with PostgreSQL (pinned version, named volume, healthcheck) and MinIO for S3-compatible file storage (bucket `reconflow-imports`).
+- [x] **M2.5** Switch configuration to `application.yml` with `local`, `test` and `prod` profiles. Secrets come from environment variables, never from committed files.
+- [x] **M2.6** Set `spring.jpa.hibernate.ddl-auto=validate` so Flyway owns the schema and Hibernate only checks it.
+- [x] **M2.7** Set `spring.jpa.open-in-view=false`.
 
 ### Code structure
-- [ ] **M2.8** Create the module packages: `ingestion`, `ledger`, `reconciliation`, `exceptions`, `reporting`, `audit`, `organization`, `security`, `shared`. Add the `api` and `worker` role profiles, which enable different beans (the worker sets `reconflow.jobs.worker.enabled`).
-- [ ] **M2.9** Enforce module boundaries with ArchUnit or Spring Modulith tests.
-- [ ] **M2.10** Add a global `@RestControllerAdvice` that returns `ProblemDetail` for validation, not-found, conflict and generic errors.
-- [ ] **M2.11** Add a request correlation ID: a filter, MDC, and a `X-Request-Id` response header.
-- [ ] **M2.12** Configure structured (JSON) logging for the `prod` profile.
+- [x] **M2.8** Create the module packages: `ingestion`, `ledger`, `reconciliation`, `exceptions`, `reporting`, `audit`, `organization`, `security`, `shared`. Add the `api` and `worker` role profiles, which enable different beans (the worker sets `reconflow.jobs.worker.enabled`).
+- [x] **M2.9** Enforce module boundaries with ArchUnit or Spring Modulith tests.
+- [x] **M2.10** Add a global `@RestControllerAdvice` that returns `ProblemDetail` for validation, not-found, conflict and generic errors.
+- [x] **M2.11** Add a request correlation ID: a filter, MDC, and a `X-Request-Id` response header.
+- [x] **M2.12** Configure structured (JSON) logging for the `prod` profile.
 
 ### Quality gates
-- [ ] **M2.13** Add Spotless or Checkstyle for formatting.
-- [ ] **M2.14** Add JaCoCo with a coverage report (no threshold yet).
-- [ ] **M2.15** Add a GitHub Actions workflow that runs build, tests (with Testcontainers) and format checks on each PR.
-- [ ] **M2.16** Add a base integration test class that starts the context against a Testcontainers PostgreSQL instance.
+- [x] **M2.13** Add Spotless or Checkstyle for formatting.
+- [x] **M2.14** Add JaCoCo with a coverage report (no threshold yet).
+- [x] **M2.15** Add a GitHub Actions workflow that runs build, tests (with Testcontainers) and format checks on each PR.
+- [x] **M2.16** Add a base integration test class that starts the context against a Testcontainers PostgreSQL instance.
 
 **Exit criteria:** `docker compose up` followed by `./mvnw spring-boot:run` starts against PostgreSQL, Flyway applies `V1__initial_schema.sql`, `V2__auth_hardening.sql` and `V3__refresh_token_constraints.sql`, `/actuator/health` returns `UP`, and CI is green.
 

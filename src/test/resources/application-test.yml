@@ -1,0 +1,12 @@
+# Test profile (test resources only, so it never ships). The datasource comes from the
+# Testcontainers PostgreSQL via @ServiceConnection; nothing here needs a .env.
+spring:
+  datasource:
+    # Overridden by @ServiceConnection; present so the placeholders always resolve.
+    username: test
+    password: test
+
+logging:
+  level:
+    org.testcontainers: INFO
+    com.github.dockerjava: WARN

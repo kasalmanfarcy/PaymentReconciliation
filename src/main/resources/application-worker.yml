@@ -1,0 +1,8 @@
+# Role profile: claims and runs jobs from the job table (imports, reconciliation runs, exports).
+# Worker nodes still start the web server so /actuator/health works for the orchestrator,
+# but the load balancer only routes to api nodes.
+reconflow:
+  jobs:
+    worker:
+      enabled: true
+      threads: 4

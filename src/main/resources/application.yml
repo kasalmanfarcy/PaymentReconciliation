@@ -1,17 +1,18 @@
+# Shared defaults for every environment and role. Overlays:
+#   environment: application-local.yml, application-prod.yml, (tests) application-test.yml
+#   role:        application-api.yml, application-worker.yml
+# Activate from outside, e.g. SPRING_PROFILES_ACTIVE=local,api,worker. There is deliberately no
+# default profile: a deploy that forgets to set one gets this strict base config, not dev settings.
 spring:
   application:
     name: reconflow
 
-  # Local dev convenience: .env is gitignored, .env.example is the template.
-  # Optional, so a deployment with real env vars (or CI) still starts.
-  # Real OS environment variables win over anything in this file.
-  config:
-    import: optional:file:.env[.properties]
-
   datasource:
     url: ${DB_URL:jdbc:postgresql://localhost:5432/paymentreconflow}
-    username: ${DB_USER}
-    password: ${DB_PASSWORD}
+    # Empty defaults keep tests (where @ServiceConnection supplies the real values) free of
+    # placeholders; application-prod.yml re-declares them with no default so prod fails fast.
+    username: ${DB_USER:}
+    password: ${DB_PASSWORD:}
     hikari:
       maximum-pool-size: ${DB_POOL_SIZE:10}
       connection-timeout: 5000
@@ -20,6 +21,7 @@ spring:
     # Flyway owns the schema. Hibernate only checks that the entities match it.
     hibernate:
       ddl-auto: validate
+    # No lazy loading during JSON serialization: fetch what you need inside the transaction.
     open-in-view: false
     properties:
       hibernate:
@@ -33,8 +35,21 @@ spring:
     # If Flyway refuses to start, the database was set up by hand: recreate it.
     baseline-on-migrate: false
 
+  mvc:
+    problemdetails:
+      # Spring MVC's own exceptions render as RFC 9457 ProblemDetail (GlobalExceptionHandler adds code/requestId).
+      enabled: true
+
+  servlet:
+    multipart:
+      # CSV contract limit (requirements: 50 MB); enforced again in code in M10.3.
+      max-file-size: 50MB
+      max-request-size: 51MB
+
 server:
   port: ${PORT:8080}
+  # On SIGTERM, stop accepting requests and let in-flight ones finish.
+  shutdown: graceful
 
 management:
   endpoints:
@@ -43,7 +58,24 @@ management:
         include: health,info
   endpoint:
     health:
+      # Anonymous callers see only {"status":"UP"}; component details help attackers.
       show-details: when-authorized
+      probes:
+        # /actuator/health/liveness and /readiness for the orchestrator (M9.11 builds on it).
+        enabled: true
+
+reconflow:
+  storage:
+    endpoint: ${S3_ENDPOINT:}
+    region: ${S3_REGION:us-east-1}
+    bucket: ${S3_BUCKET:reconflow-imports}
+    access-key: ${S3_ACCESS_KEY:}
+    secret-key: ${S3_SECRET_KEY:}
+  jobs:
+    worker:
+      # The worker profile turns this on. Roles switch beans through this property,
+      # not @Profile annotations, so profile names live only in YAML.
+      enabled: false
 
 logging:
   level:

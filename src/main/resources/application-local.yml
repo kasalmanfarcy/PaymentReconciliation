@@ -1,0 +1,19 @@
+# Laptop: compose.yaml dependencies, readable logs, verbose SQL.
+# Usually run as SPRING_PROFILES_ACTIVE=local,api,worker.
+spring:
+  config:
+    # Only the local profile reads .env (gitignored; .env.example is the template). Keeping the
+    # import here, not in application.yml, means tests and prod can never pick up a stray .env.
+    # Real OS environment variables still win over values in the file.
+    import: optional:file:.env[.properties]
+
+logging:
+  level:
+    com.reconflow: DEBUG
+    # Every SQL statement while developing.
+    org.hibernate.SQL: DEBUG
+
+management:
+  endpoint:
+    health:
+      show-details: always

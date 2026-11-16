@@ -1,0 +1,4 @@
+# Role profile: serves HTTP traffic behind the load balancer.
+# Nothing to override yet (API beans are on by default and the job worker is off in
+# application.yml). The file exists so the role is explicit and API-only settings,
+# such as rate limits in M10.4, have a home.

@@ -1,0 +1,17 @@
+# Production. Secrets come only from environment variables (set by the platform);
+# no .env file is read (only application-local.yml imports it).
+spring:
+  datasource:
+    # No defaults: nothing should quietly fall back to localhost in production.
+    url: ${DB_URL}
+    username: ${DB_USER}
+    password: ${DB_PASSWORD}
+
+reconflow:
+  # Checked at startup by shared.config.RequiredPropertiesCheck: a missing one stops the
+  # boot with a message naming it, before any bean is created.
+  required-properties: DB_URL, DB_USER, DB_PASSWORD
+
+server:
+  error:
+    include-stacktrace: never

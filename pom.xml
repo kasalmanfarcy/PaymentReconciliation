@@ -11,20 +11,34 @@
 	<groupId>com.reconflow</groupId>
 	<artifactId>paymentreconflow</artifactId>
 	<version>0.0.1-SNAPSHOT</version>
-	<name/>
-	<description/>
-	<url/>
+	<name>ReconFlow</name>
+	<description>
+		Multi-tenant payment reconciliation service: imports internal-ledger and
+		payment-gateway settlement files, matches them, and manages the resulting
+		exceptions through to an audited resolution.
+	</description>
+	<url>https://github.com/kasalmanfarcy/PaymentReconciliation</url>
+
 	<licenses>
-		<license/>
+		<license>
+			<name>Apache License, Version 2.0</name>
+			<url>https://www.apache.org/licenses/LICENSE-2.0</url>
+			<distribution>repo</distribution>
+		</license>
 	</licenses>
+
 	<developers>
-		<developer/>
+		<developer>
+			<id>kasalmanfarcy</id>
+			<url>https://github.com/kasalmanfarcy</url>
+		</developer>
 	</developers>
+
 	<scm>
-		<connection/>
-		<developerConnection/>
-		<tag/>
-		<url/>
+		<connection>scm:git:https://github.com/kasalmanfarcy/PaymentReconciliation.git</connection>
+		<developerConnection>scm:git:git@github.com:kasalmanfarcy/PaymentReconciliation.git</developerConnection>
+		<url>https://github.com/kasalmanfarcy/PaymentReconciliation</url>
+		<tag>HEAD</tag>
 	</scm>
 	<properties>
 		<java.version>25</java.version>

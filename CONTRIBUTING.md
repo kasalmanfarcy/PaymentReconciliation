@@ -73,6 +73,32 @@ pushed history on `main` is never rewritten.
   updates existing rows must loop over organizations with
   `SELECT set_config('app.org_id', <org>, true)` per organization. Schema changes (DDL) are
   unaffected.
+- **Migrations run as their own deploy step, never from the app (M11.5).** The `migrate` role
+  (`SPRING_PROFILES_ACTIVE=prod,migrate`) applies them with the migrator's credentials and exits;
+  deployed api and worker instances only validate, as `reconflow_app`, and refuse to start while a
+  migration is pending (`FlywayValidateOnlyIT`). `local` and `test` still migrate on startup.
+- **Old and new code run against the same schema during a deploy, and rollback means redeploying
+  the previous image** (Flyway Community has no undo). So every migration must work with the
+  previous release: **expand/contract**. Add first (a nullable column, a new table, a backfill in
+  batches), switch the code in the next release, drop the old structure in the one after. M10.1's
+  auth columns are an example: the contract step waits in `infra/db/contract/` until the release
+  after the switch.
+- **Keep locks short** (PostgreSQL 16): `ADD COLUMN` with a constant default is metadata-only; a
+  `NOT NULL` or `CHECK` on a big table goes in as `NOT VALID`, then `VALIDATE CONSTRAINT`;
+  `CREATE INDEX CONCURRENTLY` can't run in a transaction (`-- flyway:executeInTransaction=false` on
+  its own migration); start migrations that take locks with `SET lock_timeout = '5s'` so a blocked
+  `ALTER` fails the deploy instead of queueing every query behind it.
+- **Every migration from `V13` on starts with a rollback note** (`scripts/check_migration_notes.sh`
+  runs in CI; `V1`–`V12` predate the rule and must not be touched):
+
+      -- V13__exception_reason_expand.sql
+      -- Purpose : add exception_case.reason (expand step of the reason_code rename).
+      -- Rollback: safe to leave in place; the previous release ignores the column.
+      --           To remove: a forward migration DROP COLUMN reason, after reverting the code.
+      -- Locks   : ADD COLUMN without a default is metadata-only.
+
+  For a destructive change the note says what data is lost and points to the restore procedure
+  ([docs/runbooks/restore-drill.md](docs/runbooks/restore-drill.md)).
 - **Tenant data is touched only inside a transaction.** The tenant reaches the database through
   `TenantTransactionListener` when a transaction begins; a repository call outside one sees no
   rows. A derived query on a plain `Repository` interface is not transactional by itself.

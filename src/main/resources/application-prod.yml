@@ -7,13 +7,20 @@ spring:
     username: ${DB_APP_USER}
     password: ${DB_APP_PASSWORD}
   flyway:
-    user: ${DB_MIGRATOR_USER}
-    password: ${DB_MIGRATOR_PASSWORD}
+    # M11.5: api and worker only validate the schema (reconflow.flyway.strategy below), which needs
+    # no more than reading flyway_schema_history, so Flyway connects as the application role too.
+    # The migrator's credentials exist only in the migrate step (application-migrate.yml).
+    user: ${DB_APP_USER}
+    password: ${DB_APP_PASSWORD}
 
 reconflow:
   # Checked at startup by shared.config.RequiredPropertiesCheck: a missing one stops the
-  # boot with a message naming it, before any bean is created.
-  required-properties: DB_URL, DB_APP_USER, DB_APP_PASSWORD, DB_MIGRATOR_USER, DB_MIGRATOR_PASSWORD, OIDC_ISSUER_URI, KEYCLOAK_BASE_URL, KEYCLOAK_ADMIN_CLIENT_SECRET
+  # boot with a message naming it, before any bean is created. (The migrate role overrides it.)
+  required-properties: DB_URL, DB_APP_USER, DB_APP_PASSWORD, OIDC_ISSUER_URI, KEYCLOAK_BASE_URL, KEYCLOAK_ADMIN_CLIENT_SECRET
+  flyway:
+    # Never migrate from an application instance: shared.db.FlywayStrategyConfig. A pending
+    # migration fails the start, naming the version, and the platform keeps the old instances.
+    strategy: validate
 
 server:
   error:

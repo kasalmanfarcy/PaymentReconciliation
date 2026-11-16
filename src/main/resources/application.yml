@@ -49,8 +49,8 @@ spring:
     locations: classpath:db/migration
     # Migrations run as the schema owner, on their own connection (Boot opens it with these
     # credentials, separate from the app's pool). The app's role could not run them, by design.
-    # In a deployed environment migrations become a separate step (M11.5) and the app's
-    # environment won't hold this password at all.
+    # Deployed, migrations are a separate step (the migrate role, M11.5) and the api/worker
+    # environment doesn't hold this password at all: application-prod.yml only validates.
     user: ${DB_MIGRATOR_USER:reconflow_migrator}
     password: ${DB_MIGRATOR_PASSWORD:}
     # The schema is created by migrations, never baselined from an existing one.
@@ -170,6 +170,10 @@ management:
           include: readinessState, db, storage
 
 reconflow:
+  flyway:
+    # migrate (here: local and test apply migrations on startup) or validate (prod's api and
+    # worker, M11.5): shared.db.FlywayStrategyConfig.
+    strategy: migrate
   auth:
     keycloak:
       # M10.1: user management through Keycloak's Admin REST API (security.idp). The service-account

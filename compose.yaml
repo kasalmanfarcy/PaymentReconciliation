@@ -169,8 +169,6 @@ services:
       SPRING_PROFILES_ACTIVE: prod,api,demo
       DB_APP_USER: ${DB_APP_USER:-reconflow_app}
       DB_APP_PASSWORD: ${DB_APP_PASSWORD}
-      DB_MIGRATOR_USER: ${DB_MIGRATOR_USER:-reconflow_migrator}
-      DB_MIGRATOR_PASSWORD: ${DB_MIGRATOR_PASSWORD}
     # Only the public port. The management port (8081: probes, metrics) stays on the compose network.
     ports:
       - "8080:8080"
@@ -190,8 +188,6 @@ services:
       SPRING_PROFILES_ACTIVE: prod,worker
       DB_APP_USER: ${DB_APP_USER:-reconflow_app}
       DB_APP_PASSWORD: ${DB_APP_PASSWORD}
-      DB_MIGRATOR_USER: ${DB_MIGRATOR_USER:-reconflow_migrator}
-      DB_MIGRATOR_PASSWORD: ${DB_MIGRATOR_PASSWORD}
     depends_on:
       migrate:
         condition: service_completed_successfully

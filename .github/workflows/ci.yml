@@ -31,6 +31,10 @@ jobs:
           java-version: '25'
           cache: maven
 
+      - name: Migration rollback notes
+        # M11.5: every migration from V13 on says what to do if its release is rolled back.
+        run: scripts/check_migration_notes.sh
+
       - name: Build, test, format check, coverage
         # verify = compile, unit tests (Surefire), Testcontainers integration tests (Failsafe),
         # Spotless check and JaCoCo reports. -B: batch mode; -ntp: no download progress noise.

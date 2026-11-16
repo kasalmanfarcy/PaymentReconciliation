@@ -22,6 +22,10 @@ management:
       show-details: always
 
 reconflow:
+  storage:
+    # compose.yaml's MinIO. Without this default, a .env missing S3_ENDPOINT would send uploads to
+    # AWS's real S3 endpoint (a blank endpoint means AWS in StorageProperties).
+    endpoint: ${S3_ENDPOINT:http://localhost:9000}
   seed:
     # Two organizations, a user per role, a two-org user and a platform admin (security.seed).
     # Local only: no other profile turns this on, so prod can never seed.

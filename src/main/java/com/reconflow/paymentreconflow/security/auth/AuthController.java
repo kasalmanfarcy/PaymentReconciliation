@@ -6,6 +6,7 @@ import com.reconflow.paymentreconflow.security.token.RefreshService;
 import com.reconflow.paymentreconflow.security.user.MembershipQueries.MembershipSummary;
 import com.reconflow.paymentreconflow.shared.error.ProblemCodes;
 import com.reconflow.paymentreconflow.shared.error.ProblemDetails;
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import java.util.List;
@@ -57,15 +58,27 @@ class AuthController {
     private final AuthService auth;
     private final RefreshService refresh;
     private final RefreshCookies cookies;
+    private final LoginRateLimiter rateLimiter;
 
-    AuthController(AuthService auth, RefreshService refresh, RefreshCookies cookies) {
+    AuthController(AuthService auth, RefreshService refresh, RefreshCookies cookies, LoginRateLimiter rateLimiter) {
         this.auth = auth;
         this.refresh = refresh;
         this.cookies = cookies;
+        this.rateLimiter = rateLimiter;
     }
 
     @PostMapping(path = "/login", consumes = MediaType.APPLICATION_JSON_VALUE)
-    ResponseEntity<?> login(@Valid @RequestBody LoginRequest request) {
+    ResponseEntity<?> login(@Valid @RequestBody LoginRequest request, HttpServletRequest http) {
+        LoginRateLimiter.Decision decision = rateLimiter.tryAcquire(http.getRemoteAddr());
+        if (!decision.allowed()) {
+            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+                    .header(HttpHeaders.RETRY_AFTER, Long.toString(decision.retryAfterSeconds()))
+                    .contentType(MediaType.APPLICATION_PROBLEM_JSON)
+                    .body(ProblemDetails.of(
+                            HttpStatus.TOO_MANY_REQUESTS,
+                            ProblemCodes.RATE_LIMITED,
+                            "Too many login attempts. Try again later."));
+        }
         return switch (auth.login(request.email(), request.password())) {
             case LoginResult.Success s ->
                 ResponseEntity.ok()

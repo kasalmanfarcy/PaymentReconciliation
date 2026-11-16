@@ -8,8 +8,8 @@ import org.springframework.http.HttpMethod;
 /**
  * One endpoint's cross-tenant check: org A's most privileged user calls it, aimed at org B's data.
  *
- * @param pathTemplate exactly as mapped, e.g. {@code /api/v1/members/{userId}}; the completeness
- *     meta-test matches on it
+ * @param pathTemplate exactly as mapped, e.g. {@code /api/v1/members/{userId}}, optionally followed
+ *     by a query string; the completeness meta-test matches on the part before {@code ?}
  * @param orgBTarget the path variables, pointing at org B's resources (created by the fixture)
  * @param body the request body, or null
  */
@@ -30,8 +30,10 @@ public record CrossTenantCase(
         AFFECTS_ONLY_A
     }
 
+    /** Method and path, without any query string: what the completeness meta-test matches on. */
     public String key() {
-        return method.name() + " " + pathTemplate;
+        int query = pathTemplate.indexOf('?');
+        return method.name() + " " + (query < 0 ? pathTemplate : pathTemplate.substring(0, query));
     }
 
     @Override

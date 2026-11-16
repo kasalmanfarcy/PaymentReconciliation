@@ -1,5 +1,6 @@
 package com.reconflow.paymentreconflow.exceptions;
 
+import static com.reconflow.paymentreconflow.tenancy.CrossTenantCase.Expectation.LIST_EXCLUDES_B;
 import static com.reconflow.paymentreconflow.tenancy.CrossTenantCase.Expectation.NOT_FOUND;
 
 import com.reconflow.paymentreconflow.tenancy.CrossTenantCase;
@@ -22,6 +23,31 @@ class ExceptionCrossTenantCases implements CrossTenantCases {
     @Override
     public List<CrossTenantCase> cases() {
         List<CrossTenantCase> cases = new ArrayList<>();
+        cases.add(new CrossTenantCase(
+                "list exceptions",
+                HttpMethod.GET,
+                "/api/v1/exceptions?status=OPEN&status=RESOLVED",
+                f -> Map.of(),
+                null,
+                LIST_EXCLUDES_B));
+        // Filters aimed at org B's run and user: an empty page, never a hint that they exist.
+        cases.add(new CrossTenantCase(
+                "list exceptions of org B's run",
+                HttpMethod.GET,
+                "/api/v1/exceptions?runId={runId}",
+                f -> Map.of("runId", f.orgBRun()),
+                null,
+                LIST_EXCLUDES_B));
+        cases.add(new CrossTenantCase(
+                "list exceptions assigned to org B's user",
+                HttpMethod.GET,
+                "/api/v1/exceptions?assignedTo={userId}",
+                f -> Map.of(
+                        "userId",
+                        f.orgBMember(com.reconflow.paymentreconflow.shared.context.Role.INVESTIGATOR)
+                                .id()),
+                null,
+                LIST_EXCLUDES_B));
         cases.add(new CrossTenantCase(
                 "read org B's exception",
                 HttpMethod.GET,

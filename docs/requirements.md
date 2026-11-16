@@ -159,7 +159,111 @@ Things v1 treats as true without proof. Writing them down means we notice when o
 
 ## 7. CSV file contracts
 
-_Added in M1.3._
+The exact file formats the importer accepts. The upload checks (M5.7), the row validator (M5.11), the samples ([samples/README.md](samples/README.md)) and the API error messages all derive from this section. **Change the contract here first, then the code.**
+
+How the accepted values are turned into canonical ones (trimming, upper-casing, UTC dates, status mapping) is normalization, defined once in [reconciliation-rules.md §1](reconciliation-rules.md#1-normalization). This section only says what is *valid*.
+
+### 7.1 General format (both sources)
+
+| Property | Rule | If violated |
+|---|---|---|
+| Encoding | UTF-8. A leading byte-order mark (BOM) is accepted and stripped. Invalid bytes are never replaced with `�` | Invalid UTF-8 in the header → upload rejected `400 invalid-encoding`. Invalid UTF-8 further in → batch `FAILED`, `failure_reason = invalid-encoding at row N` |
+| Delimiter | Comma | No separate error: a semicolon file has one header column, so it fails the header check |
+| Quoting | RFC 4180. Fields containing commas, quotes or line breaks are wrapped in `"`; a `"` inside a quoted field is doubled (`""`). Spaces around a field are part of the field | Row error `MALFORMED_ROW` (see §7.5 for the unterminated-quote case) |
+| Header row | Required, first line. Names are matched case-insensitively after trimming. Column order doesn't matter. Unknown columns are allowed: ignored for matching, kept in `raw_values` | Missing required column → `400 missing-columns` at upload, listing them. A header name that repeats → `400 duplicate-columns` |
+| Field count | Every data row has as many fields as the header | Row error `MALFORMED_ROW` |
+| Line endings | LF or CRLF, mixed allowed | — |
+| Empty lines | Skipped and not counted as rows | — |
+| Size | ≤ 50 MB | `413 file-too-large` at upload |
+| Rows | 1 – 500,000 data rows | Zero bytes, no header, or a header with no data row → `400 empty-file` at upload. More than 500,000 → batch `FAILED` with `failure_reason = too-many-rows` |
+| File type | Filename ends in `.csv` (any case), and the part's `Content-Type` is `text/csv`, `text/plain`, `application/vnd.ms-excel` (what Windows sends for `.csv` when Excel is installed) or `application/octet-stream` | `415 unsupported-media-type`. The content type is only a first filter; the real test is parsing the header |
+| Dates | `transaction_date`: ISO-8601 calendar date `YYYY-MM-DD` | Row error `INVALID_DATE` |
+| Timestamps | `transaction_at`: ISO-8601 date-time **with an offset**, e.g. `2026-10-01T09:15:00+04:00` or `2026-10-01T05:15:00Z`. A time without an offset is rejected: it's ambiguous, and guessing a zone moves payments across midnight | Row error `INVALID_TIMESTAMP` |
+| Date window | The record's transaction date (after rule N7) is no more than 2 years in the past and no more than 31 days in the future, relative to today in UTC. Both limits are configuration (`reconflow.import.oldest-transaction-date`, `newest-transaction-date`) | Row error `DATE_OUT_OF_RANGE` |
+| Amounts | Plain decimal: optional leading `+`, digits, optional `.` and digits. No thousands separators, no currency symbols, no exponent. At most 15 integer digits and 4 decimal places. Must be > 0 | Row errors `INVALID_AMOUNT`, `AMOUNT_NOT_POSITIVE`, `AMOUNT_SCALE_EXCEEDED`, `AMOUNT_OUT_OF_RANGE` (§7.5) |
+| Currency | ISO-4217 alphabetic code, case-insensitive in the file; must be in the JDK's `Currency.getAvailableCurrencies()` | Row error `INVALID_CURRENCY` |
+| Reference | Non-blank; at most 128 characters after normalization | Row errors `MISSING_REQUIRED_FIELD`, `REFERENCE_TOO_LONG` |
+
+Why reject instead of fix: every silent fix (dropping a thousands separator, guessing a time zone, rounding a fifth decimal) is a decision about someone's money made without telling them. A row error is visible, has a row number, and the user can correct the source.
+
+### 7.2 Internal ledger (`source_type = INTERNAL_LEDGER`)
+
+| Column | Required | Example | Maps to |
+|---|---|---|---|
+| `reference` | Yes | `PAY-101` | `raw_reference` (as is), `normalized_reference` (N1–N4) |
+| `amount` | Yes | `1000.00` | `amount` (N6) |
+| `currency` | Yes | `AED` | `currency` (N5) |
+| `status` | Yes | `SUCCESS` | `status` (N9) |
+| `transaction_at` | One of these two columns must exist, and each row must fill at least one | `2026-10-01T09:15:00+04:00` | `transaction_at`; `transaction_date` = its UTC date (N7) |
+| `transaction_date` | (see above) | `2026-10-01` | `transaction_date`, used only when `transaction_at` is blank (N8) |
+| `transaction_type` | No (blank → `PAYMENT`) | `REFUND` | `transaction_type` (N10) |
+| `description`, `order_id`, `customer_id`, anything else | No | | `raw_values` only |
+
+At upload, a ledger header with neither `transaction_at` nor `transaction_date` is rejected with `missingColumns: ["transaction_at or transaction_date"]`. A row where both are blank gets `MISSING_REQUIRED_FIELD` on `transaction_at`.
+
+### 7.3 Gateway settlement (`source_type = GATEWAY`)
+
+| Column | Required | Example | Maps to |
+|---|---|---|---|
+| `merchant_reference` | Yes | `PAY-101` | `raw_reference`, `normalized_reference` |
+| `amount` | Yes | `1000.00` | `amount`: the **gross** amount. Fees are not deducted in v1 |
+| `currency` | Yes | `aed` | `currency` |
+| `status` | Yes | `captured` | `status` (N9) |
+| `transaction_at` | Yes | `2026-10-01T05:15:00Z` | `transaction_at`, `transaction_date` (N7) |
+| `transaction_type` | No (blank → `PAYMENT`) | `refund` | `transaction_type` |
+| `gateway_transaction_id`, `fee_amount`, `settlement_date`, anything else | No | | `raw_values` only (fee-aware matching is v2) |
+
+The gateway calls its reference `merchant_reference` and uses lower-case currencies and its own status words. Real gateways never use your ledger's names, and a contract that shows this is more honest than pretending both files are identical. In v1 the mapping for each source type is fixed in code; per-organization mappings are v2.
+
+### 7.4 Upload-time rejections
+
+Checked synchronously before the file is stored, so the user gets an answer at once and nothing is created. All are RFC 9457 problems ([api-design.md §3](api-design.md#3-error-model)).
+
+| HTTP | `code` | When |
+|---|---|---|
+| 400 | `empty-file` | Zero bytes, no header line, or a header with no data row |
+| 400 | `missing-columns` | A required column is missing; extension member `missingColumns` lists them |
+| 400 | `duplicate-columns` | Two header names are equal after trimming and lower-casing |
+| 400 | `invalid-encoding` | The header isn't valid UTF-8 |
+| 409 | `duplicate-file` | Same bytes already imported for this organization and source type; extension member `existingBatchId` ([ADR 0005](adr/0005-duplicate-import-policy.md)) |
+| 413 | `file-too-large` | Over 50 MB |
+| 415 | `unsupported-media-type` | Not a `.csv` filename, or a content type outside the list in §7.1 |
+
+### 7.5 Row errors
+
+A row error never stops the import. The importer records every problem in the row (one error per field, plus whole-row errors), skips the row, and continues. Each error is stored in `import_row_error` with the row number, the column (`NULL` for whole-row errors), the code, a readable message and the raw row text.
+
+| Code | Column | When |
+|---|---|---|
+| `MALFORMED_ROW` | — | The row breaks RFC 4180 quoting, or its field count differs from the header's. Field positions can't be trusted, so no other check runs on this row |
+| `MISSING_REQUIRED_FIELD` | the field | A required field is blank after trimming |
+| `INVALID_AMOUNT` | `amount` | Not a plain decimal: `1,000.00`, `AED 10`, `1E+3`, `.5`, `abc` |
+| `AMOUNT_NOT_POSITIVE` | `amount` | A plain decimal that is zero or negative: `0.00`, `-5.00` |
+| `AMOUNT_SCALE_EXCEEDED` | `amount` | More than 4 decimal places: `10.12345` |
+| `AMOUNT_OUT_OF_RANGE` | `amount` | More than 15 integer digits |
+| `INVALID_CURRENCY` | `currency` | Not an ISO-4217 code known to the JDK: `XYZ`, `DIRHAM` |
+| `INVALID_DATE` | `transaction_date` | Not `YYYY-MM-DD`: `01/10/2026`, `2026-02-30` |
+| `INVALID_TIMESTAMP` | `transaction_at` | Not an ISO-8601 date-time with offset |
+| `DATE_OUT_OF_RANGE` | `transaction_at` or `transaction_date` | Outside the date window in §7.1 |
+| `UNKNOWN_STATUS` | `status` | Not in the status mapping (rule N9) |
+| `UNKNOWN_TRANSACTION_TYPE` | `transaction_type` | Not blank and not `PAYMENT`, `REFUND`, `CHARGEBACK` or `FEE` (any case) |
+| `REFERENCE_TOO_LONG` | `reference` / `merchant_reference` | Longer than 128 characters after normalization |
+
+Amount checks run in the order of the table and stop at the first failure, so one bad amount gets one error: `-5.00` is `AMOUNT_NOT_POSITIVE`, not also something else.
+
+**Row numbers** are 1-based data-record numbers. The header is not counted, empty lines are not counted, and a quoted field that spans two lines is still one record.
+
+**An unterminated quote** (a field opens with `"` and never closes) swallows everything up to the end of the file, so no later row can be read reliably. The importer records one `MALFORMED_ROW` at the record where the quote opened and stops reading. Rows before it are kept, and the batch ends `COMPLETED_WITH_ERRORS` as usual.
+
+**Repeated rows are not errors.** Two identical rows are both imported and both flagged as duplicates (rule D1 in [reconciliation-rules.md §4](reconciliation-rules.md#4-outcomes-evaluated-in-order)), because only a human can tell an export glitch from a real double charge.
+
+**How a batch ends** (state machine in [reconciliation-rules.md §7.1](reconciliation-rules.md#71-import-batch)):
+
+| Situation | Status |
+|---|---|
+| Every row valid | `COMPLETED` |
+| At least one valid row and at least one row error | `COMPLETED_WITH_ERRORS` |
+| Every row invalid, or the file couldn't be read to the end for a reason other than an unterminated quote (invalid encoding, too many rows, file missing from storage, retries exhausted) | `FAILED`, with `failure_reason` |
 
 ---
 

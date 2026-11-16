@@ -15,3 +15,18 @@ reconflow:
 server:
   error:
     include-stacktrace: never
+
+logging:
+  structured:
+    format:
+      # One JSON object per line in Elastic Common Schema, built into Boot (no encoder dependency).
+      # Log platforms index the fields, so you can query requestId = "4f1c..." or level = ERROR;
+      # a stack trace stays one field instead of being split into many events. MDC entries
+      # such as requestId are included automatically. Local runs keep readable text.
+      console: ecs
+    ecs:
+      service:
+        # name defaults to spring.application.name (reconflow).
+        version: "@project.version@" # filled in at build time by Maven resource filtering
+        environment: prod
+        node-name: ${HOSTNAME:}

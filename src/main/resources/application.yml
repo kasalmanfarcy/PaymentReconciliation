@@ -115,8 +115,20 @@ management:
       # Anonymous callers see only {"status":"UP"}; component details help attackers.
       show-details: when-authorized
       probes:
-        # /actuator/health/liveness and /readiness for the orchestrator (M9.11 builds on it).
+        # /actuator/health/liveness and /readiness for the orchestrator.
         enabled: true
+      group:
+        # M9.11. Liveness: "is this process broken beyond repair?" A failure restarts the container,
+        # so it checks only the application's own state, never a dependency: with the database in
+        # liveness, a database outage would restart every instance in a loop, fixing nothing, and
+        # they would all reconnect at once when it returned.
+        liveness:
+          include: livenessState
+        # Readiness: "should this instance get traffic now?" A failure takes it out of rotation
+        # without restarting it, which is the right answer to a dependency outage. On shutdown Boot
+        # flips readinessState to REFUSING_TRAFFIC first, so the load balancer stops sending work.
+        readiness:
+          include: readinessState, db, storage
 
 reconflow:
   auth:

@@ -1,5 +1,6 @@
 package com.reconflow.paymentreconflow.shared.jobs;
 
+import java.util.Collection;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -9,8 +10,10 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import org.jspecify.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBooleanProperty;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.SmartLifecycle;
@@ -45,9 +48,18 @@ public class JobWorker implements SmartLifecycle {
     private volatile ExecutorService executor;
     private volatile boolean running;
 
+    /** Null in production; tests narrow a hand-built worker to their own organizations (shared database). */
+    private final @Nullable Collection<UUID> onlyOrganizations;
+
+    @Autowired
     JobWorker(JobRunner runner, JobWorkerProperties workerProps) {
+        this(runner, workerProps, null);
+    }
+
+    JobWorker(JobRunner runner, JobWorkerProperties workerProps, @Nullable Collection<UUID> onlyOrganizations) {
         this.runner = runner;
         this.workerProps = workerProps;
+        this.onlyOrganizations = onlyOrganizations;
         this.freeSlots = new ArrayBlockingQueue<>(workerProps.threads());
     }
 
@@ -73,7 +85,7 @@ public class JobWorker implements SmartLifecycle {
             String workerId = runner.workerId(slot);
             Optional<Job> job;
             try {
-                job = runner.claim(workerId, null);
+                job = runner.claim(workerId, onlyOrganizations);
             } catch (RuntimeException e) {
                 freeSlots.add(slot);
                 log.warn("Claim failed; will retry on the next poll", e);

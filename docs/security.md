@@ -36,6 +36,7 @@ nobody has seen fail. Accepted risks are listed too, marked as such, with the re
 
 | ID | Control | Threat | Enforced by | Proven by | Status |
 |----|---------|--------|-------------|-----------|--------|
+| S-40 | Upload size limited by the servlet container while it parses the multipart body (50 MB file, 51 MB request), again in code, and the two must agree at startup; a reverse proxy should cap the body too (`client_max_body_size 51m`) | Disk or memory exhaustion by oversized uploads | `spring.servlet.multipart.*`, `server.tomcat.max-swallow-size`, `max-http-form-post-size`, `connection-timeout` in [application.yml](../src/main/resources/application.yml); [ImportReceiver](../src/main/java/com/reconflow/paymentreconflow/ingestion/application/ImportReceiver.java); [UploadLimitsCheck](../src/main/java/com/reconflow/paymentreconflow/ingestion/application/UploadLimitsCheck.java) | [UploadSizeLimitIT](../src/test/java/com/reconflow/paymentreconflow/ingestion/UploadSizeLimitIT.java) (over a real socket: limit + 1 byte → `413 file-too-large`, no batch row, no stored object; exactly the limit → `202`), [UploadLimitsCheckTest](../src/test/java/com/reconflow/paymentreconflow/ingestion/application/UploadLimitsCheckTest.java) | ✅ (proxy: M11) |
 | S-20 | Metrics only on the internal management port; `/actuator/prometheus` denied on the public port | Reconnaissance (routes, volumes) | [SecurityConfig](../src/main/java/com/reconflow/paymentreconflow/security/config/SecurityConfig.java), `management.server.port` | [ManagementPortIT](../src/test/java/com/reconflow/paymentreconflow/reliability/ManagementPortIT.java) | ✅ |
 
 ### 1.4 Supply chain and secrets (M10.5)
@@ -65,6 +66,7 @@ nobody has seen fail. Accepted risks are listed too, marked as such, with the re
 
 | ID | Risk | Why accepted | Revisit when |
 |----|------|--------------|--------------|
+| R-02 | `max-swallow-size` is 100 MB, not 2 MB | api-design.md promises a readable `413` for an oversized file; with a small value Tomcat resets the connection and the client sees a network error. Swallowed bytes are discarded, not stored, and `connection-timeout` bounds slow senders | A proxy in front enforces the limit (M11): then lower it |
 | R-01 | Dependency-Check runs weekly, not per PR | Minutes per run, mostly the NVD download; dependency review covers the per-PR question | A CVE slips through between runs |
 
 ---

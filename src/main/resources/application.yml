@@ -82,10 +82,13 @@ spring:
 
   servlet:
     multipart:
-      # CSV contract limit (requirements: 50 MB); checked again in code by ImportReceiver
-      # (reconflow.import.max-file-size), and hardened further in M10.3.
-      max-file-size: 50MB
-      max-request-size: 51MB        # the file plus the sourceType form field
+      # M10.3: the servlet container enforces the CSV contract's 50 MB (requirements.md) while it
+      # parses the multipart body, before any controller runs; the code checks it again
+      # (ImportReceiver, reconflow.import.max-file-size, same variable) and UploadLimitsCheck refuses
+      # to start if the two disagree. A reverse proxy in front should cap the body too
+      # (docs/security.md S-40): every layer that buffers needs its own limit.
+      max-file-size: ${RECONFLOW_MAX_UPLOAD:50MB}
+      max-request-size: ${RECONFLOW_MAX_REQUEST:51MB}  # the file plus the sourceType field; never below max-file-size
       file-size-threshold: 1MB      # larger uploads are buffered to a temp file, not the heap
 
 server:
@@ -93,9 +96,16 @@ server:
   tomcat:
     # When an upload exceeds the multipart limit, Tomcat stops reading the body; past this many
     # unread bytes it resets the connection, and the client sees a network error instead of the
-    # 413 file-too-large ProblemDetail (UploadSizeLimitIT). Twice the 50 MB limit covers honest
-    # mistakes; anything larger is cut off rather than read for nothing (M10.3 revisits this).
+    # 413 file-too-large ProblemDetail (UploadSizeLimitIT). M10.3 kept 100 MB rather than the 2 MB
+    # the plan suggests: api-design.md promises a readable 413 for an oversized file, and swallowed
+    # bytes are discarded, never buffered to disk, so the cost is bandwidth for at most twice the
+    # limit, bounded by connection-timeout. Anything larger is cut off.
     max-swallow-size: 100MB
+    # Non-multipart form posts: the API takes JSON, so a big urlencoded body is never legitimate.
+    max-http-form-post-size: 2MB
+    # Slow-loris: a client that stops sending mid-request loses the connection after this long
+    # without data (it is the socket read timeout, not a cap on a whole upload).
+    connection-timeout: 20s
   # On SIGTERM, stop accepting requests and let in-flight ones finish.
   shutdown: graceful
 
@@ -158,7 +168,7 @@ reconflow:
     max-stored-errors: 10000        # per batch; error_rows still counts every bad row
     oldest-transaction-date: P2Y    # rows dated further back are DATE_OUT_OF_RANGE
     newest-transaction-date: P31D   # ...and further ahead
-    max-file-size: 50MB             # keep equal to spring.servlet.multipart.max-file-size
+    max-file-size: ${RECONFLOW_MAX_UPLOAD:50MB}  # equal to spring.servlet.multipart.max-file-size (UploadLimitsCheck)
   storage:
     endpoint: ${S3_ENDPOINT:}
     region: ${S3_REGION:us-east-1}

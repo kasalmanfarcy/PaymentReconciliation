@@ -1,0 +1,155 @@
+# ReconFlow on one host (M11.4): a small VM with Docker, in front of a managed PostgreSQL 16 and an
+# S3-compatible bucket. The runbook is docs/runbooks/deploy.md; the deploy itself is deploy/deploy.sh.
+#
+#   cd deploy && cp .env.prod.example .env    # fill in; never commit it
+#   ./deploy.sh sha-<40-hex commit>           # migrate (its own step), then worker, then api
+#
+# What runs here, and what each piece holds:
+#
+#   traefik    the edge: TLS (Let's Encrypt), HTTP->HTTPS, body caps, per-IP rate limits
+#   keycloak   identity provider, `start` (production mode) on its own `keycloak` database
+#   migrate    one-off, run by deploy.sh before new code starts: the ONLY holder of the migrator's
+#              password (M11.5); not started by `up`
+#   api        public API (prod,api), the application role's password only
+#   worker     job worker (prod,worker), the application role's password only; never routed
+#
+# Nothing but Traefik publishes a port to the internet. The local rehearsal of exactly this file is
+# compose.local.yaml (adds PostgreSQL and MinIO in containers and a local CA, no Let's Encrypt).
+name: reconflow-prod
+
+x-app: &app
+  # Deploy by immutable tag: sha-<commit> from CI (M11.3). Rollback = deploy the previous tag.
+  image: ${RECONFLOW_IMAGE:-ghcr.io/kasalmanfarcy/reconflow}:${RECONFLOW_TAG:?set RECONFLOW_TAG (sha-<commit>)}
+  restart: unless-stopped
+  # Heap = 75% of this (Dockerfile). The sizes fit a 4 GB VM next to Keycloak (runbook).
+  mem_limit: 768m
+  # Least privilege for the process: no Linux capabilities, no setuid escalation, read-only root
+  # filesystem; only /tmp (Tomcat's multipart buffer for uploads over 1 MB) is writable.
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  logging: &logging
+    driver: json-file
+    options: { max-size: "20m", max-file: "5" }
+
+x-app-env: &app-env
+  DB_URL: ${DB_URL:?set DB_URL (jdbc:postgresql://<host>:5432/<db>?sslmode=verify-full)}
+  DB_APP_USER: ${DB_APP_USER:-reconflow_app}
+  DB_APP_PASSWORD: ${DB_APP_PASSWORD:?set DB_APP_PASSWORD}
+  DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
+  S3_ENDPOINT: ${S3_ENDPOINT:?set S3_ENDPOINT}
+  S3_REGION: ${S3_REGION:-auto}
+  S3_BUCKET: ${S3_BUCKET:-reconflow-imports}
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY}
+  S3_SECRET_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY}
+  # The issuer string the tokens carry (Keycloak's public URL); the keys are fetched over the
+  # internal network, so the app never depends on its own public DNS or TLS to validate a token.
+  OIDC_ISSUER_URI: ${KEYCLOAK_PUBLIC_URL:?set KEYCLOAK_PUBLIC_URL (https://auth.example.com)}/realms/reconflow
+  SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_JWKSETURI: http://keycloak:8080/realms/reconflow/protocol/openid-connect/certs
+  KEYCLOAK_BASE_URL: http://keycloak:8080
+  KEYCLOAK_ADMIN_CLIENT_SECRET: ${KEYCLOAK_ADMIN_CLIENT_SECRET:?set KEYCLOAK_ADMIN_CLIENT_SECRET}
+  RECONFLOW_BOOTSTRAP_ADMIN_EMAIL: ${RECONFLOW_BOOTSTRAP_ADMIN_EMAIL:-}
+
+services:
+  traefik:
+    image: traefik:v3.5.6@sha256:16acb89c6db341182970d6fdafece31303b0a380a8ed7aa51682e225229bf1d2
+    restart: unless-stopped
+    environment:
+      API_HOST: ${API_HOST:?set API_HOST (api.example.com)}
+      AUTH_HOST: ${AUTH_HOST:?set AUTH_HOST (auth.example.com)}
+      TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_EMAIL: ${ACME_EMAIL:-}
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./traefik/dynamic/routes.yml:/etc/traefik/dynamic/routes.yml:ro
+      - letsencrypt:/letsencrypt
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    logging: *logging
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.2@sha256:c68e286cacd87b942ac1939a0a1481461109d6acd3a57dc496969a319a76bbf0
+    # Production mode: no dev defaults, its own PostgreSQL database. The realm is imported from git on
+    # the first start only (an existing realm is never overwritten); it has no password grant.
+    command: ["start", "--import-realm"]
+    restart: unless-stopped
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: ${KC_DB_URL:?set KC_DB_URL (jdbc:postgresql://<host>:5432/keycloak?sslmode=verify-full)}
+      KC_DB_USERNAME: ${KEYCLOAK_DB_USER:-keycloak}
+      KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:?set KEYCLOAK_DB_PASSWORD}
+      # TLS ends at Traefik; Keycloak trusts its X-Forwarded-* headers to know the request was HTTPS.
+      KC_HOSTNAME: ${KEYCLOAK_PUBLIC_URL}
+      KC_HTTP_ENABLED: "true"
+      KC_PROXY_HEADERS: xforwarded
+      KC_HEALTH_ENABLED: "true"
+      # Temporary admin for the first login only: replace it with a named admin (runbook).
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USER:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?set KEYCLOAK_ADMIN_PASSWORD}
+      # Substituted into the realm file at import, so no secret is in git.
+      RECONFLOW_KEYCLOAK_ADMIN_CLIENT_SECRET: ${KEYCLOAK_ADMIN_CLIENT_SECRET}
+      RECONFLOW_DEMO_PASSWORD: ${RECONFLOW_DEMO_PASSWORD:?set RECONFLOW_DEMO_PASSWORD (demo accounts; at least 12 characters)}
+      RECONFLOW_WEB_ORIGIN: ${RECONFLOW_WEB_ORIGIN:-https://app.example.invalid}
+    # No published port. The admin console and Admin REST API are not routed publicly
+    # (traefik/dynamic/routes.yml); operators administer the realm with kcadm.sh inside the container
+    # (`docker compose exec keycloak /opt/keycloak/bin/kcadm.sh ...`, runbook).
+    volumes:
+      - ../infra/keycloak/realm-reconflow-prod.json:/opt/keycloak/data/import/realm-reconflow.json:ro
+    mem_limit: 1g
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      # Health is on the management port (9000, not published); the image has no curl.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/9000 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q UP <&3"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    logging: *logging
+
+  # `docker compose run --rm migrate` (deploy.sh). In the `migrate` profile so `up` never starts it.
+  migrate:
+    <<: *app
+    profiles: [migrate]
+    restart: "no"
+    mem_limit: 512m
+    environment:
+      SPRING_PROFILES_ACTIVE: prod,migrate
+      DB_URL: ${DB_URL}
+      DB_MIGRATOR_USER: ${DB_MIGRATOR_USER:-reconflow_migrator}
+      DB_MIGRATOR_PASSWORD: ${DB_MIGRATOR_PASSWORD:?set DB_MIGRATOR_PASSWORD}
+    volumes:
+      - migrate-tmp:/tmp
+
+  api:
+    <<: *app
+    environment:
+      <<: *app-env
+      # Add `demo` (prod,api,demo) for a public demo: it seeds the demo organizations linked to the
+      # realm's demo accounts, and refuses if the database holds any other organization.
+      SPRING_PROFILES_ACTIVE: ${API_PROFILES:-prod,api}
+    volumes:
+      - api-tmp:/tmp
+    depends_on:
+      keycloak:
+        condition: service_healthy
+
+  worker:
+    <<: *app
+    environment:
+      <<: *app-env
+      SPRING_PROFILES_ACTIVE: prod,worker
+    volumes:
+      - worker-tmp:/tmp
+
+volumes:
+  letsencrypt:
+  api-tmp:
+  worker-tmp:
+  migrate-tmp:

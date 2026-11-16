@@ -97,7 +97,7 @@ jobs:
           docker save reconflow:ci -o "$RUNNER_TEMP/image.tar"
           docker run --rm -v "$RUNNER_TEMP:/work" aquasec/trivy:0.76.2 image \
             --input /work/image.tar --scanners vuln \
-            --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1
+            --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --timeout 15m
 
   # M11.3: every merge to main ships exactly what CI tested, identified by an immutable tag:
   # ghcr.io/kasalmanfarcy/reconflow:sha-<40 hex>, plus a moving `main`. A red build or a failed image

@@ -1,0 +1,310 @@
+{
+  "realm": "reconflow",
+  "enabled": true,
+  "displayName": "ReconFlow",
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "registrationEmailAsUsername": true,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": false,
+  "rememberMe": false,
+  "verifyEmail": false,
+  "editUsernameAllowed": false,
+  "accessTokenLifespan": 900,
+  "ssoSessionIdleTimeout": 604800,
+  "ssoSessionMaxLifespan": 2592000,
+  "revokeRefreshToken": true,
+  "refreshTokenMaxReuse": 0,
+  "bruteForceProtected": true,
+  "permanentLockout": false,
+  "failureFactor": 5,
+  "waitIncrementSeconds": 900,
+  "maxFailureWaitSeconds": 900,
+  "maxDeltaTimeSeconds": 43200,
+  "minimumQuickLoginWaitSeconds": 60,
+  "quickLoginCheckMilliSeconds": 1000,
+  "passwordPolicy": "length(12) and maxLength(64) and notUsername",
+  "eventsEnabled": true,
+  "eventsExpiration": 2592000,
+  "eventsListeners": [
+    "jboss-logging"
+  ],
+  "adminEventsEnabled": true,
+  "adminEventsDetailsEnabled": false,
+  "clients": [
+    {
+      "clientId": "reconflow-web",
+      "name": "ReconFlow web UI",
+      "enabled": true,
+      "publicClient": true,
+      "protocol": "openid-connect",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "${RECONFLOW_WEB_ORIGIN}/*"
+      ],
+      "webOrigins": [
+        "${RECONFLOW_WEB_ORIGIN}"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "${RECONFLOW_WEB_ORIGIN}/*"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience reconflow-api",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.custom.audience": "reconflow-api",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true"
+          }
+        }
+      ],
+      "fullScopeAllowed": false,
+      "defaultClientScopes": [
+        "basic",
+        "profile",
+        "email",
+        "acr",
+        "web-origins"
+      ]
+    },
+    {
+      "clientId": "reconflow-cli",
+      "name": "ReconFlow command line (scripts/demo.sh)",
+      "enabled": true,
+      "publicClient": true,
+      "protocol": "openid-connect",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "http://127.0.0.1:8765/callback"
+      ],
+      "webOrigins": [],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience reconflow-api",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.custom.audience": "reconflow-api",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true"
+          }
+        }
+      ],
+      "fullScopeAllowed": false,
+      "defaultClientScopes": [
+        "basic",
+        "profile",
+        "email",
+        "acr",
+        "web-origins"
+      ],
+      "description": "Authorization code with PKCE and a loopback redirect (RFC 8252), for scripts. No password grant."
+    },
+    {
+      "clientId": "reconflow-admin",
+      "name": "ReconFlow API: user management (service account)",
+      "enabled": true,
+      "publicClient": false,
+      "protocol": "openid-connect",
+      "clientAuthenticatorType": "client-secret",
+      "secret": "${RECONFLOW_KEYCLOAK_ADMIN_CLIENT_SECRET}",
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": true,
+      "defaultClientScopes": [
+        "basic",
+        "kc-admin-api"
+      ]
+    }
+  ],
+  "users": [
+    {
+      "id": "0193b9e2-7c41-7a10-8d2e-000000000a01",
+      "username": "admin@acme.test",
+      "email": "admin@acme.test",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Admin",
+      "lastName": "Acme",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${RECONFLOW_DEMO_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "0193b9e2-7c41-7a10-8d2e-000000000a02",
+      "username": "investigator@acme.test",
+      "email": "investigator@acme.test",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Investigator",
+      "lastName": "Acme",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${RECONFLOW_DEMO_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "0193b9e2-7c41-7a10-8d2e-000000000a03",
+      "username": "uploader@acme.test",
+      "email": "uploader@acme.test",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Uploader",
+      "lastName": "Acme",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${RECONFLOW_DEMO_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "0193b9e2-7c41-7a10-8d2e-000000000a04",
+      "username": "viewer@acme.test",
+      "email": "viewer@acme.test",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Viewer",
+      "lastName": "Acme",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${RECONFLOW_DEMO_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "0193b9e2-7c41-7a10-8d2e-000000000b01",
+      "username": "admin@globex.test",
+      "email": "admin@globex.test",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Admin",
+      "lastName": "Globex",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${RECONFLOW_DEMO_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "0193b9e2-7c41-7a10-8d2e-000000000b02",
+      "username": "investigator@globex.test",
+      "email": "investigator@globex.test",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Investigator",
+      "lastName": "Globex",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${RECONFLOW_DEMO_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "0193b9e2-7c41-7a10-8d2e-000000000b03",
+      "username": "uploader@globex.test",
+      "email": "uploader@globex.test",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Uploader",
+      "lastName": "Globex",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${RECONFLOW_DEMO_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "0193b9e2-7c41-7a10-8d2e-000000000b04",
+      "username": "viewer@globex.test",
+      "email": "viewer@globex.test",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Viewer",
+      "lastName": "Globex",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${RECONFLOW_DEMO_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "0193b9e2-7c41-7a10-8d2e-000000000c01",
+      "username": "consultant@both.test",
+      "email": "consultant@both.test",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Consultant",
+      "lastName": "Both",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${RECONFLOW_DEMO_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "id": "0193b9e2-7c41-7a10-8d2e-000000000d01",
+      "username": "platform@reconflow.test",
+      "email": "platform@reconflow.test",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Platform",
+      "lastName": "Admin",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${RECONFLOW_DEMO_PASSWORD}",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "username": "service-account-reconflow-admin",
+      "enabled": true,
+      "serviceAccountClientId": "reconflow-admin",
+      "clientRoles": {
+        "realm-management": [
+          "manage-users"
+        ]
+      }
+    }
+  ]
+}

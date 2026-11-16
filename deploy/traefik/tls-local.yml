@@ -1,0 +1,9 @@
+# LOCAL REHEARSAL ONLY (compose.local.yaml mounts it next to routes.yml). The default certificate,
+# issued by a throwaway CA that scripts/local_tls.sh creates under deploy/local/certs (gitignored).
+# Clients trust it with `curl --cacert deploy/local/certs/ca.pem`.
+tls:
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /certs/tls.pem
+        keyFile: /certs/tls-key.pem

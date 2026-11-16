@@ -35,9 +35,16 @@ build/
 .claude/
 modelmemory/
 
+### Deployment (M11.4): filled-in env files and the rehearsal's throwaway CA
+deploy/.env
+deploy/local/
+
 ### Local secrets — never commit these
 .env
 .env.*
 !.env.example
 
 projectoverview.md.jqwik-database
+!deploy/.env.prod.example
+!deploy/.env.local.example
+deploy/.deployed-tag.*

@@ -41,9 +41,10 @@ updates:
     commit-message:
       prefix: "build(repo)"
 
-  # The pinned image tags in compose.yaml (postgres, minio, keycloak, prometheus, grafana).
+  # The pinned images in compose.yaml and deploy/ (postgres, minio, keycloak, prometheus, grafana,
+  # traefik). The deploy files pin tag and digest; Dependabot bumps both.
   - package-ecosystem: docker-compose
-    directory: /
+    directories: ["/", "/deploy"]
     schedule:
       interval: weekly
       day: monday

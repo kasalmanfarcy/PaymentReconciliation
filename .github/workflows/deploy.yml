@@ -1,0 +1,71 @@
+name: deploy
+
+# M11.4: deploy an image CI already built, tested, scanned and pushed (ci.yml publish-image) to the
+# single host of deploy/compose.prod.yaml, then prove it with the end-to-end demo against the public
+# URLs. Off until the repository owner sets it up (docs/runbooks/deploy.md, "Continuous deploy"):
+# every job is skipped unless the repository variable DEPLOY_ENABLED is 'true'.
+#
+#   automatic: after CI succeeds on main (the image sha-<commit> exists by then)
+#   manual:    Actions -> deploy -> Run workflow, with any earlier commit (that is also the rollback)
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Full 40-character commit SHA whose image (sha-<commit>) to deploy
+        required: true
+
+# One deploy at a time; a newer one waits instead of interrupting a migration.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    if: >-
+      vars.DEPLOY_ENABLED == 'true' &&
+      (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Environment protection rules (required reviewers, branch restrictions) and its secrets live in
+    # Settings -> Environments -> production.
+    environment:
+      name: production
+      url: https://${{ vars.API_HOST }}
+    env:
+      COMMIT: ${{ github.event.inputs.commit || github.event.workflow_run.head_sha }}
+    steps:
+      - name: Check the commit id
+        run: '[[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "not a full commit SHA: $COMMIT"; exit 1; }'
+
+      - name: Check out (for the smoke test)
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.COMMIT }}
+
+      - name: Deploy on the host (pull, migrate, worker, api)
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          TARGET: ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy && chmod 600 ~/.ssh/deploy
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          # The host keeps a checkout of the repository (the runbook's /opt/reconflow) and deploy/.env.
+          ssh -i ~/.ssh/deploy "$TARGET" \
+            "cd /opt/reconflow && git fetch --quiet origin && git checkout --quiet --detach $COMMIT && deploy/deploy.sh sha-$COMMIT"
+
+      - name: End-to-end smoke test against the public URLs
+        env:
+          BASE_URL: https://${{ vars.API_HOST }}
+          KEYCLOAK_URL: https://${{ vars.AUTH_HOST }}
+          DEMO_PASSWORD: ${{ secrets.DEMO_PASSWORD }}
+        run: scripts/demo.sh --no-start

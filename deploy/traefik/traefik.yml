@@ -1,0 +1,56 @@
+# Traefik static configuration for the single-host deployment (M11.4). The edge: it terminates TLS,
+# redirects HTTP to HTTPS, caps request bodies and rate-limits per client IP before anything reaches
+# Keycloak or the API (docs/security.md S-40, S-43, S-44). Routes and limits: dynamic/routes.yml.
+#
+# Certificates come from Let's Encrypt (HTTP-01 on port 80). The contact email is set from the
+# environment: TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_EMAIL (compose.prod.yaml).
+# The local rehearsal (compose.local.yaml) replaces this file with traefik.local.yml: no ACME.
+
+global:
+  # Traefik phones home for version checks and anonymous statistics unless told not to.
+  checkNewVersion: false
+  sendAnonymousUsage: false
+
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+  websecure:
+    address: ":443"
+    # X-Forwarded-* headers arriving from the internet are dropped and rewritten (the default, made
+    # explicit): only Traefik says what the client's IP and scheme were.
+    forwardedHeaders:
+      insecure: false
+    transport:
+      respondingTimeouts:
+        # A 50 MB upload on a slow link: the whole request may take this long, no longer.
+        readTimeout: 120s
+    http:
+      tls:
+        certResolver: letsencrypt
+
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      storage: /letsencrypt/acme.json
+      httpChallenge:
+        entryPoint: web
+
+providers:
+  file:
+    directory: /etc/traefik/dynamic
+    watch: false
+
+ping: {}          # `traefik healthcheck --ping` for the container's health check
+
+log:
+  level: INFO
+accessLog:
+  # Client IPs and paths only; no headers (Authorization never reaches a log: S-50).
+  fields:
+    headers:
+      defaultMode: drop

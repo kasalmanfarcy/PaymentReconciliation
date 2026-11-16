@@ -1,0 +1,89 @@
+# Routes, limits and backends (M11.4). Traefik renders this file as a Go template; API_HOST and
+# AUTH_HOST come from the container's environment (compose.prod.yaml). TLS for every router comes
+# from the websecure entry point (traefik.yml: Let's Encrypt).
+#
+#   https://{API_HOST}   -> api:8080        ReconFlow's public API (never the management port 8081)
+#   https://{AUTH_HOST}  -> keycloak:8080   login pages, tokens, JWKS; never the admin console
+#
+# Limits at the edge, per client IP: the application can't see a trustworthy client IP and must not
+# be the first thing a flood reaches. The application keeps its own limits behind these (S-40/S-41).
+http:
+  routers:
+    api:
+      rule: Host(`{{ env "API_HOST" }}`)
+      entryPoints: [websecure]
+      middlewares: [api-body-limit, api-rate-limit]
+      service: api
+
+    # Credential-handling endpoints get a much lower per-IP rate than the rest of Keycloak: Keycloak
+    # locks an account after 5 failures, but only this stops one address guessing across many
+    # accounts (docs/security.md R-04).
+    auth-login:
+      rule: >-
+        Host(`{{ env "AUTH_HOST" }}`) && (
+        PathRegexp(`^/realms/[^/]+/protocol/openid-connect/token`) ||
+        PathRegexp(`^/realms/[^/]+/login-actions/`))
+      priority: 100
+      entryPoints: [websecure]
+      middlewares: [auth-body-limit, login-rate-limit]
+      service: keycloak
+
+    # The admin console and Admin REST API are not published: the app reaches the Admin API on the
+    # internal network, operators with kcadm.sh inside the container (docs/runbooks/deploy.md).
+    auth:
+      rule: Host(`{{ env "AUTH_HOST" }}`) && !PathPrefix(`/admin`)
+      priority: 10
+      entryPoints: [websecure]
+      middlewares: [auth-body-limit, auth-rate-limit]
+      service: keycloak
+
+  middlewares:
+    # 51 MiB: the CSV contract's 50 MB file plus the multipart envelope, the same numbers the app
+    # enforces (RECONFLOW_MAX_UPLOAD / RECONFLOW_MAX_REQUEST). Over it: 413 here, and the body never
+    # reaches Tomcat. Up to 2 MiB is buffered in memory, the rest on Traefik's disk.
+    api-body-limit:
+      buffering:
+        maxRequestBodyBytes: 53477376
+        memRequestBodyBytes: 2097152
+    auth-body-limit:
+      buffering:
+        maxRequestBodyBytes: 1048576
+    # Per source IP (the default criterion: the TCP peer, which X-Forwarded-For can't spoof here).
+    # Generous for people, tight for scripts; over it: 429.
+    api-rate-limit:
+      rateLimit:
+        average: 20
+        period: 1s
+        burst: 60
+    auth-rate-limit:
+      rateLimit:
+        average: 10
+        period: 1s
+        burst: 30
+    login-rate-limit:
+      rateLimit:
+        average: 10
+        period: 1m
+        burst: 20
+
+  services:
+    api:
+      loadBalancer:
+        servers:
+          - url: http://api:8080
+        # Traffic only to an instance that says it's ready (db and storage up), checked on the
+        # management port, which is otherwise never routed.
+        healthCheck:
+          path: /actuator/health/readiness
+          port: 8081
+          interval: 5s
+          timeout: 3s
+    keycloak:
+      loadBalancer:
+        servers:
+          - url: http://keycloak:8080
+
+tls:
+  options:
+    default:
+      minVersion: VersionTLS12

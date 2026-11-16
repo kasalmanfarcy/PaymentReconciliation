@@ -25,6 +25,11 @@ reconflow:
 server:
   error:
     include-stacktrace: never
+  # M11.4: deployed behind a TLS-terminating proxy (deploy/compose.prod.yaml: Traefik). "native" is
+  # Tomcat's RemoteIpValve: X-Forwarded-For/-Proto are honoured only from internal proxy addresses
+  # (10/8, 172.16/12, 192.168/16, loopback), so a client on the internet can't claim another IP or
+  # scheme. It makes request.isSecure() true behind HTTPS, which is what lets HSTS be written (S-21).
+  forward-headers-strategy: ${FORWARD_HEADERS_STRATEGY:native}
 
 logging:
   structured:

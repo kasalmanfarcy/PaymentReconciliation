@@ -199,7 +199,7 @@ services:
   # (its management port, 8081) and, with the full profile, the api and worker containers. Docker Desktop resolves host-gateway to the host; on Colima set
   # HOST_GATEWAY=192.168.5.2 (host.lima.internal) in .env.
   prometheus:
-    image: prom/prometheus:v3.5.0
+    image: prom/prometheus:v3.16.0
     profiles: [observability]
     volumes:
       - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro

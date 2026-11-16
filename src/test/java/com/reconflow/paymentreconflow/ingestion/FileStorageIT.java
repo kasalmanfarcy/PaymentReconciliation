@@ -3,12 +3,12 @@ package com.reconflow.paymentreconflow.ingestion;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import com.reconflow.paymentreconflow.ingestion.storage.FileStorage;
 import com.reconflow.paymentreconflow.ingestion.storage.OrphanFileSweeper;
 import com.reconflow.paymentreconflow.ingestion.storage.StorageKeys;
-import com.reconflow.paymentreconflow.ingestion.storage.StoredFileMissingException;
 import com.reconflow.paymentreconflow.shared.context.Role;
 import com.reconflow.paymentreconflow.shared.id.Ids;
+import com.reconflow.paymentreconflow.shared.storage.FileStorage;
+import com.reconflow.paymentreconflow.shared.storage.StoredFileMissingException;
 import com.reconflow.paymentreconflow.support.AbstractIntegrationTest;
 import java.io.ByteArrayInputStream;
 import java.nio.charset.StandardCharsets;

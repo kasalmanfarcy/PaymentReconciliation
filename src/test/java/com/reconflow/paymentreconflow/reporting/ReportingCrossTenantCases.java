@@ -56,6 +56,28 @@ class ReportingCrossTenantCases implements CrossTenantCases {
                         "/api/v1/reports/exception-ageing",
                         f -> Map.of(),
                         null,
-                        LIST_EXCLUDES_B));
+                        LIST_EXCLUDES_B),
+                // The snapshot also checks that no job and no audit event appeared for org B.
+                new CrossTenantCase(
+                        "export org B's run",
+                        HttpMethod.GET,
+                        "/api/v1/reports/exceptions/export?runId={id}",
+                        f -> Map.of("id", f.orgBRun()),
+                        null,
+                        NOT_FOUND),
+                new CrossTenantCase(
+                        "read org B's export",
+                        HttpMethod.GET,
+                        "/api/v1/reports/exports/{id}",
+                        f -> Map.of("id", f.orgBExport()),
+                        null,
+                        NOT_FOUND),
+                new CrossTenantCase(
+                        "download org B's export",
+                        HttpMethod.GET,
+                        "/api/v1/reports/exports/{id}/file",
+                        f -> Map.of("id", f.orgBExport()),
+                        null,
+                        NOT_FOUND));
     }
 }

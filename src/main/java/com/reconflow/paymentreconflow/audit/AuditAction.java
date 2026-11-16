@@ -44,5 +44,10 @@ public enum AuditAction {
     EXCEPTION_STATUS_CHANGED,
     EXCEPTION_NOTE_ADDED,
     EXCEPTION_RESOLVED,
-    EXCEPTION_REOPENED
+    EXCEPTION_REOPENED,
+    // M8: reports
+    /** A large export was queued as a background job (payload: runId, jobId, rowCount). */
+    EXPORT_REQUESTED,
+    /** A run's exceptions left the system as CSV (payload: runId, rowCount, mode, jobId if async). */
+    EXCEPTIONS_EXPORTED
 }

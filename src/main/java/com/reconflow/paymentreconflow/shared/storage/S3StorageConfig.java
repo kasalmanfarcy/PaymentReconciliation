@@ -1,4 +1,4 @@
-package com.reconflow.paymentreconflow.ingestion.storage;
+package com.reconflow.paymentreconflow.shared.storage;
 
 import com.reconflow.paymentreconflow.shared.config.StorageProperties;
 import java.net.URI;

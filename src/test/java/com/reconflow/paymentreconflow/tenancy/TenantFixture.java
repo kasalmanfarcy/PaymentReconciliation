@@ -28,6 +28,7 @@ public final class TenantFixture {
     private final UUID orgBFailedRun;
     private final UUID orgBCase;
     private final UUID orgBResolvedCase;
+    private final UUID orgBExport;
 
     private TenantFixture(JdbcTemplate jdbc) {
         this.jdbc = jdbc;
@@ -86,6 +87,13 @@ public final class TenantFixture {
         // M8: the completed run's day row, so a date-range report of A would pick it up if it ever
         // forgot the organization filter.
         jdbc.update("UPDATE reconciliation_run SET completed_at = now() WHERE id = ?", orgBRun);
+        // M8.4: a finished background export of org B's run (DONE, so no test's queue claims it).
+        orgBExport = UUID.randomUUID();
+        jdbc.update(
+                "INSERT INTO job (id, organization_id, type, payload, status) VALUES (?, ?, 'EXPORT', ?::jsonb, 'DONE')",
+                orgBExport,
+                orgB,
+                "{\"runId\":\"" + orgBRun + "\",\"requestedBy\":\"" + admin + "\"}");
         jdbc.update("""
                 INSERT INTO reconciliation_run_day (run_id, organization_id, day, currency, matched_count,
                        matched_amount, mismatch_count, mismatch_net_difference, unmatched_left_count,
@@ -192,6 +200,11 @@ public final class TenantFixture {
         return orgBResolvedCase;
     }
 
+    /** Org B's finished EXPORT job (M8.4). */
+    public UUID orgBExport() {
+        return orgBExport;
+    }
+
     /** Every ID of org B that must never appear in a response to org A. */
     public List<UUID> orgBIds() {
         List<UUID> ids = new ArrayList<>();
@@ -203,6 +216,7 @@ public final class TenantFixture {
         ids.add(orgBFailedRun);
         ids.add(orgBCase);
         ids.add(orgBResolvedCase);
+        ids.add(orgBExport);
         orgBMembers.values().forEach(u -> ids.add(u.id()));
         return ids;
     }

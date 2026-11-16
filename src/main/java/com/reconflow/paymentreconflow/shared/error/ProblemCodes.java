@@ -39,6 +39,7 @@ public final class ProblemCodes {
     public static final String ALREADY_A_MEMBER = "already-a-member";
     public static final String RUN_IN_PROGRESS = "run-in-progress";
     public static final String RUN_NOT_COMPLETED = "run-not-completed";
+    public static final String EXPORT_NOT_READY = "export-not-ready";
     // 413, 415
     public static final String FILE_TOO_LARGE = "file-too-large";
     public static final String UNSUPPORTED_MEDIA_TYPE = "unsupported-media-type";

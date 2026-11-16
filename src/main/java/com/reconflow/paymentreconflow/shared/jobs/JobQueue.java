@@ -2,6 +2,7 @@ package com.reconflow.paymentreconflow.shared.jobs;
 
 import com.reconflow.paymentreconflow.shared.id.Ids;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
@@ -28,5 +29,14 @@ public class JobQueue {
         UUID id = Ids.newId();
         store.insert(id, organizationId, type, payload);
         return id;
+    }
+
+    /**
+     * A job of this organization, for a status endpoint; empty for an unknown id or another
+     * organization's job, which callers must answer identically (404, ADR 0008).
+     */
+    @Transactional(readOnly = true)
+    public Optional<JobStatus> find(UUID organizationId, UUID jobId) {
+        return store.find(organizationId, jobId);
     }
 }

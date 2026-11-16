@@ -2,6 +2,7 @@ package com.reconflow.paymentreconflow.ingestion.storage;
 
 import com.reconflow.paymentreconflow.ingestion.domain.ImportBatchRepository;
 import com.reconflow.paymentreconflow.shared.context.TenantScope;
+import com.reconflow.paymentreconflow.shared.storage.FileStorage;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;

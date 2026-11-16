@@ -73,6 +73,29 @@ class JobStore {
     }
 
     /**
+     * One job of one organization. The table has no RLS (the claim is cross-tenant), so the
+     * organization filter here is the only thing keeping one tenant from reading another's job.
+     */
+    Optional<JobStatus> find(UUID organizationId, UUID jobId) {
+        return jdbc
+                .query(
+                        "SELECT id, organization_id, type, status, payload::text, created_at, updated_at FROM job"
+                                + " WHERE id = ? AND organization_id = ?",
+                        (rs, n) -> new JobStatus(
+                                rs.getObject("id", UUID.class),
+                                rs.getObject("organization_id", UUID.class),
+                                rs.getString("type"),
+                                rs.getString("status"),
+                                json.readValue(rs.getString("payload"), new TypeReference<Map<String, Object>>() {}),
+                                rs.getTimestamp("created_at").toInstant(),
+                                rs.getTimestamp("updated_at").toInstant()),
+                        jobId,
+                        organizationId)
+                .stream()
+                .findFirst();
+    }
+
+    /**
      * Claims the oldest runnable job, if any. {@code onlyOrganizations} narrows the claim to some
      * organizations; production passes null. It exists for tests, which share one database and
      * must not run each other's jobs.

@@ -112,6 +112,7 @@ Validation errors add an `errors` array, one entry per problem:
 | `already-a-member` | 409 | Adding a user who is already a member of this organization |
 | `run-in-progress` | 409 | Requesting or retrying a run while another run of the same organization, period, sources and currency is `PENDING` or `RUNNING` (`existingRunId`); added in M6 |
 | `run-not-completed` | 409 | A reconciliation report for a run that isn't `COMPLETED` yet (`currentStatus`): its totals are written at completion; added in M8 |
+| `export-not-ready` | 409 | Downloading a background export that isn't `DONE` (`currentStatus`); poll `GET /reports/exports/{id}`; added in M8 |
 | `file-too-large` | 413 | Upload over 50 MB |
 | `unsupported-media-type` | 415 | Upload isn't a `.csv` with an accepted content type; or a body in the wrong content type |
 | `idempotency-key-reused` | 422 | Same `Idempotency-Key`, different request body |
@@ -266,7 +267,9 @@ Permissions are from [authentication.plan §5](../plans/authentication.plan), pl
 | `GET /reports/reconciliation?runId= (or ?from=&to=&currency=)` | `REPORT_READ` + `EXCEPTION_READ` | 200 | 400, 404, 409 `run-not-completed` | M8.1 |
 | `GET /reports/import-quality?batchId= (or ?from=&to=)` | `REPORT_READ` | 200 | 400, 404 | M8.2 |
 | `GET /reports/exception-ageing` | `REPORT_READ` | 200 | 400 | M8.3 |
-| `GET /reports/exceptions/export?runId=` | `REPORT_READ` + `EXCEPTION_READ` | 200 `text/csv` | 404 | M8.4 |
+| `GET /reports/exceptions/export?runId=` | `REPORT_READ` + `EXCEPTION_READ` | 200 `text/csv` / 202 | 400, 404 | M8.4 |
+| `GET /reports/exports/{id}` | `REPORT_READ` + `EXCEPTION_READ` | 200 | 404 | M8.4 |
+| `GET /reports/exports/{id}/file` | `REPORT_READ` + `EXCEPTION_READ` | 200 `text/csv` | 404, 409 `export-not-ready` | M8.4 |
 
 All paths are under `/api/v1`. The detailed reference below covers the import (M5), reconciliation-run (M6), exception and audit-timeline (M7) endpoints; each later milestone adds its section here as its endpoints land, so this document grows with the API.
 

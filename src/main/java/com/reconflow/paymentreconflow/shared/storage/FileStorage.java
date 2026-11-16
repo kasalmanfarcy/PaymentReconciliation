@@ -1,18 +1,22 @@
-package com.reconflow.paymentreconflow.ingestion.storage;
+package com.reconflow.paymentreconflow.shared.storage;
 
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.List;
 import java.util.function.Consumer;
 
 /**
- * Where original upload files live (M5.8): S3-compatible object storage, MinIO locally and in
- * tests. Not the local disk: with two or more instances, the API node that received an upload and
- * the worker that processes it are different machines (scalability.md D3).
+ * Where files live (M5.8): S3-compatible object storage, MinIO locally and in tests. Not the local
+ * disk: with two or more instances, the API node that received an upload and the worker that
+ * processes it are different machines (scalability.md D3). Holds the original uploads
+ * ({@code ingestion}) and large exception exports ({@code reporting}, M8.4), which is why it lives
+ * in {@code shared} since M8: both modules use it, and neither may depend on the other.
  *
- * <p>Keys are built only from server-generated IDs ({@code {orgId}/imports/{batchId}/original.csv}),
- * never from the uploaded file name, so a name like {@code ../../etc/passwd} can't reach a path.
+ * <p>Keys are built only from server-generated IDs ({@code {orgId}/imports/{batchId}/original.csv},
+ * {@code {orgId}/exports/{jobId}.csv}), never from a user-supplied name, so a name like
+ * {@code ../../etc/passwd} can't reach a path.
  */
 public interface FileStorage {
 
@@ -27,6 +31,14 @@ public interface FileStorage {
      * @throws StoredFileMissingException if there is no such object (a permanent failure)
      */
     void download(String key, Path target);
+
+    /**
+     * Streams the object into {@code target} without buffering it in memory (M8.4's export
+     * download). Doesn't close {@code target}.
+     *
+     * @throws StoredFileMissingException if there is no such object
+     */
+    void copyTo(String key, OutputStream target);
 
     void delete(String key);
 

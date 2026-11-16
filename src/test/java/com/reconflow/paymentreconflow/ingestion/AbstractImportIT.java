@@ -2,9 +2,9 @@ package com.reconflow.paymentreconflow.ingestion;
 
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart;
 
-import com.reconflow.paymentreconflow.ingestion.storage.FileStorage;
 import com.reconflow.paymentreconflow.shared.context.Role;
 import com.reconflow.paymentreconflow.shared.jobs.JobRunner;
+import com.reconflow.paymentreconflow.shared.storage.FileStorage;
 import com.reconflow.paymentreconflow.support.AbstractIntegrationTest;
 import java.io.IOException;
 import java.io.UncheckedIOException;

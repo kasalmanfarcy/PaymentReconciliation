@@ -1,8 +1,9 @@
-package com.reconflow.paymentreconflow.ingestion.storage;
+package com.reconflow.paymentreconflow.shared.storage;
 
 import com.reconflow.paymentreconflow.shared.config.StorageProperties;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -47,6 +48,18 @@ class S3FileStorage implements FileStorage {
         try (ResponseInputStream<GetObjectResponse> in =
                 s3.getObject(r -> r.bucket(bucket).key(key))) {
             Files.copy(in, target, StandardCopyOption.REPLACE_EXISTING);
+        } catch (NoSuchKeyException e) {
+            throw new StoredFileMissingException(key);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    @Override
+    public void copyTo(String key, OutputStream target) {
+        try (ResponseInputStream<GetObjectResponse> in =
+                s3.getObject(r -> r.bucket(bucket).key(key))) {
+            in.transferTo(target); // 8 KB at a time: memory stays flat whatever the file's size
         } catch (NoSuchKeyException e) {
             throw new StoredFileMissingException(key);
         } catch (IOException e) {

@@ -9,14 +9,15 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * A test-only handler whose behaviour comes from the job's payload ({@code behavior}), so queue
- * tests need no mutable shared state and no extra Spring context. It claims the {@code EXPORT}
- * type: the job table's CHECK allows only real types, and EXPORT has no production handler yet
- * (M8 adds one; this then moves to a dedicated test type in that migration).
+ * tests need no mutable shared state and no extra Spring context. It claims the {@code TEST} type,
+ * which only the test database allows (db/test-callbacks): until M8 it borrowed {@code EXPORT},
+ * which then had no production handler; M8's ExportJobHandler owns that type now, and a type with
+ * two handlers is refused at startup.
  */
 @Component
 class ScriptedJobHandler implements JobHandler {
 
-    static final String TYPE = "EXPORT";
+    static final String TYPE = "TEST";
 
     /** job id -> reason passed to onPermanentFailure. */
     static final Map<UUID, String> permanentFailures = new ConcurrentHashMap<>();

@@ -61,6 +61,10 @@ spring:
     problemdetails:
       # Spring MVC's own exceptions render as RFC 9457 ProblemDetail (GlobalExceptionHandler adds code/requestId).
       enabled: true
+    async:
+      # Streamed responses (M8.4's CSV export) run on an async thread holding a DB connection; a
+      # client that stalls must not hold it forever.
+      request-timeout: 60s
 
   lifecycle:
     # Graceful shutdown: in-flight requests finish, and job workers hand their jobs back at the next
@@ -125,6 +129,10 @@ reconflow:
     bucket: ${S3_BUCKET:reconflow-imports}
     access-key: ${S3_ACCESS_KEY:}
     secret-key: ${S3_SECRET_KEY:}
+  export:
+    # M8.4: a run with at most this many exceptions streams its CSV in the response (200); a larger
+    # one is exported by an EXPORT job into object storage (202 + a status URL to poll).
+    sync-max-rows: 50000
   jobs:
     # The DB-backed queue (ADR 0004, shared.jobs). Times are the database's clock.
     poll-interval: 1s        # how often an idle worker looks for work

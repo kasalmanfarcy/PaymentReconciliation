@@ -6,10 +6,13 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 
+import com.reconflow.paymentreconflow.reporting.export.ExportKeys;
 import com.reconflow.paymentreconflow.security.authz.RolePermissions;
 import com.reconflow.paymentreconflow.shared.context.Permission;
 import com.reconflow.paymentreconflow.shared.context.Role;
+import com.reconflow.paymentreconflow.shared.storage.FileStorage;
 import com.reconflow.paymentreconflow.support.AbstractIntegrationTest;
+import java.io.ByteArrayInputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.Set;
 import java.util.UUID;
@@ -18,6 +21,7 @@ import java.util.stream.Stream;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.MediaType;
 import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.mock.web.MockMultipartFile;
@@ -30,11 +34,14 @@ import org.springframework.test.web.servlet.request.AbstractMockHttpServletReque
  */
 class AuthorizationMatrixIT extends AbstractIntegrationTest {
 
+    @Autowired
+    FileStorage storage;
+
     /**
      * What a request may aim at, all in the caller's organization: a member, a FAILED import and run,
-     * an OPEN exception case and a RESOLVED one (both at version 0).
+     * an OPEN exception case and a RESOLVED one (both at version 0), a finished export with its file.
      */
-    record Target(UUID userId, UUID batchId, UUID runId, UUID openCaseId, UUID resolvedCaseId) {}
+    record Target(UUID userId, UUID batchId, UUID runId, UUID openCaseId, UUID resolvedCaseId, UUID exportId) {}
 
     /** {@code required}: every permission the endpoint needs (M8's reports need two). */
     record Endpoint(
@@ -171,6 +178,18 @@ class AuthorizationMatrixIT extends AbstractIntegrationTest {
                 "GET /reports/exception-ageing",
                 Permission.REPORT_READ,
                 target -> get("/api/v1/reports/exception-ageing")),
+        new Endpoint(
+                "GET /reports/exceptions/export",
+                Set.of(Permission.REPORT_READ, Permission.EXCEPTION_READ),
+                target -> get("/api/v1/reports/exceptions/export?runId=" + target.runId())),
+        new Endpoint(
+                "GET /reports/exports/{id}",
+                Set.of(Permission.REPORT_READ, Permission.EXCEPTION_READ),
+                target -> get("/api/v1/reports/exports/" + target.exportId())),
+        new Endpoint(
+                "GET /reports/exports/{id}/file",
+                Set.of(Permission.REPORT_READ, Permission.EXCEPTION_READ),
+                target -> get("/api/v1/reports/exports/" + target.exportId() + "/file")),
     };
 
     static Stream<Arguments> endpointByRole() {
@@ -193,9 +212,17 @@ class AuthorizationMatrixIT extends AbstractIntegrationTest {
 
         UUID openCase = newCase(org, run, "OPEN", target.id());
         UUID resolvedCase = newCase(org, run, "RESOLVED", target.id());
+        UUID export = UUID.randomUUID();
+        jdbc.update(
+                "INSERT INTO job (id, organization_id, type, payload, status) VALUES (?, ?, 'EXPORT', ?::jsonb, 'DONE')",
+                export,
+                org,
+                "{\"runId\":\"" + run + "\",\"requestedBy\":\"" + target.id() + "\"}");
+        byte[] csv = "case_id\n".getBytes(StandardCharsets.UTF_8);
+        storage.put(ExportKeys.file(org, export), new ByteArrayInputStream(csv), csv.length, "text/csv");
 
         MockHttpServletResponse response = mockMvc.perform(endpoint.request()
-                        .apply(new Target(target.id(), batch, run, openCase, resolvedCase))
+                        .apply(new Target(target.id(), batch, run, openCase, resolvedCase, export))
                         .with(as(caller.id())))
                 .andReturn()
                 .getResponse();

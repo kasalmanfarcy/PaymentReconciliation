@@ -10,7 +10,7 @@ import org.springframework.validation.annotation.Validated;
  * setting, and {@link Validated} fails startup on a blank region or bucket rather than on the
  * first upload. A blank endpoint means AWS's own S3 endpoints (otherwise path-style requests to
  * the endpoint, as MinIO needs); blank keys mean the SDK's default credential chain (an IAM role in
- * production) instead of static keys. Used by ingestion's S3 FileStorage (M5.8).
+ * production) instead of static keys. Used by shared.storage's S3 FileStorage (M5.8; imports and M8 exports).
  */
 @Validated
 @ConfigurationProperties("reconflow.storage")

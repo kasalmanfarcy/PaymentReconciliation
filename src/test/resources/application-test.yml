@@ -1,6 +1,10 @@
 # Test profile (test resources only, so it never ships). The datasource comes from the
 # Testcontainers PostgreSQL via @ServiceConnection; nothing here needs a .env.
 spring:
+  flyway:
+    # The migrations, plus a test-only callback that lets the queue tests use their own job type
+    # (db/test-callbacks/afterMigrate__allow_test_job_type.sql).
+    locations: classpath:db/migration,classpath:db/test-callbacks
   datasource:
     # Overridden by @ServiceConnection; present so the placeholders always resolve.
     username: test

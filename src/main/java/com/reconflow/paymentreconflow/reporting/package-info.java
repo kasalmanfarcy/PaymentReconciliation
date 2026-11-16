@@ -1,6 +1,7 @@
 /**
  * Reporting: read-only aggregate reports and CSV export, written as SQL over the other
- * modules' tables. Owns no tables and depends only on {@code shared}.
+ * modules' tables. Owns no tables. Depends on {@code shared}, and on {@code audit} since M8.4:
+ * an export is financial data leaving the system, so it is audited.
  *
  * <p>Public API: this package. Sub-packages are internal to the module.
  */
@@ -8,7 +9,7 @@
 // even if it would not create a cycle.
 @ApplicationModule(
         displayName = "Reporting",
-        allowedDependencies = {"shared"})
+        allowedDependencies = {"audit", "shared"})
 package com.reconflow.paymentreconflow.reporting;
 
 import org.springframework.modulith.ApplicationModule;

@@ -7,8 +7,8 @@
 #   docker build -t reconflow:local .
 #   RECONFLOW_LOCAL=1 deploy/deploy.sh local              # the same script as a real deploy
 #   scripts/demo.sh --no-start --deployed-local           # end to end through the edge
-#   docker compose -p reconflow-rehearsal --env-file deploy/.env.local \
-#     -f deploy/compose.prod.yaml -f deploy/compose.local.yaml down -v
+#   RECONFLOW_TAG=local docker compose -p reconflow-rehearsal --env-file deploy/.env.local \
+#     -f deploy/compose.prod.yaml -f deploy/compose.local.yaml --profile migrate down -v
 services:
   traefik:
     volumes:

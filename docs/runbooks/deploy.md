@@ -153,8 +153,8 @@ docker build -t reconflow:local .
 RECONFLOW_LOCAL=1 deploy/deploy.sh local
 CURL_CA=deploy/local/certs/ca.pem BASE_URL=https://api.reconflow.localhost:8443 \
   KEYCLOAK_URL=https://auth.reconflow.localhost:8443 DEMO_PASSWORD=rehearsal-demo-password scripts/demo.sh --no-start
-docker compose -p reconflow-rehearsal --env-file deploy/.env.local \
-  -f deploy/compose.prod.yaml -f deploy/compose.local.yaml down -v
+RECONFLOW_TAG=local docker compose -p reconflow-rehearsal --env-file deploy/.env.local \
+  -f deploy/compose.prod.yaml -f deploy/compose.local.yaml --profile migrate down -v
 ```
 
 Rehearsed on 2026-11-16 (Colima): all five stages passed (migrate 4 s, api ready 7 s after its

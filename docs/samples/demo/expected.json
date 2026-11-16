@@ -1,0 +1,23 @@
+{
+  "run": { "periodStart": "2026-10-12", "periodEnd": "2026-10-13", "currency": "AED" },
+  "imports": {
+    "ledger": { "status": "COMPLETED", "totalRows": 19, "validRows": 19, "errorRows": 0 },
+    "gateway": { "status": "COMPLETED_WITH_ERRORS", "totalRows": 22, "validRows": 20, "errorRows": 2 }
+  },
+  "summary": {
+    "matched": { "count": 13, "amount": "13410.1400" },
+    "amountMismatch": { "count": 2, "netDifference": "-500.0300" },
+    "unmatchedLeft": { "count": 2, "amount": "602.0000" },
+    "unmatchedRight": { "count": 2, "amount": "2209.0000" },
+    "duplicates": { "count": 1 },
+    "currencyMismatches": { "count": 1 },
+    "excluded": { "count": 0 }
+  },
+  "openExceptionTypes": {
+    "AMOUNT_MISMATCH": 2,
+    "MISSING_IN_GATEWAY": 2,
+    "MISSING_IN_LEDGER": 2,
+    "DUPLICATE_IN_SOURCE": 1,
+    "CURRENCY_MISMATCH": 1
+  }
+}

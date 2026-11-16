@@ -1,6 +1,6 @@
 # Architecture
 
-**Status:** Accepted for v1 (revised to match the code in M11.10) · **Task:** TASKS.md M1.9 · **Date:** 2026-11-16
+**Status:** Accepted for v1; checked against the code in M11.10 (every box below is a class, table, container or service that exists) · **Task:** TASKS.md M1.9 · **Date:** 2026-11-16
 
 How ReconFlow is put together: who talks to it, what runs where, which module owns what, which module may call which, how the main requests flow, and how background work runs. The capacity reasoning behind these choices is in [scalability.md](scalability.md); the decisions are recorded as ADRs in [adr/](adr/).
 
@@ -13,41 +13,51 @@ flowchart LR
     U["Finance users<br/>uploader · investigator · org admin · viewer"]
     P["Platform admin<br/>(ReconFlow operator)"]
     R["ReconFlow<br/>payment reconciliation"]
+    KC["Keycloak<br/>identity provider (OIDC)"]
     DB[("PostgreSQL 16<br/>all business data,<br/>job queue, audit log")]
     S3[("Object storage<br/>S3-compatible; MinIO locally<br/>original CSV files")]
     U -- "HTTPS + JSON<br/>upload CSVs, run, investigate" --> R
     P -- "HTTPS + JSON<br/>manage organizations" --> R
     R -- "JDBC" --> DB
     R -- "S3 API" --> S3
+    U -- "log in (authorization code + PKCE)" --> KC
+    R -- "JWKS (validate tokens),<br/>Admin API (create users)" --> KC
 ```
 
-ReconFlow has no other external dependencies in v1: no message broker, no cache, no email service. Files arrive by manual upload through the API (v2 adds SFTP and gateway pulls).
+Since M10.1 login is Keycloak's: users get tokens there and ReconFlow only validates them ([ADR 0015](adr/0015-delegate-authentication-to-keycloak.md)). ReconFlow has no other external dependencies in v1: no message broker, no cache, no email service. Files arrive by manual upload through the API (v2 adds SFTP and gateway pulls).
 
 ---
 
 ## 2. Containers
 
-One codebase, one jar, run as two kinds of process ([ADR 0002](adr/0002-modular-monolith.md)):
+One codebase, one image, run in three roles ([ADR 0002](adr/0002-modular-monolith.md)). This is the deployed shape ([deploy/compose.prod.yaml](../deploy/compose.prod.yaml), M11.4); locally, `compose.yaml --profile full` runs the same roles without the edge.
 
 ```mermaid
 flowchart TB
-    C["API client / browser"] -->|"HTTPS, JWT"| LB["Load balancer (TLS)"]
-    LB --> A1["reconflow (api) #1"]
-    LB --> A2["reconflow (api) #2"]
-    A1 & A2 -->|"store original file"| S3[("Object storage")]
-    A1 & A2 -->|"business rows + job rows,<br/>one transaction"| DB[("PostgreSQL 16<br/>primary + standby")]
-    W1["reconflow (worker) #1"] & W2["reconflow (worker) #2"] -->|"claim jobs (SKIP LOCKED),<br/>write results"| DB
-    W1 & W2 -->|"stream file"| S3
+    C["API client"] -->|"HTTPS"| T["Traefik (edge)<br/>TLS, HTTP→HTTPS, 51 MiB body cap,<br/>per-IP rate limits, /admin blocked"]
+    T -->|"api.example.com → :8080"| A["api<br/>prod,api"]
+    T -->|"auth.example.com → :8080"| KC["Keycloak<br/>start, own database"]
+    A -->|"JWKS, Admin API<br/>(internal network)"| KC
+    A -->|"store original file"| S3[("S3 bucket")]
+    A -->|"business rows + job rows,<br/>one transaction"| DB[("PostgreSQL 16<br/>paymentreconflow")]
+    W["worker<br/>prod,worker"] -->|"claim jobs (SKIP LOCKED),<br/>write results"| DB
+    W -->|"stream file"| S3
+    M["migrate<br/>prod,migrate · once per deploy"] -->|"Flyway DDL"| DB
+    KC --> KDB[("PostgreSQL 16<br/>keycloak")]
+    PR["Prometheus (optional)"] -.->|":8081 /actuator/prometheus"| A & W
 ```
 
-| Container | Profile | Does | Doesn't |
-|---|---|---|---|
-| API instance | `api` | Authenticates, authorizes, validates, answers reads, accepts uploads and run requests, writes job rows | Run imports or reconciliation |
-| Worker instance | `worker` | Claims jobs from the `job` table and runs them: imports, reconciliation runs, large exports; runs the lease sweeper and partition maintenance | Serve HTTP traffic (only actuator health) |
-| PostgreSQL 16 | — | All business data, the job queue, the audit log | — |
-| Object storage | — | Original uploaded files, large exports | Hold anything the database needs to query |
+| Container | Profile | Does | Holds | Doesn't |
+|---|---|---|---|---|
+| `api` | `prod,api` | Authenticates, authorizes, validates, answers reads, accepts uploads and run requests, writes job rows; validates the schema at startup | `reconflow_app` password, S3 key, Keycloak service-account secret | Run imports or reconciliation; hold DDL rights |
+| `worker` | `prod,worker` | Claims jobs and runs them (imports, runs, large exports); sweeper, partition maintenance, retention, gauges | as `api` | Take public traffic (only actuator, on 8081) |
+| `migrate` | `prod,migrate` | Applies Flyway migrations, validates the entities, exits 0 (non-zero stops the deploy) | `reconflow_migrator` password only | Run when `up` runs: `deploy.sh` starts it, as its own stage |
+| Keycloak | — | Logins, tokens, users, brute-force lockout; no password grant deployed | its own database role | Reach ReconFlow's database |
+| Traefik | — | TLS (Let's Encrypt), limits, routing | certificates | Route 8081 or Keycloak's `/admin` |
+| PostgreSQL 16 | — | All business data, the job queue, the audit log (managed service deployed) | — | — |
+| Object storage | — | Original uploaded files, large exports | — | Hold anything the database needs to query |
 
-Why two process kinds: a 100k-row import takes 10–30 seconds of CPU and I/O. Running it on API threads would make browsing slow during the 09:00 upload burst. Separate worker processes isolate that load, while one codebase keeps one set of transaction boundaries and one deployment pipeline. API instances are stateless (JWT, no sessions), so any instance can serve any request.
+Why two process kinds: a 100k-row import takes 10–30 seconds of CPU and I/O. Running it on API threads would make browsing slow during the 09:00 upload burst. Separate worker processes isolate that load, while one codebase keeps one set of transaction boundaries and one deployment pipeline. API instances are stateless (bearer tokens, no sessions), so any instance can serve any request. The migrate role exists so that only one short-lived process ever holds DDL rights ([CONTRIBUTING.md](../CONTRIBUTING.md#migrations), M11.5).
 
 ---
 
@@ -60,7 +70,7 @@ The root package is `com.reconflow.paymentreconflow`. Each module is a top-level
 | Module (package) | Responsibility | Owns tables |
 |---|---|---|
 | `organization` | Organizations: create, suspend, list (platform admins) | `organization` |
-| `security` | Users, membership, login, tokens, the tenant-context filter, roles → permissions (layout: [authentication.plan §6](../plans/authentication.plan)) | `app_user`, `membership`, `refresh_token` |
+| `security` | Users and membership, the OIDC resource-server setup and `sub` → user linking, the Keycloak Admin API client (`security.idp`), the tenant-context filter, roles → permissions | `app_user`, `membership`; `refresh_token` (unused since M10.1, dropped by the pending contract step) |
 | `ingestion` | Upload, file storage, parsing, validation, normalization, import status | `import_batch`, `import_row_error` |
 | `ledger` | The normalized transaction store, its writer and its search API | `transaction_record` (and its partitions) |
 | `reconciliation` | Runs, the matching engine, matches | `reconciliation_run`, `reconciliation_match` |
@@ -112,7 +122,7 @@ The rules, and why:
 - **The audit timeline carries actor ids, not names.** `audit` depends on `shared` only and `security` depends on `audit`, so `GET /audit-events` can't ask the user directory for display names without a cycle; a client resolves names separately (M7.13).
 - **`reporting` depends on `shared` and `audit` only: read-model SQL (M8).** Reports are read-only SQL over the other modules' tables through `JdbcClient`, returning final aggregates. Going through each module's API would mean N+1 calls and in-memory joins for every report (option A in phase-M8 §2.4); an event-fed read model (option C) would decouple the schemas but costs machinery and eventual consistency. The coupling this leaves is to other modules' **schemas**, not their Java types (so `ModularityTest` stays green), and it is contained three ways: `reporting` never writes another module's table; all of its SQL lives in one `*Queries` class per report (plus the exporter's one statement); and every statement runs against the migrated schema in CI (`ReportQueryPlanIT` EXPLAINs each one, the report ITs check its results), so a renamed column fails the build. `audit` was added in M8.4 because an export is financial data leaving the system. If modules ever moved to separate databases, this becomes an event-fed read model.
 
-These rules become `ApplicationModules.verify()` tests in M2.9, plus an ArchUnit rule that nothing outside `security` imports `security.auth` or `security.token`.
+These rules are enforced in the build: `allowedDependencies` in each module's `package-info.java`, checked by `ModularityTest` (`ApplicationModules.verify()`), plus ArchUnit rules in `ArchitectureRulesTest` (nothing outside `security` touches `security.idp`; only `audit` writes `audit_event`; only `RunLifecycle` and `ExceptionStateMachine` change a run's or a case's status; money is never compared with `equals`).
 
 ---
 
@@ -205,6 +215,24 @@ sequenceDiagram
 
 The explicit version compare catches the slow race (the client read version 4 long ago); the `WHERE version = 4` in the update catches the fast race (two requests in flight at once). Either way, exactly one resolve wins and the other gets `409`.
 
+### 5.5 A worker crashes mid-import
+
+```mermaid
+sequenceDiagram
+    participant W1 as worker #1
+    participant DB as PostgreSQL
+    participant W2 as worker #2
+    W1->>DB: claim IMPORT job, lease_until = now()+2 min
+    W1->>DB: chunk 1..3 committed (last_committed_row = 15000)
+    Note over W1: SIGKILL (no graceful hand-back)
+    W2->>DB: sweeper (every 30 s): lease expired → job QUEUED, attempts kept
+    W2->>DB: claim the job, new lease
+    W2->>DB: batch is PROCESSING: resume after row 15000 (checkpoint)
+    W2->>DB: remaining chunks, fenced by the lease; COMPLETED, job DONE
+```
+
+Measured with a real `SIGKILL` of the only worker during a 500k-row import: resumed from its checkpoint about 2 minutes later, final batch identical to a clean import ([benchmarks §4](benchmarks.md)). On `SIGTERM` the worker hands the job back at the next chunk boundary instead, and the next worker claims it at once.
+
 ---
 
 ## 6. Background processing
@@ -249,12 +277,99 @@ One jar; behaviour is selected by Spring profiles. A process runs one **role** p
 |---|---|---|
 | `api` | Role | HTTP controllers and filters active; job worker loop off |
 | `worker` | Role | Sets `reconflow.jobs.worker.enabled=true`: the claim loop, sweeper and partition-maintenance job run. Controllers aren't needed beyond actuator health |
-| `local` | Environment | Docker Compose PostgreSQL and MinIO, seed data (two organizations, a user per role), readable logs, `Secure` cookie flag off for Safari. Usually run as `local,api,worker` in one process |
+| `migrate` | Role | No web server: Flyway as `reconflow_migrator`, Hibernate validation, then exit (M11.5) |
+| `local` | Environment | Reads `.env`, Docker Compose dependencies, seed data (two organizations, a user per role), readable logs, migrates on startup. Usually run as `local,api,worker` in one process |
+| `demo` | Overlay | The local seed under `prod` config, refusing any database that holds a non-demo organization (M11.2) |
 | `test` | Environment | Testcontainers PostgreSQL via `@ServiceConnection`; each test creates a fresh organization instead of truncating tables (audit tables can't be truncated) |
-| `prod` | Environment | JSON logs, secrets only from environment variables, `ddl-auto=validate`, Swagger UI off |
+| `prod` | Environment | JSON logs, secrets only from environment variables, `ddl-auto=validate`, Flyway validate-only as the app role, forwarded headers trusted from internal proxies only, no OpenAPI document or Swagger UI |
 
 **Ports (M9.10).** `server.port` (8080) serves the API and is the only port behind the load balancer. In `local` and `prod`, actuator moves to `management.server.port` (8081, `MANAGEMENT_PORT`): the liveness and readiness probes and `/actuator/prometheus`, which the security chain permits only on that port and refuses on 8080 even to a logged-in user. Prometheus and Grafana run under compose's `observability` profile (`ops/prometheus`, `ops/grafana`: a provisioned dashboard and alert rules, including the default-partition alert and its runbook in `docs/runbooks/`).
 
 **Probes and shutdown (M9.11).** Liveness (`/actuator/health/liveness`) checks only the application's own state; readiness adds the database and object storage (`HEAD bucket`, 2 s timeout). A dependency outage takes an instance out of rotation instead of restarting it, which would fix nothing and make every instance reconnect at once when the dependency returned. On `SIGTERM`, readiness flips to refusing traffic, Tomcat finishes in-flight requests (`server.shutdown: graceful`), and the job worker stops claiming and asks running handlers to stop at their next chunk boundary, where they hand the job back (`QUEUED`, no attempt spent) so another worker resumes it at once; all within `spring.lifecycle.timeout-per-shutdown-phase` (30 s), which the platform's grace period must exceed. If the process is killed instead, the lease expiry recovers the job within ~2 minutes: graceful shutdown is an optimization, crash recovery is the guarantee.
 
-Locally, a single `local,api,worker` process does everything. In production, the same image is deployed twice: two instances with `prod,api` behind the load balancer, and two with `prod,worker`.
+Locally, a single `local,api,worker` process does everything. Deployed, the same image runs as `prod,api`, `prod,worker` and, once per deploy, `prod,migrate` (§2); [docs/runbooks/deploy.md](runbooks/deploy.md) is the procedure, including rollback (deploy the previous `sha-<commit>` tag). The v1 deployment runs one api and one worker; scaling either is more replicas of the same container (scalability.md).
+
+---
+
+## 9. Data model
+
+The main tables and how they connect; columns, constraints, partitioning and row-level security are in [database-design.md](database-design.md). Every tenant-owned table carries `organization_id` and has a row-level-security policy.
+
+```mermaid
+erDiagram
+    ORGANIZATION ||--o{ MEMBERSHIP : has
+    APP_USER ||--o{ MEMBERSHIP : has
+    ORGANIZATION ||--o{ IMPORT_BATCH : owns
+    IMPORT_BATCH ||--o{ IMPORT_ROW_ERROR : reports
+    IMPORT_BATCH ||--o{ TRANSACTION_RECORD : contains
+    ORGANIZATION ||--o{ RECONCILIATION_RUN : owns
+    RECONCILIATION_RUN ||--o{ RECONCILIATION_RUN_DAY : "totals per day"
+    RECONCILIATION_RUN ||--o{ RECONCILIATION_MATCH : produces
+    TRANSACTION_RECORD ||--o{ RECONCILIATION_MATCH : "ledger / gateway side"
+    EXCEPTION_CASE ||--o{ EXCEPTION_CASE_RUN : "observed by"
+    RECONCILIATION_RUN ||--o{ EXCEPTION_CASE_RUN : observes
+    EXCEPTION_CASE ||--o{ EXCEPTION_CASE_RECORD : links
+    TRANSACTION_RECORD ||--o{ EXCEPTION_CASE_RECORD : "linked by"
+    EXCEPTION_CASE ||--o{ EXCEPTION_NOTE : has
+    EXCEPTION_CASE ||--o{ EXCEPTION_STATUS_HISTORY : has
+    ORGANIZATION ||--o{ AUDIT_EVENT : scopes
+    ORGANIZATION ||--o{ JOB : queues
+```
+
+`transaction_record` is partitioned by month on `transaction_date` ([ADR 0011](adr/0011-monthly-partitioning-of-transaction-record.md)); `archive_manifest` records months archived to object storage (M9.16).
+
+## 10. State machines
+
+Each has one class that changes it (`ImportBatchStatus`, `RunStatus` through `RunLifecycle`, `ExceptionStateMachine`) and an audit event per transition ([reconciliation-rules.md §7](reconciliation-rules.md#7-state-machines)).
+
+Import batch:
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> RECEIVED
+    RECEIVED --> PROCESSING
+    RECEIVED --> FAILED : rejected
+    PROCESSING --> COMPLETED
+    PROCESSING --> COMPLETED_WITH_ERRORS : some rows rejected
+    PROCESSING --> FAILED : retries exhausted
+    FAILED --> RECEIVED : retry (explicit)
+```
+
+Reconciliation run:
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> PENDING
+    PENDING --> RUNNING
+    PENDING --> FAILED
+    RUNNING --> COMPLETED
+    RUNNING --> FAILED
+    FAILED --> PENDING : retry, resumes from its checkpoint
+```
+
+Exception case:
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> OPEN : created by a run
+    OPEN --> IN_REVIEW : start review
+    IN_REVIEW --> OPEN : back to open (reason)
+    OPEN --> RESOLVED : resolve (code)
+    IN_REVIEW --> RESOLVED : resolve (code)
+    RESOLVED --> OPEN : reopen (admin, reason)
+```
+
+## 11. Where idempotency comes from
+
+| Retry of… | Protected by |
+|---|---|
+| An upload of the same file | `UNIQUE (organization_id, source_type, content_hash)` on `import_batch` → `409 duplicate-file` ([ADR 0005](adr/0005-duplicate-import-policy.md)) |
+| A run request | `UNIQUE (organization_id, idempotency_key)` on `reconciliation_run` → the existing run, `200` ([ADR 0006](adr/0006-reconciliation-run-idempotency.md)) |
+| A re-run finding the same discrepancy | partial unique index on active cases by `discrepancy_key` (K3): the case is re-observed, not duplicated |
+| An import chunk after a crash or an ambiguous commit | `last_committed_row` compare-and-set checkpoint |
+| A run day after a crash | `last_completed_date` checkpoint and the day lock |
+| Two people resolving one case | `@Version` with `If-Match` → `409 stale-version` ([ADR 0007](adr/0007-optimistic-locking-on-exceptions.md)) |
+

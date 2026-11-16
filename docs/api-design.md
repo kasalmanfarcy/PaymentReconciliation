@@ -111,6 +111,7 @@ Validation errors add an `errors` array, one entry per problem:
 | `last-org-admin` | 409 | Demoting or disabling the organization's last active org admin |
 | `already-a-member` | 409 | Adding a user who is already a member of this organization |
 | `run-in-progress` | 409 | Requesting or retrying a run while another run of the same organization, period, sources and currency is `PENDING` or `RUNNING` (`existingRunId`); added in M6 |
+| `run-not-completed` | 409 | A reconciliation report for a run that isn't `COMPLETED` yet (`currentStatus`): its totals are written at completion; added in M8 |
 | `file-too-large` | 413 | Upload over 50 MB |
 | `unsupported-media-type` | 415 | Upload isn't a `.csv` with an accepted content type; or a body in the wrong content type |
 | `idempotency-key-reused` | 422 | Same `Idempotency-Key`, different request body |
@@ -262,7 +263,7 @@ Permissions are from [authentication.plan §5](../plans/authentication.plan), pl
 | `POST /exceptions/{id}/resolve` | `EXCEPTION_RESOLVE` | 200 + `ETag` | 400, 404, 409, 428 | M7.10 |
 | `POST /exceptions/{id}/reopen` | `EXCEPTION_REOPEN` | 200 + `ETag` | 400, 404, 409 `active-case-exists`, 428 | M7.11 |
 | `GET /audit-events?entityType=&entityId=` | `AUDIT_READ` | 200 page | 400 | M7.13 |
-| `GET /reports/reconciliation?runId=` or `?from=&to=&currency=` | `REPORT_READ` + `EXCEPTION_READ` | 200 | 400, 404 | M8.1 |
+| `GET /reports/reconciliation?runId= (or ?from=&to=&currency=)` | `REPORT_READ` + `EXCEPTION_READ` | 200 | 400, 404, 409 `run-not-completed` | M8.1 |
 | `GET /reports/import-quality` | `REPORT_READ` | 200 | 400 | M8.2 |
 | `GET /reports/exception-ageing` | `REPORT_READ` | 200 | 400 | M8.3 |
 | `GET /reports/exceptions/export?runId=` | `REPORT_READ` + `EXCEPTION_READ` | 200 `text/csv` | 404 | M8.4 |

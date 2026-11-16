@@ -1,5 +1,6 @@
 package com.reconflow.paymentreconflow.exceptions;
 
+import java.time.LocalDate;
 import java.util.List;
 import java.util.UUID;
 
@@ -21,11 +22,21 @@ public interface DiscrepancyRecorder {
      * Either way, link every record not yet linked, and link the run ({@code exception_case_run}).
      * A key whose only cases are RESOLVED gets a new OPEN case (K4). Idempotent: recording the same
      * discrepancies for the same run twice changes nothing.
+     *
+     * @param day the anchor day of the chunk that found them, stored on the run link so a
+     *     date-range report can attribute each case to the same (run, day) as the run's day totals
      */
-    Recorded record(UUID organizationId, UUID runId, List<Discrepancy> discrepancies);
+    Recorded record(UUID organizationId, UUID runId, LocalDate day, List<Discrepancy> discrepancies);
 
     /** The cases a run observed, created or re-observed, totalled by type (M6.9's summary). */
     RunExceptionSummary summarize(UUID organizationId, UUID runId);
+
+    /**
+     * As {@link #summarize}, for the cases the run observed on one anchor day (M8.1's day rows).
+     * Summed over the run's days it equals {@link #summarize}, because a run observes each case on
+     * exactly one day.
+     */
+    RunExceptionSummary summarizeDay(UUID organizationId, UUID runId, LocalDate day);
 
     /** What {@link #record} did: how many cases it created and how many it found already active. */
     record Recorded(int created, int reobserved) {}

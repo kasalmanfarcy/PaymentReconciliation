@@ -12,6 +12,7 @@ import com.reconflow.paymentreconflow.exceptions.RunExceptionSummary;
 import com.reconflow.paymentreconflow.shared.id.Ids;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
+import java.time.LocalDate;
 import java.util.Comparator;
 import java.util.EnumMap;
 import java.util.List;
@@ -68,8 +69,8 @@ class JdbcDiscrepancyRecorder implements DiscrepancyRecorder {
 
     // A re-executed chunk may have linked the run already.
     private static final String LINK_RUN = """
-            INSERT INTO exception_case_run (exception_id, run_id, organization_id, created)
-            VALUES (:caseId, :runId, :org, :created)
+            INSERT INTO exception_case_run (exception_id, run_id, organization_id, created, day)
+            VALUES (:caseId, :runId, :org, :created, :day)
             ON CONFLICT DO NOTHING
             """;
 
@@ -81,6 +82,18 @@ class JdbcDiscrepancyRecorder implements DiscrepancyRecorder {
               FROM exception_case_run r
               JOIN exception_case ec ON ec.id = r.exception_id AND ec.organization_id = r.organization_id
              WHERE r.run_id = :runId AND r.organization_id = :org
+             GROUP BY ec.type
+            """;
+
+    // The same totals for one anchor day: the PK (run_id, exception_id) narrows to the run first.
+    private static final String SUMMARIZE_DAY = """
+            SELECT ec.type,
+                   count(*)                                AS cases,
+                   coalesce(sum(ec.amount), 0)             AS amount,
+                   coalesce(sum(ec.amount_difference), 0)  AS net_difference
+              FROM exception_case_run r
+              JOIN exception_case ec ON ec.id = r.exception_id AND ec.organization_id = r.organization_id
+             WHERE r.run_id = :runId AND r.organization_id = :org AND r.day = :day
              GROUP BY ec.type
             """;
 
@@ -99,7 +112,7 @@ class JdbcDiscrepancyRecorder implements DiscrepancyRecorder {
 
     @Override
     @Transactional(propagation = Propagation.MANDATORY)
-    public Recorded record(UUID organizationId, UUID runId, List<Discrepancy> discrepancies) {
+    public Recorded record(UUID organizationId, UUID runId, LocalDate day, List<Discrepancy> discrepancies) {
         int created = 0;
         int reobserved = 0;
         // Key order: every transaction locks keys in the same order, so two concurrent runs of one
@@ -131,6 +144,7 @@ class JdbcDiscrepancyRecorder implements DiscrepancyRecorder {
                     .param("runId", runId)
                     .param("org", organizationId)
                     .param("created", found.created())
+                    .param("day", day)
                     .update();
         }
         return new Recorded(created, reobserved);
@@ -178,8 +192,21 @@ class JdbcDiscrepancyRecorder implements DiscrepancyRecorder {
     @Override
     @Transactional(propagation = Propagation.MANDATORY)
     public RunExceptionSummary summarize(UUID organizationId, UUID runId) {
+        return totals(sql.sql(SUMMARIZE).param("runId", runId).param("org", organizationId));
+    }
+
+    @Override
+    @Transactional(propagation = Propagation.MANDATORY)
+    public RunExceptionSummary summarizeDay(UUID organizationId, UUID runId, LocalDate day) {
+        return totals(sql.sql(SUMMARIZE_DAY)
+                .param("runId", runId)
+                .param("org", organizationId)
+                .param("day", day));
+    }
+
+    private static RunExceptionSummary totals(JdbcClient.StatementSpec statement) {
         Map<ExceptionType, RunExceptionSummary.Totals> byType = new EnumMap<>(ExceptionType.class);
-        sql.sql(SUMMARIZE).param("runId", runId).param("org", organizationId).query(rs -> {
+        statement.query(rs -> {
             byType.put(
                     ExceptionType.valueOf(rs.getString("type")),
                     new RunExceptionSummary.Totals(

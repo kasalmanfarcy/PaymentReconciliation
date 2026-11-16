@@ -9,6 +9,7 @@ import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noClasses;
 
 import com.reconflow.paymentreconflow.exceptions.internal.domain.ExceptionCase;
 import com.reconflow.paymentreconflow.reconciliation.domain.ReconciliationRun;
+import com.reconflow.paymentreconflow.shared.context.RequiresBothPermissions;
 import com.reconflow.paymentreconflow.shared.context.RequiresPermission;
 import com.tngtech.archunit.core.domain.JavaClasses;
 import com.tngtech.archunit.core.importer.ClassFileImporter;
@@ -113,6 +114,8 @@ class ArchitectureRulesTest {
                 .areMetaAnnotatedWith(RequestMapping.class)
                 .should()
                 .beAnnotatedWith(RequiresPermission.class)
+                .orShould()
+                .beAnnotatedWith(RequiresBothPermissions.class) // M8: report + exception data
                 .orShould()
                 .beAnnotatedWith(PreAuthorize.class)
                 .check(classes);

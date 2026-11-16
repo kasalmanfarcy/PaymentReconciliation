@@ -38,6 +38,7 @@ public final class ProblemCodes {
     public static final String LAST_ORG_ADMIN = "last-org-admin";
     public static final String ALREADY_A_MEMBER = "already-a-member";
     public static final String RUN_IN_PROGRESS = "run-in-progress";
+    public static final String RUN_NOT_COMPLETED = "run-not-completed";
     // 413, 415
     public static final String FILE_TOO_LARGE = "file-too-large";
     public static final String UNSUPPORTED_MEDIA_TYPE = "unsupported-media-type";

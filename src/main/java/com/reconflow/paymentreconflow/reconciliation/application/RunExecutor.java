@@ -18,7 +18,8 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * The worker's run loop (M6.9, ADR 0012): one transaction per day of the period, each committing
- * that day's matches, its exception cases and the {@code last_completed_date} checkpoint together.
+ * that day's matches, its exception cases, its day totals (M8.1) and the {@code last_completed_date}
+ * checkpoint together.
  * A crash loses at most the day in flight; the next attempt resumes after the checkpoint and ends
  * in exactly the state of a clean run.
  *
@@ -81,7 +82,8 @@ public class RunExecutor {
                 lifecycle.lockForChunk(run, d); // fence 1: the checkpoint is where we expect
                 context.fence(); // fence 2: we still hold the job's lease (and extend it)
                 DayResult r = strategy.reconcileDay(run, d);
-                discrepancies.record(run.organizationId(), run.runId(), r.discrepancies());
+                discrepancies.record(run.organizationId(), run.runId(), d, r.discrepancies());
+                lifecycle.recordDay(run, d, r); // M8.1: the day's totals, for date-range reports
                 hook.beforeCheckpoint(run.runId(), d);
                 lifecycle.advanceCheckpoint(run, d);
                 return r;

@@ -148,6 +148,8 @@ class CheckpointResumeIT extends AbstractIntegrationTest {
         assertThat(driver.observedCases(run)).isNotEmpty().isEqualTo(driver.observedCases(clean));
         Map<String, Object> expected = driver.summary(clean);
         assertThat(driver.summary(run)).isEqualTo(expected);
+        // M8.1: the day rows roll back with their chunk, so a resumed run has exactly one per day.
+        assertThat(driver.dayRows(run)).hasSize(10).isEqualTo(driver.dayRows(clean));
         assertThat(count(
                         "SELECT count(*) FROM (SELECT ledger_record_id FROM reconciliation_match WHERE run_id = ?"
                                 + " GROUP BY 1 HAVING count(*) > 1) d",

@@ -10,6 +10,7 @@ import com.reconflow.paymentreconflow.reconciliation.domain.ReconciliationRun;
 import com.reconflow.paymentreconflow.reconciliation.domain.ReconciliationRunRepository;
 import com.reconflow.paymentreconflow.reconciliation.domain.RunStatus;
 import com.reconflow.paymentreconflow.reconciliation.domain.RunSummary;
+import com.reconflow.paymentreconflow.reconciliation.engine.DayResult;
 import com.reconflow.paymentreconflow.reconciliation.engine.RunContext;
 import com.reconflow.paymentreconflow.reconciliation.engine.SqlScripts;
 import com.reconflow.paymentreconflow.shared.jobs.PermanentJobFailure;
@@ -47,6 +48,7 @@ public class RunLifecycle {
     private static final String ADVANCE_CHECKPOINT = SqlScripts.load("advance_checkpoint.sql");
     private static final String SUMMARIZE_MATCHES = SqlScripts.load("summarize_matches.sql");
     private static final String COUNT_EXCLUDED = SqlScripts.load("count_excluded.sql");
+    private static final String INSERT_RUN_DAY = SqlScripts.load("insert_run_day.sql");
 
     private final ReconciliationRunRepository runs;
     private final JdbcClient jdbc;
@@ -143,6 +145,39 @@ public class RunLifecycle {
         if (updated != 1) {
             throw new IllegalStateException("Run " + run.runId() + " is no longer RUNNING");
         }
+    }
+
+    /**
+     * The day's totals (M8.1), in the chunk's transaction: the chunk's matches from the strategy,
+     * its cases from the exceptions module (the cases this run observed on this day), mapped onto
+     * the summary columns exactly as {@link #complete} maps the whole run. So the day rows of a
+     * completed run add up to its summary (except {@code excluded_count}, which has no day), and a
+     * date-range report can pick one authoritative run per day.
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void recordDay(RunContext run, LocalDate day, DayResult result) {
+        RunSummary totals = RunSummaries.of(
+                run.leftSource(),
+                result.matchesInserted(),
+                result.matchedAmount(),
+                discrepancies.summarizeDay(run.organizationId(), run.runId(), day),
+                0);
+        jdbc.sql(INSERT_RUN_DAY)
+                .param("runId", run.runId())
+                .param("org", run.organizationId())
+                .param("day", day)
+                .param("currency", run.currency())
+                .param("matchedCount", totals.matchedCount())
+                .param("matchedAmount", totals.matchedAmount())
+                .param("mismatchCount", totals.mismatchCount())
+                .param("mismatchNetDifference", totals.mismatchNetDifference())
+                .param("unmatchedLeftCount", totals.unmatchedLeftCount())
+                .param("unmatchedLeftAmount", totals.unmatchedLeftAmount())
+                .param("unmatchedRightCount", totals.unmatchedRightCount())
+                .param("unmatchedRightAmount", totals.unmatchedRightAmount())
+                .param("duplicateCount", totals.duplicateCount())
+                .param("currencyMismatchCount", totals.currencyMismatchCount())
+                .update();
     }
 
     /**

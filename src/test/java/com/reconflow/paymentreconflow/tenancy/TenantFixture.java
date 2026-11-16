@@ -83,6 +83,15 @@ public final class TenantFixture {
                 orgBRecord,
                 orgB);
         orgBResolvedCase = newCase(orgB, orgBRun, "MISSING_IN_LEDGER:PAY-B2:PAYMENT:AED", "RESOLVED");
+        // M8: the completed run's day row, so a date-range report of A would pick it up if it ever
+        // forgot the organization filter.
+        jdbc.update("UPDATE reconciliation_run SET completed_at = now() WHERE id = ?", orgBRun);
+        jdbc.update("""
+                INSERT INTO reconciliation_run_day (run_id, organization_id, day, currency, matched_count,
+                       matched_amount, mismatch_count, mismatch_net_difference, unmatched_left_count,
+                       unmatched_left_amount, unmatched_right_count, unmatched_right_amount, duplicate_count,
+                       currency_mismatch_count)
+                VALUES (?, ?, DATE '2026-10-01', 'AED', 1, 10.0000, 1, -1.0000, 0, 0, 1, 10.0000, 0, 0)""", orgBRun, orgB);
     }
 
     /** A case of org B with its creation history row and run link, as DiscrepancyRecorder writes them. */
@@ -111,7 +120,8 @@ public final class TenantFixture {
                 org,
                 id);
         jdbc.update(
-                "INSERT INTO exception_case_run (exception_id, run_id, organization_id, created) VALUES (?, ?, ?, true)",
+                "INSERT INTO exception_case_run (exception_id, run_id, organization_id, created, day)"
+                        + " VALUES (?, ?, ?, true, DATE '2026-10-01')",
                 id,
                 run,
                 org);

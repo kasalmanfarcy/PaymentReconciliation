@@ -31,6 +31,7 @@ public class ExactReferenceStrategy implements MatchingStrategy {
     private static final String CLASSIFY_GROUPS = SqlScripts.load("classify_groups.sql");
     private static final String INSERT_MATCHES = SqlScripts.load("insert_matches.sql");
     private static final String SELECT_EXCEPTION_GROUPS = SqlScripts.load("select_exception_groups.sql");
+    private static final String SUM_MATCHED_GROUPS = SqlScripts.load("sum_matched_groups.sql");
     private static final String SELECT_COUNTERPARTS_NOT_SUCCESS =
             SqlScripts.load("select_counterparts_not_success.sql");
 
@@ -65,6 +66,9 @@ public class ExactReferenceStrategy implements MatchingStrategy {
                 .param("org", run.organizationId())
                 .param("runId", run.runId())
                 .update();
+        // The day's matched total for M8.1's day row, read from the scratch table while it exists.
+        BigDecimal matchedAmount =
+                jdbc.sql(SUM_MATCHED_GROUPS).query(BigDecimal.class).single();
         List<GroupRow> exceptionGroups =
                 jdbc.sql(SELECT_EXCEPTION_GROUPS).query(GroupRow::map).list();
 
@@ -75,7 +79,7 @@ public class ExactReferenceStrategy implements MatchingStrategy {
             discrepancies.add(toDiscrepancy(run, group, counterpartNotSuccess));
         }
         discrepancies.sort(Comparator.comparing(Discrepancy::discrepancyKey));
-        return new DayResult(matches, discrepancies);
+        return new DayResult(matches, matchedAmount, discrepancies);
     }
 
     private record GroupKey(String normalizedReference, String transactionType) {}

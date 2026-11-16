@@ -2,6 +2,7 @@ package com.reconflow.paymentreconflow.tenancy;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.reconflow.paymentreconflow.shared.context.RequiresBothPermissions;
 import com.reconflow.paymentreconflow.shared.context.RequiresPermission;
 import com.tngtech.archunit.core.domain.JavaClass;
 import com.tngtech.archunit.core.importer.ClassFileImporter;
@@ -15,6 +16,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
 import org.springframework.core.annotation.AnnotatedElementUtils;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -63,16 +65,29 @@ class PermissionDocsTest {
                         (prefix + (mapping.path().length == 0 ? "" : mapping.path()[0])).replaceFirst("^" + API, "");
                 String key = mapping.method()[0].name() + " " + path;
                 String row = documented.get(key);
-                RequiresPermission required = method.getAnnotation(RequiresPermission.class);
+                String required = required(method);
                 if (row == null) {
                     problems.add(key + " is not in the api-design.md §8.1 index");
-                } else if (required != null && !row.equals("`" + required.value() + "`")) {
-                    problems.add(key + " needs " + required.value() + " but the docs say " + row);
+                } else if (required != null && !row.equals(required)) {
+                    problems.add(key + " needs " + required + " but the docs say " + row);
                 }
             }
         }
 
         assertThat(endpoints).isPositive();
         assertThat(problems).isEmpty();
+    }
+
+    /** The permission cell the docs must show: {@code `X`}, or {@code `X` + `Y`} when both are needed. */
+    private static @Nullable String required(Method method) {
+        RequiresPermission one = method.getAnnotation(RequiresPermission.class);
+        if (one != null) {
+            return "`" + one.value() + "`";
+        }
+        RequiresBothPermissions both = method.getAnnotation(RequiresBothPermissions.class);
+        if (both != null) {
+            return "`" + both.value() + "` + `" + both.and() + "`";
+        }
+        return null;
     }
 }

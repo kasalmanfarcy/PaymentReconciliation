@@ -11,6 +11,7 @@ import com.reconflow.paymentreconflow.shared.context.Permission;
 import com.reconflow.paymentreconflow.shared.context.Role;
 import com.reconflow.paymentreconflow.support.AbstractIntegrationTest;
 import java.nio.charset.StandardCharsets;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Function;
 import java.util.stream.Stream;
@@ -35,8 +36,14 @@ class AuthorizationMatrixIT extends AbstractIntegrationTest {
      */
     record Target(UUID userId, UUID batchId, UUID runId, UUID openCaseId, UUID resolvedCaseId) {}
 
+    /** {@code required}: every permission the endpoint needs (M8's reports need two). */
     record Endpoint(
-            String name, Permission required, Function<Target, AbstractMockHttpServletRequestBuilder<?>> request) {
+            String name, Set<Permission> required, Function<Target, AbstractMockHttpServletRequestBuilder<?>> request) {
+
+        Endpoint(String name, Permission required, Function<Target, AbstractMockHttpServletRequestBuilder<?>> request) {
+            this(name, Set.of(required), request);
+        }
+
         @Override
         public String toString() {
             return name;
@@ -151,6 +158,11 @@ class AuthorizationMatrixIT extends AbstractIntegrationTest {
                 "GET /imports/{id}/errors",
                 Permission.IMPORT_READ,
                 target -> get("/api/v1/imports/" + target.batchId() + "/errors")),
+        // M8: the date-range mode (the target run is FAILED, so run mode would be a 409).
+        new Endpoint(
+                "GET /reports/reconciliation",
+                Set.of(Permission.REPORT_READ, Permission.EXCEPTION_READ),
+                target -> get("/api/v1/reports/reconciliation?from=2026-10-01&to=2026-10-31&currency=AED")),
     };
 
     static Stream<Arguments> endpointByRole() {
@@ -180,7 +192,7 @@ class AuthorizationMatrixIT extends AbstractIntegrationTest {
                 .andReturn()
                 .getResponse();
 
-        if (RolePermissions.of(role).contains(endpoint.required())) {
+        if (RolePermissions.of(role).containsAll(endpoint.required())) {
             assertThat(response.getStatus()).as(response.getContentAsString()).isBetween(200, 299);
         } else {
             assertThat(response.getStatus()).isEqualTo(403);

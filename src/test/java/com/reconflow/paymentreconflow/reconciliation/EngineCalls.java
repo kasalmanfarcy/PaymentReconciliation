@@ -43,7 +43,7 @@ class EngineCalls {
                 run.organizationId(),
                 () -> tx.execute(s -> {
                     DayResult result = strategy.reconcileDay(run, day);
-                    recorder.record(run.organizationId(), run.runId(), result.discrepancies());
+                    recorder.record(run.organizationId(), run.runId(), day, result.discrepancies());
                     return result;
                 }));
     }

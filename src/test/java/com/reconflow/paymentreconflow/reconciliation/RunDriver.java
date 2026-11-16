@@ -86,6 +86,17 @@ class RunDriver {
                   FROM reconciliation_run WHERE id = ?""", run);
     }
 
+    /** The run's day rows (M8.1), oldest first, money as text, without the run id. */
+    List<Map<String, Object>> dayRows(UUID run) {
+        return jdbc.queryForList("""
+                SELECT day, currency, matched_count, matched_amount::text AS matched_amount, mismatch_count,
+                       mismatch_net_difference::text AS mismatch_net_difference,
+                       unmatched_left_count, unmatched_left_amount::text AS unmatched_left_amount,
+                       unmatched_right_count, unmatched_right_amount::text AS unmatched_right_amount,
+                       duplicate_count, currency_mismatch_count
+                  FROM reconciliation_run_day WHERE run_id = ? ORDER BY day""", run);
+    }
+
     void expireLeases(UUID org) {
         jdbc.update("UPDATE job SET lease_until = now() - interval '1 second' WHERE organization_id = ?", org);
     }

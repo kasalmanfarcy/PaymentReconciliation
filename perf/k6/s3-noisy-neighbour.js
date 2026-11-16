@@ -6,6 +6,7 @@
 import http from 'k6/http';
 import { check, sleep } from 'k6';
 import { Trend } from 'k6/metrics';
+import exec from 'k6/execution';
 import { BASE, auth, login } from './common.js';
 
 const BIG = JSON.parse(__ENV.BIG);
@@ -37,12 +38,12 @@ function post(token, org, file) {
 }
 
 export function big(data) {
-  const res = post(data.token, BIG.org, BIG.files[__ITER % BIG.files.length]);
+  const res = post(data.token, BIG.org, BIG.files[exec.scenario.iterationInTest]);
   check(res, { 'big upload 202': (x) => x.status === 202 });
 }
 
 export function small(data) {
-  const s = SMALL[__VU - 1];
+  const s = SMALL[exec.scenario.iterationInTest]; // one iteration per upload; __VU counts every scenario's VUs
   const start = Date.now();
   const res = post(data.token, s.org, s.file);
   if (!check(res, { 'small upload 202': (x) => x.status === 202 })) return;

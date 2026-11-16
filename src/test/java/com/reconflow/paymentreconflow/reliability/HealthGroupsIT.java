@@ -12,7 +12,7 @@ import org.springframework.boot.health.actuate.endpoint.HealthEndpointGroups;
 /**
  * M9.11: liveness checks only the application itself; readiness also checks the database and object
  * storage. (Stopping the database made readiness DOWN and left liveness UP on the benchmark stack:
- * docs/benchmarks.md §6. Doing it here would take the shared test database away from every other
+ * docs/benchmarks.md §5. Doing it here would take the shared test database away from every other
  * test.)
  */
 class HealthGroupsIT extends AbstractIntegrationTest {

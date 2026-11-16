@@ -1,6 +1,6 @@
 # Phase M9 — Reliability and Performance
 
-**Status:** Not started · **Tasks:** TASKS.md M9.1–M9.15, plus the "New" items from docs/scalability.md §9 (partition maintenance, archival, restore drill) · **Depends on:** M5 (job table and worker), M6 (chunked engine), M7 (optimistic locking), M8 (report queries) · **Date:** 2026-11-01
+**Status:** Done (2026-11-16; as built: §9) · **Tasks:** TASKS.md M9.1–M9.15, plus the "New" items from docs/scalability.md §9 (partition maintenance, archival, restore drill) · **Depends on:** M5 (job table and worker), M6 (chunked engine), M7 (optimistic locking), M8 (report queries) · **Date:** 2026-11-01
 
 Up to M8, ReconFlow works when nothing goes wrong. This phase proves it still works when things do go wrong (crashes, deadlocks, killed workers, slow clients) and measures how fast it is, instead of guessing. It ends with the evidence you'll quote in interviews: benchmark numbers, failure-injection tests that pass, and dashboards that show the system running.
 
@@ -1169,3 +1169,42 @@ By restoring them. I run a restore drill into a fresh database, start the app ag
 - Adding Kafka without a measured reason, or without an outbox and idempotent consumers.
 - Ignoring the partition window until rows pile up in the default partition.
 - Assuming backups work without ever restoring one.
+
+---
+
+## 9. As built: where the code differs from this plan, and why
+
+docs/ win over this plan wherever they disagree (scalability.md §4.3/§6/§7, ADR 0004, api-design.md §3.1/§4, requirements.md §7.5, database-design.md §5). Choices made while building M9:
+
+| Plan said | Built | Why |
+|---|---|---|
+| Sweeper SQL with an attempt-limit branch; startup sweep; consistency check | Already in M5 (requeue + exhausted → handler fails the batch/run with `retries-exhausted`, audited). Added: startup sweep on `ApplicationReadyEvent` (expired leases only), the heartbeat flag `JobContext.ensureLeaseHeld()`, and `OrphanedImportCheck`/`OrphanedRunCheck` (every 5 min; `orphaned`; `reconflow.jobs.orphaned`) | Reason codes from requirements.md §7.5 (`retries-exhausted`; `orphaned` added there and to api-design §8.10). Cross-tenant checks bind each organization in turn through a new `shared.context.TenantDirectory` (implemented by `organization`): FORCE RLS hides every row otherwise, and no BYPASSRLS role or SECURITY DEFINER function was added |
+| Fairness: decide soft or hard cap | Soft, kept; test asserts overshoot ≤ cap + claimers − 1 and that a small tenant isn't starved | ADR 0004 already decided soft; a hard cap costs an advisory lock and a second statement per claim |
+| Backoff: attempt 1 → ~20 s, attempt 5 → ~320 s, cap 1 h | Exactly that (`base × 2^attempts`); M5 had built `2^(attempts−1)` and a 10 min cap | scalability.md §4.3 / ADR 0004 say `2^attempts × 10 s` |
+| Retention of DONE jobs after 30 days, FAILED longer | DONE 30 d, FAILED 180 d, bounded batches, daily on workers | — |
+| `@Retryable` (Framework 7) around a `@Transactional` method | Programmatic `RetryTemplate` (Framework 7 `core.retry`) in `shared.jobs.TransientRetry`, wrapping each `TransactionTemplate` call; refuses to run inside a transaction | The chunk boundaries are `TransactionTemplate` calls inside one method, which a proxy-based annotation can't reach (self-invocation); the order "retry outside the transaction" is visible in code |
+| Classifier: Spring hierarchy first, SQLState fallback | SQLState first, then the hierarchy; also `57P01–57P03`, Hikari's closed-connection message, and `StorageUnavailableException`; never `OptimisticLockingFailureException`, `DataIntegrityViolationException`, `LeaseLostException` | Spring maps `08xxx`/`57xxx` to a *non*-transient type; killing a real backend showed the rollback failing on Hikari's closed proxy with no SQLState, masking `57P01` |
+| Ambiguous commit is safe "because the chunk is idempotent" | Made explicit: the import checkpoint update is a compare-and-set on the previous row; the run's day lock returns "already committed" when the checkpoint is on that day | Without it a retried chunk whose first commit landed would have counted its rows twice in `valid_rows` |
+| `FaultInjector` in `shared` with `ScriptedFaultInjector` | As planned (`shared.fault`, points listed in `FaultPoints`), plus `storage.put`/`storage.download`; the M5–M7 hooks (`ImportProcessingHook`, `RunChunkHook`, `ExceptionWriteHook`) kept | Their tests still use them; one mechanism per new point |
+| `FailureInjectionIT` parameterized over points × hits | A `@TestFactory` that first runs a clean scenario to count each point's hits, then crashes on hit 1, 2 and last (15 cases); separate transient-path and storage-outage tests | "last" must be measured, and a `@MethodSource` can't use Spring beans |
+| — | Storage outage at upload: `503 storage-unavailable` with `Retry-After: 30` (new catalogue row) | Carried over from M5; the catalogue needed the row first |
+| Generator `--malformed-rate` inside the categories | Malformed rows are extra rows with their own references | Keeps the categories disjoint, so `expected.json` stays exact |
+| k6 in the official image | k6 v2.4 installed on the host (Homebrew) | Under Colima the image's scenario clock advanced 8 minutes in 52 wall-clock minutes; results discarded (benchmarks §3) |
+| S1 for 30 minutes; S4 at 3 M × 3 M | S1 for 10 minutes at full load; S4 scaled to 500k × 500k with 40% exceptions | Access tokens live 15 minutes and the scenario logs in once; the laptop VM can't hold S4's 6 M extra rows comfortably. Scale factors in benchmarks §3 |
+| S5 kill on the 50k dataset | On the 500k dataset, both `SIGKILL` and `SIGTERM` (`scripts/chaos_kill.sh`) | 50k imports in 1.5 s, too fast to interrupt reliably |
+| Tuning: batch sizes first | Two plan problems found and fixed instead (stale statistics after bulk loads: `ANALYZE` after imports ≥ 1,000 rows; classify rewritten with an aggregating `LATERAL` per group), plus the lease fence moved to the end of the day transaction | Measured: the run went from a 53 s median to 6.5 s; imports were already 20× over target |
+| N+1 detection with datasource-proxy | `pg_stat_statements` in the test container (`support.QueryCounter`) | No new dependency (it wasn't in the offline cache); counts Hibernate and `JdbcClient` statements alike. No N+1 found |
+| Page-size test: at most 100 items | At most 200, and fixed-order lists now refuse any `sort` with `400` | api-design.md §4 says 200, clamped; it also makes every unknown sort field a 400 |
+| Gauges from a "read-only system path" | Open-cases gauge iterates organizations with each bound (`TenantDirectory`); queued-jobs gauge reads the RLS-free `job` table; both refreshed on a schedule on workers | Same reason as the consistency check |
+| Prometheus on a management port; "check how Boot 4 secures it" | Management port 8081 in `local` and `prod` only; the security chain permits `/actuator/prometheus` when the request's local port is the management server's (learnt from its `WebServerInitializedEvent`), and denies it otherwise; `ManagementPortIT` starts a real server on two random ports | Tests keep MockMvc and one shared context (no management port in the `test` profile) |
+| Readiness: db, "consider storage" | `readinessState`, `db`, `storage` (new `HEAD bucket` indicator, 2 s timeout) | An API node without storage can't accept uploads |
+| Graceful shutdown test: close the context | `GracefulShutdownIT` drives the real `JobWorker` (poller, pool thread, `SmartLifecycle.stop()`); plus a real `SIGTERM` to the packaged app | Closing the shared test context would take the test database with it |
+| Kafka ADR `NNNN-kafka.md` | [ADR 0014](../docs/adr/0014-no-kafka-in-v1.md): no Kafka; M9.13–M9.15 skipped | Every §8 trigger far from met (claim rank 21, 0.29 jobs/s, 1.3 s wait) |
+| Archival "design now, build when data ages" | Built (TASKS.md M9.16 asks for the job): `reconciliation.archive.PartitionArchival`, ledger's `RecordArchive`, exceptions' `CaseLinkArchive`, `shared.storage.CsvArchive`, V9 `archive_manifest`; gzipped CSV, not Parquet; tested on real partitions | The task list (docs over plan) asks for the job; Parquet needs a writer dependency (parquet-java + Hadoop) not worth it yet. Orchestrated in `reconciliation`, the one module allowed to see records, matches and case links (architecture.md §4) |
+| Restore drill | Performed once with `scripts/restore_drill.sh`: 102 s against the 1 h RTO, checks identical | Logged in docs/runbooks/restore-drill.md, with the expected M10.7 roles finding |
+| Partition maintenance (M9.N1) | Verified, not rebuilt (M5.27): scheduled on workers with an advisory lock, gauge `reconflow.partitions.default.rows`; this phase added its alert and the repair runbook | Ordering exception 3 in plans/README.md |
+
+Tests added: `ImportRecoveryIT`, `RunRecoveryIT`, `JobQueueHardeningIT`, `TransientFailuresTest`, `TransientRetryIT` (a real deadlock), `ImportTransientRetryIT` (a real killed backend, an ambiguous commit), `RunTransientRetryIT`, `FailureInjectionIT`, `ImportStatisticsIT`, `NPlusOneIT`, `PaginationLimitsIT`, `MetricsIT`, `ManagementPortIT`, `HealthGroupsIT`, `GracefulShutdownIT`, `PartitionArchivalIT`; plus new cases in `JobQueueIT` and `BackoffTest`.
+
+Not built, deliberately: Kafka (M9.13–M9.15, ADR 0014); Parquet archives; a Grafana screenshot (no browser in this environment; the dashboard was verified through Grafana's API); S4 at 3 M × 3 M and S1 for 30 minutes (scaled, benchmarks §3); cold-cache report timings (the build checks their plans; S1 measured them under load). Known costs noted for later: `ANALYZE` after every import ≥ 1,000 rows was the top statement during the burst (0.6 s each, off the critical path); the exception recorder's per-case statements dominate exception-heavy runs (benchmarks §2.5).
+

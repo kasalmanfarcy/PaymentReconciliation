@@ -11,6 +11,8 @@ import { BASE, auth, login, pick } from './common.js';
 const ORG = __ENV.ORG;
 const RUN = __ENV.RUN;
 const PACE = Number(__ENV.PACE || 30);
+const FROM = __ENV.FROM || '2026-05-01'; // the transaction search's required date range
+const TO = __ENV.TO || '2026-10-31';
 
 export const options = {
   scenarios: {
@@ -41,7 +43,7 @@ export default function (data) {
   } else if (r < 0.85) {
     res = http.get(`${BASE}/api/v1/exceptions/${pick(data.exceptionIds)}`, p);
   } else if (r < 0.95) {
-    res = http.get(`${BASE}/api/v1/transactions?reference=${encodeURIComponent(pick(data.references))}`, p);
+    res = http.get(`${BASE}/api/v1/transactions?transactionDateFrom=${FROM}&transactionDateTo=${TO}&reference=${encodeURIComponent(pick(data.references))}`, p);
   } else {
     res = http.get(`${BASE}/api/v1/reports/reconciliation?runId=${RUN}`, p);
   }

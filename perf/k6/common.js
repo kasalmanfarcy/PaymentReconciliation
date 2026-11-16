@@ -1,7 +1,8 @@
 // Shared helpers for the k6 scenarios (docs/scalability.md §7, phase-M9 §M9.6).
-// Run against a LOCAL ReconFlow only, e.g.:
-//   docker run --rm -i -v "$PWD:/w" -w /w -e BASE=http://host.lima.internal:8080 -e ORG=<uuid> \
-//     grafana/k6:1.3.0 run perf/k6/s1-steady-browsing.js
+// Run against a LOCAL ReconFlow only, with k6 installed on the host, e.g.:
+//   k6 run -e ORG=<uuid> -e RUN=<uuid> perf/k6/s1-steady-browsing.js
+// Not the grafana/k6 image under Colima: its scenario clock advanced 8 minutes in 52 wall-clock
+// minutes while VUs slept (docs/benchmarks.md §3), so durations and latencies were meaningless.
 import http from 'k6/http';
 
 export const BASE = __ENV.BASE || 'http://localhost:8080';

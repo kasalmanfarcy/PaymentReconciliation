@@ -266,6 +266,8 @@ This keeps the hot database at roughly **450 GB in steady state** instead of gro
 
 ---
 
+**Measured (M9.6, one laptop, docs/benchmarks.md):** read p95 21 ms with 100 users (S1); imports of the morning burst done in ≤ 5.1 s with one worker (S2); a 500k-row import in 14 s (35,000 rows/s, 20× §2.3's target); 50k × 50k reconciled in 6.5 s; small tenants waited ≤ 3.1 s behind a 30-file tenant (S3); restore drill 102 s for a 464 MB backup.
+
 ## 7. Load test plan
 
 Use **k6** (API) and a dataset generator script (`scripts/generate-dataset`).

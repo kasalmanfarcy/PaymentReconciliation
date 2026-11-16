@@ -2,7 +2,7 @@
 
 A payment reconciliation and exception resolution platform. ReconFlow compares a business's internal payment ledger against payment gateway settlements, surfaces the discrepancies, and tracks how each one was investigated and resolved.
 
-> **Project status: reporting done (M8).** On top of M2–M6 (profiles, error model, in-house JWT authentication, tenant resolution with PostgreSQL row-level security, a permission matrix, an append-only audit log, CSV ingestion through a PostgreSQL job queue, and a set-based matching engine that creates exception cases deduplicated by a deterministic discrepancy key): an exception workflow where investigators list, filter and open cases with both source records side by side, assign them, add append-only notes, and resolve them with a resolution code, and org admins reopen them with a reason. Every status change goes through one state machine that writes status history and an audit event in the same transaction; every update is guarded by optimistic locking (`ETag`/`If-Match`, `428` when missing, `409` when stale, proven by a two-writer race test); and admins can read any entity's audit timeline. Reporting (M8): one call answers "which match, which don't, why, who resolved them" for a run or a date range (overlapping runs never double count a day), plus import quality, exception ageing and a CSV export of a run's exceptions that streams small runs and hands large ones to a background job, escaped against spreadsheet formula injection; every report query's plan is checked at volume in the build. See [Roadmap](#roadmap).
+> **Project status: reliability and performance done (M9).** M9 proved the system survives what goes wrong and measured how fast it is: crash-at-any-point tests whose final state equals a clean run, in-process retries of transient database failures, a real `SIGKILL`/`SIGTERM` of the worker mid-import, separate liveness and readiness probes, Prometheus metrics on an internal port with a Grafana dashboard and alerts, archival of months older than 13, a timed restore drill, and benchmarks (50k × 50k reconciled in 6.5 s; read p95 21 ms under 100 users; a 500k import in 14 s under `-Xmx256m`) recorded in [docs/benchmarks.md](docs/benchmarks.md). Kafka was measured unnecessary ([ADR 0014](docs/adr/0014-no-kafka-in-v1.md)). Earlier: reporting (M8). On top of M2–M6 (profiles, error model, in-house JWT authentication, tenant resolution with PostgreSQL row-level security, a permission matrix, an append-only audit log, CSV ingestion through a PostgreSQL job queue, and a set-based matching engine that creates exception cases deduplicated by a deterministic discrepancy key): an exception workflow where investigators list, filter and open cases with both source records side by side, assign them, add append-only notes, and resolve them with a resolution code, and org admins reopen them with a reason. Every status change goes through one state machine that writes status history and an audit event in the same transaction; every update is guarded by optimistic locking (`ETag`/`If-Match`, `428` when missing, `409` when stale, proven by a two-writer race test); and admins can read any entity's audit timeline. Reporting (M8): one call answers "which match, which don't, why, who resolved them" for a run or a date range (overlapping runs never double count a day), plus import quality, exception ageing and a CSV export of a run's exceptions that streams small runs and hands large ones to a background job, escaped against spreadsheet formula injection; every report query's plan is checked at volume in the build. See [Roadmap](#roadmap).
 
 ---
 
@@ -193,7 +193,7 @@ S3 API on `localhost:9000` and its console on `http://localhost:9001` (log in wi
 SPRING_PROFILES_ACTIVE=local,api,worker ./mvnw spring-boot:run
 ```
 
-Flyway applies `V1`–`V6` on first startup (`V5` is M6's engine support: summary columns, `exception_case_run`, `uuid_generate_v7()`, the reference index and the one-active-run-per-scope index; `V6` makes exception notes and status history append-only with triggers). Hibernate runs in `validate` mode, so a mismatch between
+Flyway applies `V1`–`V9` on first startup (`V7`/`V8` are M8's report support, `V9` M9.16's archive manifest) (`V5` is M6's engine support: summary columns, `exception_case_run`, `uuid_generate_v7()`, the reference index and the one-active-run-per-scope index; `V6` makes exception notes and status history append-only with triggers). Hibernate runs in `validate` mode, so a mismatch between
 the entities and the schema fails the boot rather than silently altering it.
 
 | Profile | Kind | Effect |
@@ -202,12 +202,16 @@ the entities and the schema fails the boot rather than silently altering it.
 | `prod` | Environment | Secrets from environment variables only, JSON (ECS) logs |
 | `test` | Environment | Used by the tests (Testcontainers); lives in `src/test/resources` |
 | `api` | Role | Serves HTTP traffic |
-| `worker` | Role | Turns on the job worker (`reconflow.jobs.worker.enabled`) and scheduled jobs (lease sweeper, partition maintenance at startup and 02:15 UTC, orphan-file sweeper) |
+| `worker` | Role | Turns on the job worker (`reconflow.jobs.worker.enabled`) and scheduled jobs (lease sweeper with a startup sweep, orphaned-work check, job retention, metric gauges, partition maintenance at startup and 02:15 UTC, monthly archival, orphan-file sweeper) |
 
 There is deliberately no default profile. Locally one process runs both roles.
 
+Actuator lives on the management port 8081 in `local` and `prod` (M9.10): probes at
+`/actuator/health/liveness` and `/readiness`, metrics at `/actuator/prometheus`, which the public
+port refuses.
+
 ```bash
-curl -s localhost:8080/actuator/health        # {"status":"UP",...}
+curl -s localhost:8081/actuator/health        # {"status":"UP",...}
 curl -si localhost:8080/api/v1/members        # 401, application/problem+json, X-Request-Id
 ```
 
@@ -315,6 +319,19 @@ switch roles explicitly.
 `./mvnw spring-boot:test-run` runs the application against a Testcontainers PostgreSQL instead of
 Compose.
 
+### Observe and benchmark (local)
+
+```bash
+docker compose --profile observability up -d    # Prometheus :9090, Grafana :3000 (GRAFANA_ADMIN_PASSWORD; on Colima HOST_GATEWAY=192.168.5.2)
+python3 scripts/generate_dataset.py --preset 50k --out target/datasets/50k
+scripts/bench_import.sh target/datasets/50k 3   # import + reconcile, checked against expected.json
+k6 run -e ORG=<org> -e RUN=<run> perf/k6/s1-steady-browsing.js
+```
+
+Load scenarios, chaos (`scripts/chaos_kill.sh`), background data (`scripts/preload.sh`) and the
+restore drill (`scripts/restore_drill.sh`) are described in [docs/benchmarks.md](docs/benchmarks.md)
+and [docs/runbooks](docs/runbooks). All of them talk only to local containers.
+
 ### Test
 
 ```bash
@@ -347,7 +364,7 @@ request.
 | M6 | Reconciliation engine: matching, idempotent runs | Done |
 | M7 | Exception management: workflow, optimistic locking | Done |
 | M8 | Reporting and export | Done |
-| M9 | Reliability and performance | Not started |
+| M9 | Reliability and performance | Done |
 | M10 | Security hardening | Not started |
 | M11 | Deployment and portfolio | Not started |
 

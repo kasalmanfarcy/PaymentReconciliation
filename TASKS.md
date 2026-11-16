@@ -254,31 +254,31 @@ Built early so later milestones emit events as they go, instead of retrofitting 
 ## M9 — Reliability and performance
 
 ### Reliability
-- [ ] **M9.1** Recover jobs left stuck in `PROCESSING` or `RUNNING` after a restart, using a heartbeat or lease plus a startup sweep.
-- [ ] **M9.2** ~~Move import and reconciliation processing off the request thread.~~ Moved to **M5.0**: ADR 0003 made processing asynchronous from v1. This task now hardens the queue built there (fencing, graceful shutdown, queue metrics).
-- [ ] **M9.3** Add retry with backoff for transient DB failures, and keep it away from validation failures.
-- [ ] **M9.4** Failure-injection tests: kill processing at several points, then reprocess and assert the final state is identical to a clean run.
+- [x] **M9.1** Recover jobs left stuck in `PROCESSING` or `RUNNING` after a restart, using a heartbeat or lease plus a startup sweep.
+- [x] **M9.2** ~~Move import and reconciliation processing off the request thread.~~ Moved to **M5.0**: ADR 0003 made processing asynchronous from v1. This task now hardens the queue built there (fencing, graceful shutdown, queue metrics).
+- [x] **M9.3** Add retry with backoff for transient DB failures, and keep it away from validation failures.
+- [x] **M9.4** Failure-injection tests: kill processing at several points, then reprocess and assert the final state is identical to a clean run.
 
 ### Performance
-- [ ] **M9.5** Generate a 50k-row synthetic dataset (and 500k for stress testing, plus the 6-month preload for load tests) with a script under `scripts/`.
-- [ ] **M9.6** Benchmark import throughput and reconciliation time, and run load scenarios S1–S6 from docs/scalability.md §7 with k6. Record the results in `docs/benchmarks.md`.
-- [ ] **M9.7** Tune batch sizes, indexes and fetch strategies, and add checks for N+1 queries.
-- [ ] **M9.8** Make sure every list endpoint paginates and has a maximum page size.
+- [x] **M9.5** Generate a 50k-row synthetic dataset (and 500k for stress testing, plus the 6-month preload for load tests) with a script under `scripts/`.
+- [x] **M9.6** Benchmark import throughput and reconciliation time, and run load scenarios S1–S6 from docs/scalability.md §7 with k6. Record the results in `docs/benchmarks.md`.
+- [x] **M9.7** Tune batch sizes, indexes and fetch strategies, and add checks for N+1 queries.
+- [x] **M9.8** Make sure every list endpoint paginates and has a maximum page size.
 
 ### Observability
-- [ ] **M9.9** Micrometer metrics: rows imported, rows rejected, run duration, matches and exceptions per run, open exception count.
-- [ ] **M9.10** Expose a Prometheus endpoint, plus an optional Grafana dashboard in `compose.yaml`.
-- [ ] **M9.11** Liveness and readiness health groups.
+- [x] **M9.9** Micrometer metrics: rows imported, rows rejected, run duration, matches and exceptions per run, open exception count.
+- [x] **M9.10** Expose a Prometheus endpoint, plus an optional Grafana dashboard in `compose.yaml`.
+- [x] **M9.11** Liveness and readiness health groups.
 
 ### Kafka (only if M9.6 shows a need)
-- [ ] **M9.12** Write an ADR stating the measured problem Kafka solves. If no measurement justifies it, record that decision and skip M9.13–M9.15.
-- [ ] **M9.13** Use the transactional outbox pattern to publish `ImportCompleted` and `ReconciliationRequested` events.
-- [ ] **M9.14** Make consumers idempotent, with a dead-letter topic.
-- [ ] **M9.15** Testcontainers Kafka integration tests.
+- [x] **M9.12** Write an ADR stating the measured problem Kafka solves. If no measurement justifies it, record that decision and skip M9.13–M9.15. *Done: [ADR 0014](docs/adr/0014-no-kafka-in-v1.md), no Kafka in v1.*
+- [x] **M9.13** Use the transactional outbox pattern to publish `ImportCompleted` and `ReconciliationRequested` events. *Skipped: ADR 0014 measured no need (M9.12).*
+- [x] **M9.14** Make consumers idempotent, with a dead-letter topic. *Skipped: ADR 0014 measured no need (M9.12).*
+- [x] **M9.15** Testcontainers Kafka integration tests. *Skipped: ADR 0014 measured no need (M9.12).*
 
 ### Data lifecycle
-- [ ] **M9.16** Archival job: after 13 months, export a `transaction_record` partition (and the matches and exception links that reference it) to Parquet in object storage, verify counts and checksums, then detach and drop the partition (docs/scalability.md §5.3).
-- [ ] **M9.17** Quarterly restore drill: restore a backup to a fresh instance, check row counts and a sample run's totals, and record the time taken against the RTO (≤ 1 h).
+- [x] **M9.16** Archival job: after 13 months, export a `transaction_record` partition (and the matches and exception links that reference it) to Parquet in object storage, verify counts and checksums, then detach and drop the partition (docs/scalability.md §5.3). *As built: gzipped CSV first; Parquet once a writer dependency is justified (phase-M9 §9).*
+- [x] **M9.17** Quarterly restore drill: restore a backup to a fresh instance, check row counts and a sample run's totals, and record the time taken against the RTO (≤ 1 h).
 
 **Exit criteria:** the 50k-row benchmark is documented, crash and reprocess tests pass, and metrics are visible.
 

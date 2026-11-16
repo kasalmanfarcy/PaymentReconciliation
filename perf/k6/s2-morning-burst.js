@@ -7,6 +7,7 @@
 import http from 'k6/http';
 import { check, sleep } from 'k6';
 import { Trend, Counter } from 'k6/metrics';
+import exec from 'k6/execution';
 import { BASE, auth, login } from './common.js';
 import browse from './s1-steady-browsing.js';
 
@@ -42,7 +43,7 @@ export function browsing(data) {
 }
 
 export function upload(data) {
-  const u = UPLOADS[__VU - 1];
+  const u = UPLOADS[exec.scenario.iterationInTest]; // one iteration per upload; __VU counts every scenario's VUs
   sleep(Math.random() * 90); // all uploads arrive within two minutes
   const start = Date.now();
   const p = auth(data.token, u.org);

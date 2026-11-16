@@ -24,7 +24,7 @@ import org.springframework.mock.web.MockMultipartFile;
  * attempt, so another worker resumes it at once instead of after the 2-minute lease. Driven through
  * the real {@link JobWorker}: its poller claims, its pool thread runs the import, and its
  * {@code SmartLifecycle.stop()} is what the context calls on SIGTERM. (M5 tested only the runner;
- * a real SIGTERM to the packaged app is in docs/benchmarks.md §5.)
+ * a real SIGTERM to the packaged app is in docs/benchmarks.md §4.)
  */
 class GracefulShutdownIT extends AbstractIntegrationTest {
 

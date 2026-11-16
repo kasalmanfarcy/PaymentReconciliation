@@ -21,7 +21,7 @@
 -- estimates. The earlier plain join did: for an organization whose rows
 -- autovacuum hadn't analyzed yet, the planner estimated one row and
 -- chose an unparameterized inner scan of the whole month, read once per
--- group (17,066 rows x 293 groups for one day; docs/benchmarks.md §2.2).
+-- group (17,066 rows x 293 groups for one day; docs/benchmarks.md §2.4).
 -- The accepted batches (rule P3) are computed once, not joined per row.
 INSERT INTO recon_group (normalized_reference, transaction_type, currencies, ledger_n, gateway_n,
                          ledger_ids, ledger_dates, gateway_ids, gateway_dates,

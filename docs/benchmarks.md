@@ -18,6 +18,8 @@ Measured numbers only. Each section says what was loaded, how it was measured an
 | Isolation | A separate compose project (`docker compose -p reconflow-bench`, its own volumes and an env file outside the repo), so a developer's local data is never touched |
 | Dataset | `python3 scripts/generate_dataset.py --preset 50k --out target/datasets/50k` (seed 42: 49,752 ledger and 49,877 gateway rows over October 2026, 1% amount mismatches, 0.5% missing on each side, 0.2% duplicates, 0.1% malformed rows); `--preset 500k` for stress |
 
+**Note on the first S2/S3 attempts.** The k6 scripts first picked each uploader's file by `__VU`, which counts every scenario's users (and `exec.vu.idInScenario` is undefined in k6 v2): S2 uploaded nothing and S3 uploaded duplicates (409). Fixed to `exec.scenario.iterationInTest`; only the reruns are reported.
+
 **Method.** `scripts/bench_import.sh <dataset> <reps>` creates a fresh organization per repetition (a file can be imported once per organization), uploads the ledger and waits for it, uploads the gateway file and waits, requests a run for the dataset's period and waits, then checks every count and total against `expected.json` (all repetitions below matched exactly). One discarded warm-up repetition (JIT), then three measured; the table gives the median with min and max. "DB time" is the server's own `started_at → completed_at`; "wall" adds the HTTP calls, queue wait and 0.2 s polling. k6 runs in Docker (`grafana/k6:1.3.0`) inside the same VM as the database, so it competes with it for CPU: the latencies are pessimistic.
 
 ## 1. Report queries (M8.5)
@@ -32,7 +34,7 @@ Measured numbers only. Each section says what was loaded, how it was measured an
 - Each statement is the **production string** (`STATEMENTS` on each `*Queries` class, `ExceptionAgeingQueries.sql(...)`, `ExceptionCsvExporter.EXPORT`), bound with real parameters through JDBC, run twice with `EXPLAIN (ANALYZE, BUFFERS)`; the second (warm) run is recorded. PostgreSQL 16 in Testcontainers on a laptop (Colima), so absolute times are indicative; the plan shapes are the point.
 - Assertion: no `Seq Scan` on `exception_case`, `exception_case_run`, `exception_case_record`, `import_row_error` or `transaction_record` (an empty partition shown as `(never executed)` is runtime pruning, not a scan). Small tables (`reconciliation_run`, `reconciliation_run_day`, `import_batch`, `app_user`) may be scanned.
 
-Cold-cache timings and plans at the M9.5 volume: §2.4.
+At the M9.5 volume (3.7 M records) the engine's classify statement was measured right after a PostgreSQL restart and warm (§2.4); the report statements were not re-measured cold: their plans are checked on every build by `ReportQueryPlanIT`, and S1 exercises the reconciliation report on the large database at a p95 of 21 ms (§3).
 
 ### 1.2 Results
 
@@ -136,3 +138,80 @@ Not changed, deliberately: JDBC batch sizes (imports already run at 20× the tar
 | `GET /reports/reconciliation`, `/import-quality`, `/exception-ageing` | 9, 8, 8 |
 
 Each count includes the transaction's `set_config('app.org_id', …)` for row-level security. No N+1 was found: the read paths were written as projections and joins from M5 on (`spring.jpa.open-in-view=false` since M2.7 keeps it that way). `GET /platform/organizations` (cross-tenant, platform admin) and the streamed CSV export aren't in the check.
+
+### 2.4 Background data, and the second plan fix
+
+**Preload.** `scripts/preload.sh` on `generate_dataset.py --preset preload` (10 organizations with long-tailed sizes, 60,000 down to 6,000 references a month, May–October 2026), through the real API: every month imported and reconciled, every count checked against `expected.json`. With the earlier benchmark and chaos organizations the database then held **3.72 million** `transaction_record` rows, 29,700 cases and 2.9 GB. That is about a week of the 1,000-user target's volume (scalability.md §2.2: 1.5 M rows a day): enough for planner behaviour, far from the 270 M rows of a six-month production database (that needs production-sized hardware; not run).
+
+**What it found.** The first organizations' monthly runs took 1–7 s. Then organizations 6 and 7 (10,000 and 8,571 references a month, under the first fix's 10,000-row `ANALYZE` threshold) took **48–124 s** per monthly run (median 55 s and 67 s). `EXPLAIN (ANALYZE)` of one day: the planner, never having seen the organization's id in its statistics, estimated one row and scanned the organization's whole month once per group (17,066 rows × 293 groups). The fix (M9.7, second commit): the classify query aggregates each group's records in a `LATERAL` subquery, which PostgreSQL can't flatten into a plain join, so each group is one index range whatever the estimates; the accepted batches (rule P3) are computed once; and the `ANALYZE` threshold drops to 1,000 rows (below that a bad plan costs groups × rows of a tiny organization: noise).
+
+| Monthly run (30–31 days) of… | Before | After |
+|---|---|---|
+| organization 6 (10,000 refs) / 7 (8,571 refs), statistics stale | median 55 s / 67 s (max 124 s) | — |
+| organizations 7–10 (8,571 → 6,000 refs), same data shape | — | median 0.9–1.2 s (max 1.4 s) |
+| organization 1 (60,000 refs, analyzed) | 6.6 s median | unchanged |
+
+
+**The classify statement at volume** (M6's deferred `EXPLAIN (ANALYZE, BUFFERS)`, on the final query): organization 1 (60,000 refs a month), 15 October, its October partition holding 4.27 M rows of all tenants: 1,950 groups, each one `Index Scan` on `transaction_record_reference_idx` inside the per-group aggregate (1,950 loops, 4 µs each); the day's keys from a bitmap scan of `transaction_record_match_idx` (3,892 rows); `import_batch` read once. **26.4 ms right after a PostgreSQL restart** (shared buffers empty; the VM's file cache stays warm, so this is not a disk-cold number), **16.7 ms warm**; 14,684 buffers.
+
+### 2.5 Stress and memory: 500k × 500k with 206,000 cases, `-Xmx256m` (S4 scaled, M5/M8 carry-overs)
+
+`generate_dataset.py --rows 500000 --seed 77 --mismatch-rate 0.4` (a deliberately bad month: 40% of payments mismatched), app restarted with `-Xmx256m -Xlog:gc`, on the 3.7 M-record database:
+
+| Step | Result |
+|---|---|
+| Import 497,763 ledger rows | 14.3 s (34,736 rows/s), counts as expected |
+| Import 498,855 gateway rows | 14.0 s, counts as expected |
+| Reconcile 500k × 500k, 30 days: 294,000 matches, 200,066 mismatches, 4,909 missing, 1,027 duplicates | **303.6 s** (3,283 records/s); summary identical to `expected.json` |
+| Export the run's 206,002 cases (`GET /reports/exceptions/export`, over the 50,000 sync limit, so an `EXPORT` job) | `DONE` 3 s after the request; the downloaded CSV has 206,002 rows + header (46 MB) |
+| Heap, whole sequence (479 GC pauses, G1) | **max 102 MB after GC** of 256 MB (40%), max 150 MB before GC; no full GC, no `OutOfMemoryError` |
+
+So the 100k-row import and the 200k-row export (deferred from M5 and M8) run in constant memory under `-Xmx256m`, and S4's "worker heap stays under 70%" holds at this scale. The run's time is dominated by the per-case statements of the exception recorder (200,000 new cases, each an insert, a history row, an audit row and links) rather than by matching: at 2% exceptions (the scalability assumption) the 50k run spends 6.5 s for 99,600 records, here 40% exceptions cost 5 minutes for 996,600. S4 itself (3 M × 3 M) was not run: it would need ~6 M more rows than this laptop's VM holds comfortably; scaled linearly from this run it would take ~30 minutes at a 40% exception rate and well under the 15-minute target at 2%, which is an extrapolation, not a measurement. If month-end runs of exception-heavy tenants matter, batching the recorder's per-case statements is the next change (measured first).
+
+---
+
+## 3. Load scenarios S1–S6 (docs/scalability.md §7)
+
+Against the database of §2.4 (3.7 M records, 30,000 cases). k6 v2.4 **on the host** (Homebrew), next to the app: it competes with the app for CPU, so latencies are pessimistic. The first attempts used the `grafana/k6` image inside the Colima VM; there k6's own scenario clock advanced 8 minutes in 52 wall-clock minutes while its virtual users slept (the run never ended and its durations were meaningless), so those results were discarded. Scale factors are stated per scenario; none ran at production size.
+
+| Scenario | Scale run | Result | Pass criteria | Pass |
+|---|---|---|---|---|
+| S1 Steady browsing | **Full load** (100 users, 2 req/min each, the 60/25/10/5 mix) for **10 min** instead of 30 (access tokens live 15 min and the script logs in once); organization 1 of the preload (60,000 refs/month, 6 runs) | 2,001 requests, 0 errors; reads p50 14.6 ms, **p95 21.4 ms**, p99 22.3 ms, max 30 ms | read p95 < 300 ms, errors < 0.1% | ✓ |
+| S2 Morning burst | 5 × 100k-row and 20 × 10k-row uploads (distinct files, 25 organizations) within 85 s, while S1's 100 users browse for 8 min; one worker process, 4 threads | every import **done in 1.0–5.1 s** (median 2.0 s) from upload; longest wait to start 1.3 s; browsing p95 **21.0 ms**, 0 errors in 1,706 requests | imports done < 5 min; browsing p95 < 300 ms | ✓ |
+| S3 Noisy neighbour | 30 × 20k-row files from one organization (5 uploaders), then 10 organizations upload 1k rows each 20 s later | the 30 files drained in 15.2 s, each waiting up to 14.3 s behind the per-organization cap of 2; every small organization's import **started within 3.1 s** (median 2.1 s) | no small organization waits > 2 min | ✓ |
+| S4 Month-end | Scaled: 500k × 500k with 40% exceptions instead of 3 M × 3 M (§2.5) | 304 s; heap 40% after GC at `-Xmx256m` | < 15 min at full size; heap < 70% | heap ✓; full size not run |
+| S5 Chaos | `SIGKILL` (and separately `SIGTERM`) of the only worker during a 500k import (§4) | resumed from its checkpoint; final batch identical to a clean import | jobs resume; state matches a clean run | ✓ |
+| S6 Contention | Full (50 users resolving the same 10 open cases at once) | exactly **10 × 200** and **40 × 409**, 0 other statuses; 10 `RESOLVED` history rows for 10 cases (no lost update, no double resolve); p95 80 ms | one success per case, the rest 409 | ✓ |
+
+---
+
+## 4. Crash and shutdown of the real process (S5, M9.4, M9.11)
+
+`scripts/chaos_kill.sh` uploads the 500k ledger file (497,605 rows) into a fresh organization, waits 5 s so the worker is mid-import, signals the packaged app, restarts it and checks the batch against `expected.json`. (The plan asked for the 50k file; 50k imports in 1.5 s, too fast to hit reliably by hand, so the 500k file was used.)
+
+| Signal | State right after | Recovery | Result |
+|---|---|---|---|
+| `SIGTERM` (graceful) | job `QUEUED`, **attempts 0**, lease cleared; batch `PROCESSING`, checkpoint 155,000 (a chunk boundary). Log: `Released job … on shutdown`, then Tomcat's graceful shutdown | Next start: claimed at once, `Resuming batch … after row 155000`; done 11 s after the restart | 497,605 / 497,357 / 248 rows as expected, no source row twice: **PASS** |
+| `SIGKILL` (crash) | job still `RUNNING` with the dead process's lease; batch `PROCESSING`, checkpoint 175,000 | Startup sweep found nothing yet (the lease was still valid: correct, it must not reclaim by host name); the lease expired and the 30 s sweeper re-queued it 2 min after the kill; resumed after row 175,000 | job `DONE` on attempt 2; counts as expected, no source row twice: **PASS** |
+
+The difference is the point of graceful shutdown: about 2 minutes of stall per deploy avoided. Crash recovery doesn't depend on it.
+
+## 5. Probes (M9.11)
+
+Against the benchmark stack, `local` profile, management port 8081:
+
+| Situation | `/actuator/health/liveness` | `/actuator/health/readiness` |
+|---|---|---|
+| Everything up | 200 | 200 (`db` UP, `storage` UP) |
+| PostgreSQL container stopped | **200** | 503 (`db` DOWN: `CannotGetJdbcConnectionException`) |
+| MinIO stopped, PostgreSQL back | **200** | 503 (`storage` DOWN: connection refused) |
+| Both back | 200 | 200 |
+
+## 6. Kafka decision inputs (M9.12)
+
+From `pg_stat_statements` reset before each scenario. S1 (10 min): the claim ran 632 times (the idle 1 s poll) for 43 ms in total. S2 (8.5 min, the burst): the claim ran 550 times, 72 ms in total (0.13 ms each), **rank 21 of 67** statements by total time; the top three were `ANALYZE` after imports (25 calls, 15.6 s: 0.6 s each on a 4.3 M-row partition, after the batch is already `COMPLETED`), the import `INSERT` batches (9.4 s) and the exception list (8.5 s). Peak job rate 0.29 jobs/s (S2) and ~2.6 jobs/s for 15 s (S3). Decision and thresholds: [ADR 0014](adr/0014-no-kafka-in-v1.md).
+
+## 7. Observability (M9.10)
+
+With `docker compose --profile observability up -d` against the benchmark stack, during a 50k import: Prometheus' target `host.docker.internal:8081/actuator/prometheus` was `up`, all six alert rules loaded (`inactive`), `sum by (outcome) (reconflow_import_rows_total)` returned 99,579 valid and 50 rejected, the provisioned "ReconFlow" dashboard was listed by Grafana's API and its datasource answered the same query. `/actuator/prometheus` on the public port 8080 answered `401`. No screenshot: this environment had no browser.
+

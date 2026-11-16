@@ -7,6 +7,7 @@ import com.reconflow.paymentreconflow.audit.AuditService;
 import com.reconflow.paymentreconflow.ingestion.csv.CsvEncodingException;
 import com.reconflow.paymentreconflow.ingestion.csv.CsvHeaderException;
 import com.reconflow.paymentreconflow.ingestion.csv.CsvRows;
+import com.reconflow.paymentreconflow.ingestion.domain.DuplicateFileException;
 import com.reconflow.paymentreconflow.ingestion.domain.ImportBatch;
 import com.reconflow.paymentreconflow.ingestion.domain.ImportBatchRepository;
 import com.reconflow.paymentreconflow.ingestion.storage.FileStorage;
@@ -14,6 +15,7 @@ import com.reconflow.paymentreconflow.ingestion.storage.StorageKeys;
 import com.reconflow.paymentreconflow.ledger.SourceType;
 import com.reconflow.paymentreconflow.shared.context.CurrentUser;
 import com.reconflow.paymentreconflow.shared.context.TenantContext;
+import com.reconflow.paymentreconflow.shared.error.UniqueViolations;
 import com.reconflow.paymentreconflow.shared.id.Ids;
 import com.reconflow.paymentreconflow.shared.jobs.JobQueue;
 import java.io.IOException;
@@ -29,6 +31,7 @@ import java.util.Locale;
 import java.util.Set;
 import java.util.UUID;
 import org.jspecify.annotations.Nullable;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -94,6 +97,12 @@ public class ImportReceiver {
         checkRequest(file);
         String hash = sha256(file);
         inspectHeader(file, sourceType);
+        // Duplicate fast path (M5.9): a friendly 409 before uploading anything. Not the guarantee:
+        // two concurrent uploads can both pass it. The unique constraint below is.
+        batches.findByOrganizationIdAndSourceTypeAndContentHash(organizationId, sourceType, hash)
+                .ifPresent(existing -> {
+                    throw new DuplicateFileException(existing.getId());
+                });
 
         UUID batchId = Ids.newId();
         // Server-generated IDs only: the original file name is user input and never touches a key.
@@ -114,15 +123,31 @@ public class ImportReceiver {
                 key,
                 currentUser.id(),
                 clock.instant());
-        tx.executeWithoutResult(s -> {
-            batches.saveAndFlush(batch);
-            jobs.enqueue(organizationId, ImportJobs.TYPE, ImportJobs.payload(batchId));
-            audit.record(AuditEntry.of(AuditAction.IMPORT_RECEIVED, AuditEntityType.IMPORT_BATCH, batchId)
-                    .with("fileName", batch.getFileName())
-                    .with("sourceType", sourceType.name())
-                    .with("sizeBytes", batch.getFileSizeBytes())
-                    .with("contentHash", hash));
-        });
+        try {
+            tx.executeWithoutResult(s -> {
+                // saveAndFlush: the INSERT runs now, so a unique violation surfaces inside this
+                // try, attributable to this statement, instead of at commit.
+                batches.saveAndFlush(batch);
+                jobs.enqueue(organizationId, ImportJobs.TYPE, ImportJobs.payload(batchId));
+                audit.record(AuditEntry.of(AuditAction.IMPORT_RECEIVED, AuditEntityType.IMPORT_BATCH, batchId)
+                        .with("fileName", batch.getFileName())
+                        .with("sourceType", sourceType.name())
+                        .with("sizeBytes", batch.getFileSizeBytes())
+                        .with("contentHash", hash));
+            });
+        } catch (DataIntegrityViolationException e) {
+            if (!UniqueViolations.isViolationOf(e, DuplicateFileException.CONSTRAINT)) {
+                throw e; // any other violation is a bug, not a duplicate
+            }
+            // A concurrent upload of the same bytes won the race. Our object is now an orphan:
+            // delete it (best effort; the sweeper catches a failure) and point at the winner. The
+            // lookup runs in a new transaction: the failed one is rolled back and unusable.
+            storage.deleteQuietly(key);
+            UUID winner = batches.findByOrganizationIdAndSourceTypeAndContentHash(organizationId, sourceType, hash)
+                    .map(ImportBatch::getId)
+                    .orElseThrow(() -> e);
+            throw new DuplicateFileException(winner);
+        }
         return ImportView.of(batch, 0);
     }
 

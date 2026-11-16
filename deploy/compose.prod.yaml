@@ -52,7 +52,7 @@ x-app-env: &app-env
 
 services:
   traefik:
-    image: traefik:v3.5.6@sha256:16acb89c6db341182970d6fdafece31303b0a380a8ed7aa51682e225229bf1d2
+    image: traefik:v3.7.0@sha256:eb328e2c806c53aafbbace6c451fa54d268961261a85452fcf0fb752a30c17be
     restart: unless-stopped
     environment:
       API_HOST: ${API_HOST:?set API_HOST (api.example.com)}

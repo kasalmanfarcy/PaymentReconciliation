@@ -503,6 +503,19 @@ The run's matches, paginated (§4: `page`, `size` default 50, clamped to 200), s
 
 `reference` is the raw reference exactly as in the file; `normalizedReference` is what was matched on. **Errors:** `404 not-found` for an unknown run or another tenant's (the run is checked first, so it is never an empty page).
 
+### 8.12 `GET /api/v1/reconciliation-runs`
+
+The organization's runs, newest first (M6.17), served by `reconciliation_run_list_idx (organization_id, created_at DESC)`. Response: a page (§4) of the run shape from §8.10.
+
+| Parameter | Notes |
+|---|---|
+| `status` | Repeatable: `status=PENDING&status=RUNNING` |
+| `from`, `to` | `YYYY-MM-DD`; runs whose period **overlaps** `[from, to]` (`period_start ≤ to AND period_end ≥ from`); either may be omitted; `to ≥ from` |
+| `sort` | `createdAt` only (default `desc`); `id` breaks ties. Anything else is `400 validation-failed` |
+| `page`, `size` | As §4; `size` is clamped to 200 |
+
+**Errors:** `400 validation-failed` (unknown sort field or direction, reversed range, bad enum or date).
+
 ### 8.13 Notes for later sections
 
 Decisions already made that the later endpoint sections must reflect:

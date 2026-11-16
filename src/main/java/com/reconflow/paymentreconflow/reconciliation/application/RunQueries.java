@@ -1,15 +1,23 @@
 package com.reconflow.paymentreconflow.reconciliation.application;
 
 import com.reconflow.paymentreconflow.reconciliation.domain.MatchType;
+import com.reconflow.paymentreconflow.reconciliation.domain.ReconciliationRun;
 import com.reconflow.paymentreconflow.reconciliation.domain.ReconciliationRunRepository;
+import com.reconflow.paymentreconflow.reconciliation.domain.RunStatus;
 import com.reconflow.paymentreconflow.shared.context.TenantContext;
 import com.reconflow.paymentreconflow.shared.error.NotFoundException;
+import com.reconflow.paymentreconflow.shared.error.ValidationFailedException;
 import com.reconflow.paymentreconflow.shared.web.Pagination;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.LocalDate;
+import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 import java.util.UUID;
+import org.jspecify.annotations.Nullable;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
@@ -105,5 +113,84 @@ public class RunQueries {
                 rs.getString(prefix + "norm"),
                 rs.getBigDecimal(prefix + "amount"),
                 rs.getObject(prefix + "date", LocalDate.class));
+    }
+
+    /**
+     * The organization's runs, newest first by default (api-design.md §8.12), served by
+     * {@code reconciliation_run_list_idx (organization_id, created_at DESC)}. Filters: any of
+     * several statuses; a date range the run's period overlaps. The only sort field is
+     * {@code createdAt}; the id breaks ties. One query picks the page's ids (filters, order and
+     * paging in SQL), a second loads those runs.
+     */
+    public Page<RunView> list(
+            @Nullable List<RunStatus> statuses,
+            @Nullable LocalDate from,
+            @Nullable LocalDate to,
+            @Nullable List<String> sort,
+            int page,
+            int size) {
+        if (from != null && to != null && to.isBefore(from)) {
+            throw new ValidationFailedException("to", "must-not-be-before-start", "to must be on or after from");
+        }
+        UUID organizationId = tenant.organizationId();
+        String direction = direction(sort);
+        StringBuilder where = new StringBuilder(" WHERE organization_id = :org");
+        Map<String, Object> params = new HashMap<>();
+        params.put("org", organizationId);
+        if (statuses != null && !statuses.isEmpty()) {
+            where.append(" AND status IN (:statuses)");
+            params.put("statuses", statuses.stream().map(Enum::name).toList());
+        }
+        if (to != null) {
+            where.append(" AND period_start <= :to"); // the period overlaps [from, to]
+            params.put("to", to);
+        }
+        if (from != null) {
+            where.append(" AND period_end >= :from");
+            params.put("from", from);
+        }
+        int p = Pagination.page(page);
+        int s = Pagination.size(size);
+        List<UUID> ids = jdbc.sql("SELECT id FROM reconciliation_run" + where + " ORDER BY created_at " + direction
+                        + ", id " + direction + " LIMIT :limit OFFSET :offset")
+                .params(params)
+                .param("limit", s)
+                .param("offset", (long) p * s)
+                .query(UUID.class)
+                .list();
+        Long total = jdbc.sql("SELECT count(*) FROM reconciliation_run" + where)
+                .params(params)
+                .query(Long.class)
+                .single();
+        Map<UUID, ReconciliationRun> loaded = new HashMap<>();
+        if (!ids.isEmpty()) {
+            runs.findByOrganizationIdAndIdIn(organizationId, ids).forEach(r -> loaded.put(r.getId(), r));
+        }
+        List<RunView> content = ids.stream().map(loaded::get).map(RunView::of).toList();
+        return new PageImpl<>(content, PageRequest.of(p, s), total);
+    }
+
+    /** {@code sort=createdAt,asc|desc}; anything else is 400 (fields are whitelisted). */
+    private static String direction(@Nullable List<String> sort) {
+        if (sort == null || sort.isEmpty()) {
+            return "DESC";
+        }
+        List<String> tokens = sort.stream()
+                .flatMap(x -> Arrays.stream(x.split(",")))
+                .map(String::strip)
+                .filter(t -> !t.isEmpty())
+                .toList();
+        if (tokens.isEmpty() || !tokens.getFirst().equals("createdAt") || tokens.size() > 2) {
+            throw new ValidationFailedException("sort", "unsupported-sort-field", "Sortable fields: createdAt");
+        }
+        if (tokens.size() == 1) {
+            return "DESC";
+        }
+        return switch (tokens.get(1).toLowerCase(Locale.ROOT)) {
+            case "asc" -> "ASC";
+            case "desc" -> "DESC";
+            default ->
+                throw new ValidationFailedException("sort", "unsupported-sort-direction", "Direction: asc or desc");
+        };
     }
 }

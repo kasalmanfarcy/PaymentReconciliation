@@ -1,6 +1,8 @@
 package com.reconflow.paymentreconflow.reconciliation.domain;
 
 import jakarta.persistence.LockModeType;
+import java.util.Collection;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import org.springframework.data.jpa.repository.Lock;
@@ -20,6 +22,8 @@ public interface ReconciliationRunRepository extends Repository<ReconciliationRu
     ReconciliationRun saveAndFlush(ReconciliationRun run);
 
     Optional<ReconciliationRun> findByIdAndOrganizationId(UUID id, UUID organizationId);
+
+    List<ReconciliationRun> findByOrganizationIdAndIdIn(UUID organizationId, Collection<UUID> ids);
 
     Optional<ReconciliationRun> findByOrganizationIdAndIdempotencyKey(UUID organizationId, String idempotencyKey);
 

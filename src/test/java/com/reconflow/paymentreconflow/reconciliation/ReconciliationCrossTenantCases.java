@@ -1,6 +1,7 @@
 package com.reconflow.paymentreconflow.reconciliation;
 
 import static com.reconflow.paymentreconflow.tenancy.CrossTenantCase.Expectation.AFFECTS_ONLY_A;
+import static com.reconflow.paymentreconflow.tenancy.CrossTenantCase.Expectation.LIST_EXCLUDES_B;
 import static com.reconflow.paymentreconflow.tenancy.CrossTenantCase.Expectation.NOT_FOUND;
 
 import com.reconflow.paymentreconflow.tenancy.CrossTenantCase;
@@ -29,6 +30,13 @@ class ReconciliationCrossTenantCases implements CrossTenantCases {
                         f -> Map.of(),
                         f -> Map.of("periodStart", "2026-10-01", "periodEnd", "2026-10-31", "currency", "AED"),
                         AFFECTS_ONLY_A),
+                new CrossTenantCase(
+                        "list runs",
+                        HttpMethod.GET,
+                        "/api/v1/reconciliation-runs",
+                        f -> Map.of(),
+                        null,
+                        LIST_EXCLUDES_B),
                 new CrossTenantCase(
                         "read org B's run",
                         HttpMethod.GET,

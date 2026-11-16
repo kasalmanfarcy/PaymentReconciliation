@@ -93,6 +93,7 @@ class AuthorizationMatrixIT extends AbstractIntegrationTest {
                 target -> post("/api/v1/reconciliation-runs")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"periodStart\":\"2026-10-01\",\"periodEnd\":\"2026-10-31\",\"currency\":\"AED\"}")),
+        new Endpoint("GET /reconciliation-runs", Permission.RUN_READ, target -> get("/api/v1/reconciliation-runs")),
         new Endpoint(
                 "GET /reconciliation-runs/{id}",
                 Permission.RUN_READ,

@@ -5,12 +5,15 @@ import com.reconflow.paymentreconflow.reconciliation.application.ReconciliationR
 import com.reconflow.paymentreconflow.reconciliation.application.RunQueries;
 import com.reconflow.paymentreconflow.reconciliation.application.RunRequest;
 import com.reconflow.paymentreconflow.reconciliation.application.RunView;
+import com.reconflow.paymentreconflow.reconciliation.domain.RunStatus;
 import com.reconflow.paymentreconflow.shared.context.Permission;
 import com.reconflow.paymentreconflow.shared.context.RequiresPermission;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
 import java.net.URI;
+import java.time.LocalDate;
+import java.util.List;
 import java.util.UUID;
 import org.jspecify.annotations.Nullable;
 import org.springframework.data.web.PagedModel;
@@ -41,6 +44,19 @@ class ReconciliationRunController {
     ReconciliationRunController(ReconciliationRunService runs, RunQueries queries) {
         this.runs = runs;
         this.queries = queries;
+    }
+
+    /** The organization's runs, newest first; filters: status (repeatable), a period overlapping from..to. */
+    @GetMapping
+    @RequiresPermission(Permission.RUN_READ)
+    PagedModel<RunView> list(
+            @RequestParam(required = false) @Nullable List<RunStatus> status,
+            @RequestParam(required = false) @Nullable LocalDate from,
+            @RequestParam(required = false) @Nullable LocalDate to,
+            @RequestParam(required = false) @Nullable List<String> sort,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "50") int size) {
+        return new PagedModel<>(queries.list(status, from, to, sort, page, size));
     }
 
     /** Status, progress and summary; cheap to poll, with Retry-After until the run is terminal. */

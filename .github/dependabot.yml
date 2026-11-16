@@ -32,8 +32,16 @@ updates:
     commit-message:
       prefix: "ci(repo)"
 
-  # The pinned image tags in compose.yaml (postgres, minio, keycloak, prometheus, grafana). The
-  # Dockerfile arrives in M11.1; add a `docker` entry then.
+  # The base images of the Dockerfile (M11.1), pinned by tag and digest: Dependabot bumps both.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "build(repo)"
+
+  # The pinned image tags in compose.yaml (postgres, minio, keycloak, prometheus, grafana).
   - package-ecosystem: docker-compose
     directory: /
     schedule:

@@ -1,0 +1,15 @@
+# The image build needs four things; everything else stays out of the build context (M11.1).
+# An allow-list, not a deny-list: a new file (a .env, a dump, a key) is excluded until someone
+# decides the build needs it, so `COPY . .` can never bake a local secret into a layer (and deleting
+# it in a later layer would not remove it from the earlier one).
+*
+!.mvn/
+!mvnw
+!pom.xml
+!src/main/
+
+# Belt and braces, should someone widen the list above.
+.env
+.env.*
+**/*.pem
+**/*.key

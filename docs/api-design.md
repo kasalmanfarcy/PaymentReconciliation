@@ -391,7 +391,13 @@ Decisions already made that the later endpoint sections must reflect:
 
 ## 9. Authorization matrix
 
-The source of truth is [plans/authentication.plan §5](../plans/authentication.plan); M3.7 copies the final matrix here once the code exists. Code checks **permissions**, never role names, so changing what a role can do is a one-line change in `RolePermissions`.
+The matrix as built in M3.7. Code checks **permissions**, never role names, so changing what a role can do is a one-line change in `security.authz.RolePermissions`, the only place roles become permissions.
+
+How it is enforced and kept honest:
+
+- Every controller method carries `@RequiresPermission(Permission.X)`, a meta-annotation for `@PreAuthorize("hasAuthority('X')")`. The authorities of a request are the caller's permissions in the selected organization, resolved per request by `TenantContextFilter`. An architecture rule fails the build if a controller method outside `security.auth` has no permission annotation.
+- `RolePermissionsTest` pins this table cell by cell; `AuthorizationMatrixIT` calls every endpoint as every role and expects `2xx` or `403 forbidden` accordingly.
+- `PermissionDocsTest` checks the endpoint index in §8.1 against the code: every mapped endpoint must have a row, and the row must name the permission its annotation requires.
 
 | Permission | VIEWER | UPLOADER | INVESTIGATOR | ORG_ADMIN |
 |---|---|---|---|---|

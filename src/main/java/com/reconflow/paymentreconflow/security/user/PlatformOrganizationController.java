@@ -2,6 +2,8 @@ package com.reconflow.paymentreconflow.security.user;
 
 import com.reconflow.paymentreconflow.organization.Organization;
 import com.reconflow.paymentreconflow.organization.OrganizationStatus;
+import com.reconflow.paymentreconflow.shared.context.Permission;
+import com.reconflow.paymentreconflow.shared.context.RequiresPermission;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
@@ -12,7 +14,6 @@ import java.util.UUID;
 import org.jspecify.annotations.Nullable;
 import org.springframework.data.web.PagedModel;
 import org.springframework.http.ResponseEntity;
-import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -56,14 +57,14 @@ class PlatformOrganizationController {
     }
 
     @GetMapping
-    @PreAuthorize("hasAuthority('PLATFORM_ORG_MANAGE')")
+    @RequiresPermission(Permission.PLATFORM_ORG_MANAGE)
     PagedModel<OrganizationResponse> list(
             @RequestParam(defaultValue = "0") int page, @RequestParam(defaultValue = "50") int size) {
         return new PagedModel<>(platform.list(page, size).map(OrganizationResponse::of));
     }
 
     @PostMapping
-    @PreAuthorize("hasAuthority('PLATFORM_ORG_MANAGE')")
+    @RequiresPermission(Permission.PLATFORM_ORG_MANAGE)
     ResponseEntity<CreatedOrganizationResponse> create(@Valid @RequestBody CreateOrganizationRequest request) {
         var created = platform.create(request.name(), request.adminEmail(), request.adminDisplayName());
         return ResponseEntity.created(URI.create("/api/v1/platform/organizations/"

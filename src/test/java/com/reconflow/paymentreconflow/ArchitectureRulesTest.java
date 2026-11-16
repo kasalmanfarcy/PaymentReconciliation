@@ -1,11 +1,16 @@
 package com.reconflow.paymentreconflow;
 
+import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.methods;
 import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noClasses;
 
+import com.reconflow.paymentreconflow.shared.context.RequiresPermission;
 import com.tngtech.archunit.core.domain.JavaClasses;
 import com.tngtech.archunit.core.importer.ClassFileImporter;
 import com.tngtech.archunit.core.importer.ImportOption;
 import org.junit.jupiter.api.Test;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
 
 /**
  * Architecture rules Spring Modulith cannot express. ArchUnit comes in with spring-modulith-core.
@@ -81,6 +86,27 @@ class ArchitectureRulesTest {
                         "org.springframework.security.core.context..",
                         "org.springframework.security.oauth2.jwt..",
                         "org.springframework.security.oauth2.server.resource..")
+                .check(classes);
+    }
+
+    @Test
+    void everyEndpointDeclaresItsPermission() {
+        // M3.7: a forgotten annotation must be a red build, not an open endpoint. Only the auth
+        // endpoints (login, refresh, logout: public; change-password: any authenticated user) are
+        // exempt.
+        methods()
+                .that()
+                .areDeclaredInClassesThat()
+                .areAnnotatedWith(RestController.class)
+                .and()
+                .areDeclaredInClassesThat()
+                .resideOutsideOfPackage(ROOT + ".security.auth..")
+                .and()
+                .areMetaAnnotatedWith(RequestMapping.class)
+                .should()
+                .beAnnotatedWith(RequiresPermission.class)
+                .orShould()
+                .beAnnotatedWith(PreAuthorize.class)
                 .check(classes);
     }
 }

@@ -1,5 +1,7 @@
 package com.reconflow.paymentreconflow.security.user;
 
+import com.reconflow.paymentreconflow.shared.context.Permission;
+import com.reconflow.paymentreconflow.shared.context.RequiresPermission;
 import com.reconflow.paymentreconflow.shared.context.Role;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Email;
@@ -12,7 +14,6 @@ import java.util.UUID;
 import org.jspecify.annotations.Nullable;
 import org.springframework.data.web.PagedModel;
 import org.springframework.http.ResponseEntity;
-import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -57,7 +58,7 @@ class MemberController {
     }
 
     @GetMapping
-    @PreAuthorize("hasAuthority('MEMBER_MANAGE')")
+    @RequiresPermission(Permission.MEMBER_MANAGE)
     PagedModel<MemberView> list(
             @RequestParam(defaultValue = "0") int page,
             @RequestParam(defaultValue = "50") int size,
@@ -70,7 +71,7 @@ class MemberController {
      * created, shown this once, and never logged; it's null when an existing user was attached.
      */
     @PostMapping
-    @PreAuthorize("hasAuthority('MEMBER_MANAGE')")
+    @RequiresPermission(Permission.MEMBER_MANAGE)
     ResponseEntity<CreatedMemberResponse> create(@Valid @RequestBody CreateMemberRequest request) {
         var created = members.create(request.email(), request.displayName(), request.role());
         MemberView m = created.member();
@@ -89,20 +90,20 @@ class MemberController {
     @PatchMapping(
             path = "/{userId}",
             consumes = {"application/json", "application/merge-patch+json"})
-    @PreAuthorize("hasAuthority('MEMBER_MANAGE')")
+    @RequiresPermission(Permission.MEMBER_MANAGE)
     MemberView changeRole(@PathVariable UUID userId, @Valid @RequestBody ChangeRoleRequest request) {
         return members.changeRole(userId, request.role());
     }
 
     /** The only account-recovery path in v1: there is no email, so no self-service reset. */
     @PostMapping("/{userId}/reset-password")
-    @PreAuthorize("hasAuthority('MEMBER_MANAGE')")
+    @RequiresPermission(Permission.MEMBER_MANAGE)
     TemporaryPasswordResponse resetPassword(@PathVariable UUID userId) {
         return new TemporaryPasswordResponse(members.resetPassword(userId));
     }
 
     @PostMapping("/{userId}/disable")
-    @PreAuthorize("hasAuthority('MEMBER_MANAGE')")
+    @RequiresPermission(Permission.MEMBER_MANAGE)
     MemberView disable(@PathVariable UUID userId) {
         return members.disable(userId);
     }

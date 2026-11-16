@@ -18,6 +18,7 @@ import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
 import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.core.annotation.AnnotationTemplateExpressionDefaults;
 import org.springframework.security.core.userdetails.UserDetailsService;
 import org.springframework.security.core.userdetails.UsernameNotFoundException;
 import org.springframework.security.oauth2.server.resource.web.authentication.BearerTokenAuthenticationFilter;
@@ -84,6 +85,15 @@ class SecurityConfig {
                 .addFilterAfter(
                         new TenantContextFilter(tenantLookup, problemWriter), PasswordChangeRequiredFilter.class);
         return http.build();
+    }
+
+    /**
+     * Lets {@code @RequiresPermission(Permission.X)} expand to {@code hasAuthority('X')}. Static, so
+     * method security's infrastructure can pick it up before this configuration is initialised.
+     */
+    @Bean
+    static AnnotationTemplateExpressionDefaults annotationTemplateExpressionDefaults() {
+        return new AnnotationTemplateExpressionDefaults();
     }
 
     /** 401 {@code unauthenticated}; deliberately the same body for a missing, expired or forged token. */

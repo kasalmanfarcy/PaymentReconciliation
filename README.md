@@ -2,7 +2,7 @@
 
 A payment reconciliation and exception resolution platform. ReconFlow compares a business's internal payment ledger against payment gateway settlements, surfaces the discrepancies, and tracks how each one was investigated and resolved.
 
-> **Project status: design phase.** This repository currently contains the Spring Boot skeleton only. No domain code, persistence layer, or endpoints exist yet. See [Roadmap](#roadmap).
+> **Project status: foundation.** The database schema (Flyway V1–V3), data layer and test harness are in place. No domain code or business endpoints exist yet. See [Roadmap](#roadmap).
 
 ---
 
@@ -127,9 +127,9 @@ Explicitly **out of scope for v1**: one-to-many matching for aggregated settleme
 | Language | Java 25 | LTS |
 | Framework | Spring Boot 4.1.2 | `webmvc` + `validation` only, so far |
 | Database | PostgreSQL | `NUMERIC` for money, FK + unique constraints, transactional writes |
-| Migrations | Flyway | Planned — not yet added |
+| Migrations | Flyway | V1–V3 applied on startup; applied migrations are never edited |
 | Build | Maven (wrapper) | `./mvnw`, no system Maven required |
-| Testing | JUnit + Testcontainers | Planned |
+| Testing | JUnit + Testcontainers | Tests start their own PostgreSQL 16 in Docker |
 | Async | Kafka | Deliberately deferred |
 | Cache | Redis | Deliberately deferred; only if a concrete need appears |
 | Local infra | Docker Compose | Planned |
@@ -143,7 +143,7 @@ Explicitly **out of scope for v1**: one-to-many matching for aggregated settleme
 - **Java 25** — verify with `java -version`
 - No system Maven needed; use the bundled wrapper (`./mvnw`, executable)
 - **PostgreSQL 16** — the schema is owned by Flyway and applied on startup
-- Docker — not required yet; it becomes necessary for the Testcontainers tests in M2.3
+- **Docker** (Docker Desktop, OrbStack or Colima) — required by the tests, which start their own PostgreSQL
 
 ### Configure
 
@@ -167,7 +167,7 @@ The application requires a database and a role that can create tables. It does *
 createdb -h localhost -U "$DB_USER" paymentreconflow
 ```
 
-Flyway applies `V1` and `V2` on first startup. Hibernate runs in `validate` mode, so a mismatch
+Flyway applies `V1`–`V3` on first startup. Hibernate runs in `validate` mode, so a mismatch
 between the entities and the schema fails the boot rather than silently altering it.
 
 > **Local auth.** PostgreSQL must require a password. Homebrew's default `pg_hba.conf` uses
@@ -190,8 +190,9 @@ no business endpoints yet — the next milestone adds the organization and user 
 ./mvnw test
 ```
 
-The only test present is the default `contextLoads` smoke test, which needs a live database
-and a valid `.env`. It moves to Testcontainers in M2.3.
+Tests need Docker but no local database and no `.env`: Testcontainers starts
+`postgres:16.4-alpine`, Flyway applies the migrations to it, and the context test checks they
+applied.
 
 ---
 
@@ -199,13 +200,20 @@ and a valid `.env`. It moves to Testcontainers in M2.3.
 
 | # | Milestone | Status |
 | - | --------- | ------ |
-| 01 | Requirements and system design | **In progress** — `docs/` not yet written |
-| 02 | Project foundation: JPA, PostgreSQL, Flyway, config, tests | Not started — skeleton only |
-| 03 | Transaction ingestion: CSV upload, row validation, dedupe | Not started |
-| 04 | Reconciliation engine: matching, mismatches, duplicates, reports | Not started |
-| 05 | Exception management: assignment, resolution, RBAC, audit | Not started |
-| 06 | Reliability & performance: reprocessing, concurrency, metrics | Not started |
-| 07 | Deployment & portfolio: Docker, docs, demo dataset | Not started |
+| M0 | Repository hygiene: license, conventions, protected `main` | In progress |
+| M1 | Requirements and system design: docs, ADRs, sample data | Not started |
+| M2 | Project foundation: profiles, error model, logging, CI | Partly done — JPA, Flyway, schema, Testcontainers |
+| M3 | Organizations, users, authentication, tenant isolation | Not started |
+| M4 | Append-only audit | Not started |
+| M5 | Transaction ingestion: CSV upload, job queue, validation | Not started |
+| M6 | Reconciliation engine: matching, idempotent runs | Not started |
+| M7 | Exception management: workflow, optimistic locking | Not started |
+| M8 | Reporting and export | Not started |
+| M9 | Reliability and performance | Not started |
+| M10 | Security hardening | Not started |
+| M11 | Deployment and portfolio | Not started |
+
+[TASKS.md](TASKS.md) lists every task; [plans/](plans/README.md) explains how each phase is built.
 
 ### Planned API surface
 
@@ -252,13 +260,18 @@ These must be resolved before the persistence layer is written:
 
 ```
 paymentreconflow/
-├── docs/                 # requirements, architecture, DB design, API, matching rules (planned)
+├── docs/                 # scalability plan; requirements, architecture, API, rules (M1)
+├── plans/                # how each phase is built, and why
 ├── src/main/java/com/reconflow/paymentreconflow/
 │   └── PaymentreconflowApplication.java
 ├── src/main/resources/
-│   └── application.properties
-├── src/test/java/...
+│   ├── application.yml
+│   └── db/migration/     # Flyway V1–V3
+├── src/test/java/...     # Testcontainers-backed tests
 ├── projectoverview.md    # full system design brief
+├── TASKS.md              # every task, M0–M11
+├── CONTRIBUTING.md       # branch, commit and PR conventions
+├── LICENSE               # Apache-2.0
 ├── pom.xml
 └── README.md
 ```

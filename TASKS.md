@@ -13,12 +13,12 @@ The full build plan, from an empty Spring Boot skeleton to a deployed, documente
 
 ## M0 — Repository hygiene
 
-- [ ] **M0.1** Make the initial commit of the Spring Initializr skeleton.
-- [ ] **M0.2** Fill in the `pom.xml` metadata: `<name>`, `<description>`, and remove the empty `<licenses>`, `<developers>` and `<scm>` blocks.
-- [ ] **M0.3** Pick a license and add `LICENSE`.
-- [ ] **M0.4** Create a GitHub repository, push `main` and protect it (PRs only, CI must pass).
-- [ ] **M0.5** Agree on a branch and commit convention (e.g. Conventional Commits plus task IDs) and record it in `CONTRIBUTING.md`.
-- [ ] **M0.6** Add `.editorconfig` covering indentation, final newline and line endings.
+- [x] **M0.1** Make the initial commit of the Spring Initializr skeleton.
+- [x] **M0.2** Fill in the `pom.xml` metadata: `<name>`, `<description>`, and remove the empty `<licenses>`, `<developers>` and `<scm>` blocks.
+- [x] **M0.3** Pick a license and add `LICENSE`.
+- [ ] **M0.4** Create a GitHub repository, push `main` and protect it (PRs only, CI must pass). *Note: the "CI must pass" rule is switched on in M2.15, once a CI check exists.*
+- [x] **M0.5** Agree on a branch and commit convention (e.g. Conventional Commits plus task IDs) and record it in `CONTRIBUTING.md`.
+- [x] **M0.6** Add `.editorconfig` covering indentation, final newline and line endings.
 
 **Exit criteria:** the repository is on GitHub and `./mvnw test` passes on a fresh clone.
 

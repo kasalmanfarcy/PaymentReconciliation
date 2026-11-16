@@ -1,0 +1,7 @@
+merchant_reference,amount,currency,status,transaction_at,gateway_transaction_id
+PAY-301,90.00,AED,captured,2026-10-04T06:00:00Z,gw_0301
+PAY-301,90.00,AED,captured,2026-10-04T06:00:00Z,gw_0301
+PAY-301,90.00,AED,captured,2026-10-04T06:00:00Z,gw_0301
+PAY-302,60.00,AED,captured,2026-10-04T07:00:00Z,gw_0302
+PAY-302,65.00,AED,captured,2026-10-04T07:30:00Z,gw_0302b
+PAY-303,45.00,AED,captured,2026-10-04T08:00:00Z,gw_0303

@@ -1,2 +1,5 @@
 /mvnw text eol=lf
 *.cmd text eol=crlf
+# Sample CSVs are test fixtures: keep their bytes exactly (BOM, CRLF,
+# padded fields). See docs/samples/README.md.
+docs/samples/*.csv -text

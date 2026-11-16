@@ -1,0 +1,4 @@
+merchant_reference,amount,currency,status,transaction_at,gateway_transaction_id
+PAY-201,108.92,usd,captured,2026-10-03T06:00:00Z,gw_0201
+PAY-202,150.00,aed,captured,2026-10-03T22:30:00Z,gw_0202
+PAY-203,75.00,usd,captured,2026-10-03T08:00:00Z,gw_0203

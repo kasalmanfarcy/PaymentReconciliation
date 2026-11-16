@@ -1,6 +1,7 @@
 package com.reconflow.paymentreconflow.reconciliation;
 
 import static com.reconflow.paymentreconflow.tenancy.CrossTenantCase.Expectation.AFFECTS_ONLY_A;
+import static com.reconflow.paymentreconflow.tenancy.CrossTenantCase.Expectation.NOT_FOUND;
 
 import com.reconflow.paymentreconflow.tenancy.CrossTenantCase;
 import com.reconflow.paymentreconflow.tenancy.CrossTenantCases;
@@ -27,6 +28,14 @@ class ReconciliationCrossTenantCases implements CrossTenantCases {
                         "/api/v1/reconciliation-runs",
                         f -> Map.of(),
                         f -> Map.of("periodStart", "2026-10-01", "periodEnd", "2026-10-31", "currency", "AED"),
-                        AFFECTS_ONLY_A));
+                        AFFECTS_ONLY_A),
+                // Org B's failed run must stay FAILED, its job count unchanged (the snapshot).
+                new CrossTenantCase(
+                        "retry org B's failed run",
+                        HttpMethod.POST,
+                        "/api/v1/reconciliation-runs/{id}/retry",
+                        f -> Map.of("id", f.orgBFailedRun()),
+                        f -> Map.of("reason", "hijack"),
+                        NOT_FOUND));
     }
 }

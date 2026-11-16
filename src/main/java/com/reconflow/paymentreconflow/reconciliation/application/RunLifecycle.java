@@ -193,6 +193,26 @@ public class RunLifecycle {
         });
     }
 
+    /**
+     * FAILED → PENDING ({@code RUN_RETRY_REQUESTED}), by a user, with a reason. The checkpoint
+     * stays, so the new job resumes after the last committed day and never redoes (or duplicates)
+     * it. Flushed at once: if another run of the same scope is active, the active-scope index
+     * fails here, inside the caller's try.
+     *
+     * @throws InvalidRunTransitionException (409) unless the run is FAILED
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public ReconciliationRun requestRetry(ReconciliationRun run, String reason) {
+        String previousFailure = run.getFailureReason();
+        run.transitionTo(RunStatus.PENDING, clock.instant());
+        runs.saveAndFlush(run);
+        audit.record(AuditEntry.of(AuditAction.RUN_RETRY_REQUESTED, AuditEntityType.RECONCILIATION_RUN, run.getId())
+                .with("reason", reason)
+                .with("previousFailureReason", previousFailure)
+                .with("lastCompletedDate", dateOrNull(run.getLastCompletedDate())));
+        return run;
+    }
+
     private RunSummary summarize(RunContext run) {
         Map<String, Object> matched = jdbc.sql(SUMMARIZE_MATCHES)
                 .param("runId", run.runId())

@@ -6,9 +6,13 @@ import com.reconflow.paymentreconflow.reconciliation.application.RunView;
 import com.reconflow.paymentreconflow.shared.context.Permission;
 import com.reconflow.paymentreconflow.shared.context.RequiresPermission;
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
 import java.net.URI;
+import java.util.UUID;
 import org.jspecify.annotations.Nullable;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
@@ -51,6 +55,20 @@ class ReconciliationRunController {
                     .body(run);
         }
         return withRetryAfter(ResponseEntity.ok().location(location(run)), run);
+    }
+
+    /** A retry must say why (reconciliation-rules.md §7.2); it goes into the audit trail. */
+    record RetryRequest(@NotBlank @Size(max = 1000) String reason) {}
+
+    /** 202 like the request: the run is PENDING again and its new job is queued. */
+    @PostMapping("/{id}/retry")
+    @RequiresPermission(Permission.RUN_CREATE)
+    ResponseEntity<RunView> retry(@PathVariable UUID id, @Valid @RequestBody RetryRequest request) {
+        RunView run = runs.retry(id, request.reason());
+        return ResponseEntity.accepted()
+                .location(location(run))
+                .header("Retry-After", RETRY_AFTER_SECONDS)
+                .body(run);
     }
 
     static URI location(RunView run) {

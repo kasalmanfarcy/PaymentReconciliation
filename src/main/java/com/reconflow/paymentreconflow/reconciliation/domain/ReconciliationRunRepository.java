@@ -16,6 +16,9 @@ public interface ReconciliationRunRepository extends Repository<ReconciliationRu
 
     ReconciliationRun save(ReconciliationRun run);
 
+    /** Flushes at once, so a unique violation (the active-scope index) surfaces here, not at commit. */
+    ReconciliationRun saveAndFlush(ReconciliationRun run);
+
     Optional<ReconciliationRun> findByIdAndOrganizationId(UUID id, UUID organizationId);
 
     Optional<ReconciliationRun> findByOrganizationIdAndIdempotencyKey(UUID organizationId, String idempotencyKey);

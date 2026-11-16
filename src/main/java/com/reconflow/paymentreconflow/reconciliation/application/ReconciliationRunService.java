@@ -11,6 +11,7 @@ import com.reconflow.paymentreconflow.reconciliation.domain.ReconciliationRunRep
 import com.reconflow.paymentreconflow.shared.context.CurrentUser;
 import com.reconflow.paymentreconflow.shared.context.TenantContext;
 import com.reconflow.paymentreconflow.shared.error.ConflictException;
+import com.reconflow.paymentreconflow.shared.error.NotFoundException;
 import com.reconflow.paymentreconflow.shared.error.ProblemCodes;
 import com.reconflow.paymentreconflow.shared.error.UniqueViolations;
 import com.reconflow.paymentreconflow.shared.error.ValidationFailedException;
@@ -89,6 +90,7 @@ public class ReconciliationRunService {
     private final TenantContext tenant;
     private final CurrentUser currentUser;
     private final TransactionTemplate tx;
+    private final RunLifecycle lifecycle;
 
     ReconciliationRunService(
             ReconciliationRunRepository runs,
@@ -98,7 +100,9 @@ public class ReconciliationRunService {
             AuditService audit,
             TenantContext tenant,
             CurrentUser currentUser,
-            TransactionTemplate tx) {
+            TransactionTemplate tx,
+            RunLifecycle lifecycle) {
+        this.lifecycle = lifecycle;
         this.runs = runs;
         this.jdbc = jdbc;
         this.jobs = jobs;
@@ -171,6 +175,37 @@ public class ReconciliationRunService {
         ReconciliationRun run =
                 runs.findByIdAndOrganizationId(id, scope.organizationId()).orElseThrow();
         return new Created(RunView.of(run), true);
+    }
+
+    /**
+     * {@code POST /reconciliation-runs/{id}/retry} (M6.12): a FAILED run goes back to PENDING with a
+     * new RECONCILE job, in one transaction with the run row locked (two retries at once are
+     * serialized; the second finds PENDING and gets 409). The run keeps its checkpoint.
+     */
+    public RunView retry(UUID id, String reason) {
+        UUID organizationId = tenant.organizationId();
+        try {
+            return tx.execute(s -> {
+                ReconciliationRun run = runs.lockByIdAndOrganizationId(id, organizationId)
+                        .orElseThrow(() -> new NotFoundException("Reconciliation run", id));
+                lifecycle.requestRetry(run, reason);
+                jobs.enqueue(organizationId, ReconcileJobs.TYPE, ReconcileJobs.payload(id));
+                return RunView.of(run);
+            });
+        } catch (DataIntegrityViolationException e) {
+            if (!UniqueViolations.isViolationOf(e, ACTIVE_SCOPE_UK)) {
+                throw e;
+            }
+            ReconciliationRun run = tx.execute(s -> runs.findByIdAndOrganizationId(id, organizationId)
+                    .orElseThrow(() -> new NotFoundException("Reconciliation run", id)));
+            throw runInProgress(new Scope(
+                    organizationId,
+                    run.getPeriodStart(),
+                    run.getPeriodEnd(),
+                    run.getLeftSource(),
+                    run.getRightSource(),
+                    run.getCurrency()));
+        }
     }
 
     /** The run this key already names: the same request gets it back, a different one gets 422. */

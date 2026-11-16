@@ -29,8 +29,8 @@ import org.springframework.test.web.servlet.request.AbstractMockHttpServletReque
  */
 class AuthorizationMatrixIT extends AbstractIntegrationTest {
 
-    /** What a request may aim at, all in the caller's organization: a member and a FAILED import. */
-    record Target(UUID userId, UUID batchId) {}
+    /** What a request may aim at, all in the caller's organization: a member, a FAILED import and run. */
+    record Target(UUID userId, UUID batchId, UUID runId) {}
 
     record Endpoint(
             String name, Permission required, Function<Target, AbstractMockHttpServletRequestBuilder<?>> request) {
@@ -94,6 +94,12 @@ class AuthorizationMatrixIT extends AbstractIntegrationTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"periodStart\":\"2026-10-01\",\"periodEnd\":\"2026-10-31\",\"currency\":\"AED\"}")),
         new Endpoint(
+                "POST /reconciliation-runs/{id}/retry",
+                Permission.RUN_CREATE,
+                target -> post("/api/v1/reconciliation-runs/" + target.runId() + "/retry")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"reason\":\"database restarted\"}")),
+        new Endpoint(
                 "GET /imports/{id}/errors",
                 Permission.IMPORT_READ,
                 target -> get("/api/v1/imports/" + target.batchId() + "/errors")),
@@ -111,9 +117,15 @@ class AuthorizationMatrixIT extends AbstractIntegrationTest {
         var caller = data().newMember(org, role);
         var target = data().newMember(org, Role.VIEWER);
         UUID batch = data().newImportBatch(org, target.id(), "GATEWAY", "FAILED");
+        UUID run = UUID.randomUUID();
+        jdbc.update("""
+                INSERT INTO reconciliation_run (id, organization_id, idempotency_key, request_fingerprint,
+                       period_start, period_end, currency, status, triggered_by, failure_reason)
+                VALUES (?, ?, ?, ?, DATE '2026-09-01', DATE '2026-09-30', 'AED', 'FAILED', ?, 'internal-error')""", run, org, "client:" + run, "0".repeat(64), target.id());
 
-        MockHttpServletResponse response = mockMvc.perform(
-                        endpoint.request().apply(new Target(target.id(), batch)).with(as(caller.id())))
+        MockHttpServletResponse response = mockMvc.perform(endpoint.request()
+                        .apply(new Target(target.id(), batch, run))
+                        .with(as(caller.id())))
                 .andReturn()
                 .getResponse();
 

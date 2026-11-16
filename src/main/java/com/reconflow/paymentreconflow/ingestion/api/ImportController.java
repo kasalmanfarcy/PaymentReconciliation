@@ -9,6 +9,7 @@ import com.reconflow.paymentreconflow.ingestion.domain.ImportBatchStatus;
 import com.reconflow.paymentreconflow.ledger.SourceType;
 import com.reconflow.paymentreconflow.shared.context.Permission;
 import com.reconflow.paymentreconflow.shared.context.RequiresPermission;
+import com.reconflow.paymentreconflow.shared.web.Pagination;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
@@ -93,7 +94,9 @@ class ImportController {
     PagedModel<RowErrorView> errors(
             @PathVariable UUID id,
             @RequestParam(defaultValue = "0") int page,
-            @RequestParam(defaultValue = "50") int size) {
+            @RequestParam(defaultValue = "50") int size,
+            @RequestParam(required = false) @Nullable List<String> sort) {
+        Pagination.requireNoSort(sort, "rowNumber, column");
         return new PagedModel<>(queries.errors(id, page, size));
     }
 

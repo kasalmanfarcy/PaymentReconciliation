@@ -8,6 +8,7 @@ import com.reconflow.paymentreconflow.reconciliation.application.RunView;
 import com.reconflow.paymentreconflow.reconciliation.domain.RunStatus;
 import com.reconflow.paymentreconflow.shared.context.Permission;
 import com.reconflow.paymentreconflow.shared.context.RequiresPermission;
+import com.reconflow.paymentreconflow.shared.web.Pagination;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
@@ -107,7 +108,9 @@ class ReconciliationRunController {
     PagedModel<MatchView> matches(
             @PathVariable UUID id,
             @RequestParam(defaultValue = "0") int page,
-            @RequestParam(defaultValue = "50") int size) {
+            @RequestParam(defaultValue = "50") int size,
+            @RequestParam(required = false) @Nullable List<String> sort) {
+        Pagination.requireNoSort(sort, "reference, id");
         return new PagedModel<>(queries.matches(id, page, size));
     }
 

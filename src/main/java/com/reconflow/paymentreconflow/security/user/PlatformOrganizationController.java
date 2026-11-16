@@ -4,12 +4,14 @@ import com.reconflow.paymentreconflow.organization.Organization;
 import com.reconflow.paymentreconflow.organization.OrganizationStatus;
 import com.reconflow.paymentreconflow.shared.context.Permission;
 import com.reconflow.paymentreconflow.shared.context.RequiresPermission;
+import com.reconflow.paymentreconflow.shared.web.Pagination;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
 import java.net.URI;
 import java.time.Instant;
+import java.util.List;
 import java.util.UUID;
 import org.jspecify.annotations.Nullable;
 import org.springframework.data.web.PagedModel;
@@ -59,7 +61,10 @@ class PlatformOrganizationController {
     @GetMapping
     @RequiresPermission(Permission.PLATFORM_ORG_MANAGE)
     PagedModel<OrganizationResponse> list(
-            @RequestParam(defaultValue = "0") int page, @RequestParam(defaultValue = "50") int size) {
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "50") int size,
+            @RequestParam(required = false) @Nullable List<String> sort) {
+        Pagination.requireNoSort(sort, "createdAt, id");
         return new PagedModel<>(platform.list(page, size).map(OrganizationResponse::of));
     }
 

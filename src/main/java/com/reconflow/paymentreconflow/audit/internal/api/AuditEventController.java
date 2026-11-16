@@ -6,7 +6,9 @@ import com.reconflow.paymentreconflow.audit.internal.AuditEvent;
 import com.reconflow.paymentreconflow.audit.internal.AuditTimeline;
 import com.reconflow.paymentreconflow.shared.context.Permission;
 import com.reconflow.paymentreconflow.shared.context.RequiresPermission;
+import com.reconflow.paymentreconflow.shared.web.Pagination;
 import java.time.Instant;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import org.jspecify.annotations.Nullable;
@@ -60,7 +62,9 @@ class AuditEventController {
             @RequestParam AuditEntityType entityType,
             @RequestParam UUID entityId,
             @RequestParam(defaultValue = "0") int page,
-            @RequestParam(defaultValue = "50") int size) {
+            @RequestParam(defaultValue = "50") int size,
+            @RequestParam(required = false) @Nullable List<String> sort) {
+        Pagination.requireNoSort(sort, "createdAt, id");
         return new PagedModel<>(timeline.of(entityType, entityId, page, size).map(AuditEventView::of));
     }
 }

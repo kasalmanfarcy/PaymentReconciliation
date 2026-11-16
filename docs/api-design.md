@@ -133,7 +133,8 @@ Why `400` and not `422` for upload content errors: `400` is the general "your re
 **Parameters:** `?page=0&size=50&sort=createdAt,desc`.
 
 - `page` is 0-based. `size` defaults to **50**, maximum **200**; larger values are **clamped** to 200, not rejected (clients asking for "everything" get a full page, not an error).
-- `sort=<field>,<asc|desc>`, repeatable. Sort fields are **whitelisted per endpoint** and mapped to columns in code; an unknown field is `400 validation-failed`. User input never reaches SQL as a column name.
+- `sort=<field>,<asc|desc>`, repeatable. Sort fields are **whitelisted per endpoint** and mapped to columns in code; an unknown field is `400 validation-failed`. User input never reaches SQL as a column name. A list with one fixed order (a batch's row errors, a run's matches, an audit timeline, the platform's organizations) accepts no `sort` at all: any value is `400` (`unsupported-sort-field`), rather than silently ignored (M9.8).
+- The response's `page.size` is the **effective** size, so a client that asked for 1,000 can see it got 200. `PaginationLimitsIT` calls every list endpoint with `size=1000` and with `sort=password_hash`, and fails when a new list endpoint isn't in its list.
 - Every list has a stable default order with a unique tiebreaker (`createdAt desc, id desc`), so pages don't shift or repeat between requests.
 
 **Page response** (Spring Data's stable `PagedModel` shape; never serialize a raw `PageImpl`, whose JSON isn't a stable contract):

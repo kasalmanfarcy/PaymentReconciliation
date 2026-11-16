@@ -2,7 +2,7 @@
 
 A payment reconciliation and exception resolution platform. ReconFlow compares a business's internal payment ledger against payment gateway settlements, surfaces the discrepancies, and tracks how each one was investigated and resolved.
 
-> **Project status: exception management done (M7).** On top of M2–M6 (profiles, error model, in-house JWT authentication, tenant resolution with PostgreSQL row-level security, a permission matrix, an append-only audit log, CSV ingestion through a PostgreSQL job queue, and a set-based matching engine that creates exception cases deduplicated by a deterministic discrepancy key): an exception workflow where investigators list, filter and open cases with both source records side by side, assign them, add append-only notes, and resolve them with a resolution code, and org admins reopen them with a reason. Every status change goes through one state machine that writes status history and an audit event in the same transaction; every update is guarded by optimistic locking (`ETag`/`If-Match`, `428` when missing, `409` when stale, proven by a two-writer race test); and admins can read any entity's audit timeline. Reporting starts in M8. See [Roadmap](#roadmap).
+> **Project status: reporting done (M8).** On top of M2–M6 (profiles, error model, in-house JWT authentication, tenant resolution with PostgreSQL row-level security, a permission matrix, an append-only audit log, CSV ingestion through a PostgreSQL job queue, and a set-based matching engine that creates exception cases deduplicated by a deterministic discrepancy key): an exception workflow where investigators list, filter and open cases with both source records side by side, assign them, add append-only notes, and resolve them with a resolution code, and org admins reopen them with a reason. Every status change goes through one state machine that writes status history and an audit event in the same transaction; every update is guarded by optimistic locking (`ETag`/`If-Match`, `428` when missing, `409` when stale, proven by a two-writer race test); and admins can read any entity's audit timeline. Reporting (M8): one call answers "which match, which don't, why, who resolved them" for a run or a date range (overlapping runs never double count a day), plus import quality, exception ageing and a CSV export of a run's exceptions that streams small runs and hands large ones to a background job, escaped against spreadsheet formula injection; every report query's plan is checked at volume in the build. See [Roadmap](#roadmap).
 
 ---
 
@@ -346,7 +346,7 @@ request.
 | M5 | Transaction ingestion: CSV upload, job queue, validation | Done |
 | M6 | Reconciliation engine: matching, idempotent runs | Done |
 | M7 | Exception management: workflow, optimistic locking | Done |
-| M8 | Reporting and export | Not started |
+| M8 | Reporting and export | Done |
 | M9 | Reliability and performance | Not started |
 | M10 | Security hardening | Not started |
 | M11 | Deployment and portfolio | Not started |
@@ -384,7 +384,9 @@ Permissions per endpoint: [api-design.md §8.1](docs/api-design.md#81-index) and
 
 | Endpoint | Purpose |
 | -------- | ------- |
-| `GET /api/v1/reports/reconciliation` | Summary metrics |
+| `GET /api/v1/reports/reconciliation` | Summary metrics by run or date range |
+| `GET /api/v1/reports/import-quality`, `/exception-ageing` | File quality, case ageing |
+| `GET /api/v1/reports/exceptions/export` | A run's exceptions as CSV |
 
 Build order is ingestion → reconciliation → exceptions. Not every endpoint is required for the first working version.
 

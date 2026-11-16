@@ -1,6 +1,6 @@
 # Phase M8 — Reporting
 
-**Status:** Not started · **Tasks:** TASKS.md M8.1–M8.6 · **Depends on:** M6 (runs, matches, precomputed run totals), M7 (exception workflow and status history), M3 (tenant context, RLS, permissions) · **Date:** 2026-11-01
+**Status:** Done · **Tasks:** TASKS.md M8.1–M8.6 · **Depends on:** M6 (runs, matches, precomputed run totals), M7 (exception workflow and status history), M3 (tenant context, RLS, permissions) · **Date:** 2026-11-01
 
 This phase turns the data the earlier phases produce into answers. The four questions ReconFlow promises to answer (README, projectoverview.md §1) are: *Which transactions match? Which don't? Why? Who investigated and resolved them?* At the end of M8, a single API call answers all four for a run.
 
@@ -767,3 +767,37 @@ Spreadsheet apps treat a cell starting with `=`, `+`, `-` or `@` as a formula, s
 - Using `BETWEEN` on timestamps instead of a half-open range.
 - Counting errors where the report says error rows.
 - Leaving out the cross-tenant test for a new report endpoint.
+
+---
+
+## 9. As built: where the code differs from this plan, and why
+
+docs/ win over this plan wherever they disagree (api-design.md §1, §3.1, §4, §8.1, §8.20, requirements.md FR-20, architecture.md §4). Choices made while building M8:
+
+| Plan said | Built | Why |
+|---|---|---|
+| "Exceptions of a run" = `exception_case.run_id` (the run that raised them), plus a `note` when counts differ | The cases the run **observed** (`exception_case_run`), in the report and the export; no `note` | api-design.md §8.10/§8.13 already define a run's cases that way (run summary, `GET /exceptions?runId=`); with it the report's breakdown agrees with the summary instead of needing an explanation |
+| Day table with the plan's columns | Also `currency_mismatch_count` and `created_at`; no `excluded_count` | The run summary has the fifth type; excluded records are counted over the whole period at completion and have no anchor day, so date-range mode returns `excluded: null` |
+| Exceptions in date-range mode: `run_id = ANY(:runsUsed)` | V7 adds `exception_case_run.day`; cases are those the authoritative runs observed **on their authoritative days**, DISTINCT | With whole runs, a case run 1 saw on a day run 2 later reclassified would still be counted; now breakdown and totals agree (tested) |
+| Day row written "alongside the day's results" | `DiscrepancyRecorder.record(..., day, ...)` stores the day; `summarizeDay` gives the day's case totals; the strategy returns the day's matched amount; `RunLifecycle.recordDay` maps them with the same `RunSummaries` as completion | One mapping for day and run totals, so they can't drift; `RunDayTotalsIT` and `CheckpointResumeIT` (day rows identical after a crash and resume) check it |
+| Run not complete → 409 | `409 run-not-completed` (`currentStatus`), new catalogue row | A 409 needs a stable code |
+| `REPORT_READ` + `EXCEPTION_READ` via a second check | `@RequiresBothPermissions(value, and)`, a second meta-annotation (`hasAuthority(a) and hasAuthority(b)`); ArchitectureRulesTest and PermissionDocsTest accept it; `RequiresBothPermissionsTest` shows one permission alone is refused | Spring Security allows one `@PreAuthorize`; every role holds both today, so only a unit test can show the refusal |
+| Export permission `EXCEPTION_READ` | `REPORT_READ` + `EXCEPTION_READ` | api-design.md §8.1 |
+| Ageing filter `assignee`, amount `mismatchAmountAtStake` from `abs(amount_difference)` | `assignedTo` (id, `me`, `unassigned`), `type` repeatable, `currency`; `amountAtStake` = sum of the cases' `amount`, **per currency** | api-design.md §4 filter naming; V5 added `amount` (the amount at stake, §8.20) for every type; adding currencies would be meaningless |
+| Ageing partial index "if EXPLAIN shows a problem" | Not added | `exception_case_list_idx` bitmap scan, 2–3 ms (docs/benchmarks.md) |
+| Import quality: `(:sourceType IS NULL OR …)` or two queries | Two query texts; errors counted per batch in an aggregating LATERAL subquery with `GROUPING SETS`, summed per bucket | The plan check found the plain join hash-joining a full scan of `import_row_error`; the LATERAL subquery can't be flattened, so each batch is one index range |
+| `CsvCell.safe` a no-op hook, the test `@Disabled("M10.2")` | Escaping implemented now (`= + - @`, tab, CR, LF, after leading spaces, full-width forms); money/dates exempt; tests enabled | requirements.md FR-20 promises an export safe to open in a spreadsheet; the M10 plan now says M10.2 reviews it |
+| One export endpoint returning `text/csv` | `200 text/csv` (streamed) or `202` + `GET /reports/exports/{id}` (status) + `…/file` (download); `409 export-not-ready` | M5 exposed no `/jobs` endpoint; `shared.jobs.JobQueue.find(org, id)` reads a job scoped by organization (the table has no RLS) |
+| Export key `exports/{orgId}/{jobId}.csv` | `{orgId}/exports/{jobId}.csv` | Same per-organization prefix as uploads; outside `imports/`, so the orphan sweeper never touches it |
+| `FileStorage` (from M5) used by reporting | Moved to `shared.storage`; `copyTo(key, OutputStream)` added for the download | reporting may depend only on shared (and now audit); storage is cross-cutting like the job queue |
+| reporting depends on shared only | `audit` added to its allowed dependencies (architecture.md updated) | The plan's own audit events need `AuditService` |
+| `EXCEPTIONS_EXPORTED` for both paths | Sync: when the stream starts, with the count taken then; async: `EXPORT_REQUESTED` with the job, `EXCEPTIONS_EXPORTED` when the file is written, actor = requester | A client that drops half way has still been given data |
+| Sync limit 2 in a test via a property | `ExportLimit` seam; tests' `@Primary AdjustableExportLimit` lowers it per organization | A property override means a second Spring context and container |
+| — | Queue tests' `ScriptedJobHandler` moved from `EXPORT` to a `TEST` type allowed only in the test schema (Flyway `afterMigrate` callback in `src/test/resources/db/test-callbacks`) | Two handlers for one type are refused at startup; production's CHECK stays exactly as migrated |
+| Plans in docs/benchmarks.md "or the PR", checked by hand | `ReportQueryPlanIT` EXPLAINs every production statement (exposed as `STATEMENTS`) on 60k records / 120k cases over 8 tenants and fails on a seq scan of a large table; results in docs/benchmarks.md | A manual check is done once; this one runs on every build |
+| — | V8 `exception_case_run_day_idx (run_id, day)` | Found by the plan check (date-range breakdown did a full scan of the link table) |
+| — | `spring.mvc.async.request-timeout: 60s`, `reconflow.export.sync-max-rows: 50000` | Plan §M8.4 |
+
+Tests added: `RunDayTotalsIT`, `ReconciliationReportIT` (four questions on the sample, 404/409/400s, overlapping runs counted once, coverage gaps), `ImportQualityReportIT` (malformed sample, two errors on one row, UTC buckets), `ExceptionAgeingQueriesIT` (every bucket boundary inside one transaction, so `now()` is fixed), `ExceptionAgeingReportIT`, `ExceptionExportIT` (comma, newline, formula injection, BOM; 202 path gives the same bytes; audit), `CsvCellTest`, `RequiresBothPermissionsTest`, `ReportQueryPlanIT`, `ReportTotalsReconcileIT` (M8.6: raw counts, hand-worked values, conservation, range = run, ageing and import quality against direct sums); plus report rows in `AuthorizationMatrixIT` and `ReportingCrossTenantCases`.
+
+Not built, deliberately: the 200k-row export under `-Xmx256m` (M9.6 measures memory); cold-cache timings and the full M9.5 dataset (M9.6/M9.7); gap-filled import-quality buckets (empty buckets are omitted). Known limit of date-range mode: a group whose records span the boundary between two authoritative runs' days can be classified differently by each (e.g. a cross-day match in run 1, a missing record in run 2 whose period starts after the ledger day); the report counts each day from its own authoritative run.

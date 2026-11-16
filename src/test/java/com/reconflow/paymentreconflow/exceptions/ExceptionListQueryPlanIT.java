@@ -116,7 +116,10 @@ class ExceptionListQueryPlanIT extends AbstractIntegrationTest {
                         + " AND r.organization_id = e.organization_id AND r.run_id = '" + run + "')"));
 
         assertThat(plan).doesNotContain("Seq Scan on exception_case ");
-        assertThat(plan).containsPattern("exception_case_run_pkey|exception_case_run_exception_idx");
+        // Any key leading with run_id (or the per-case one): M8's V8 added exception_case_run_day_idx
+        // (run_id, day), which the planner may prefer for the same run_id lookup.
+        assertThat(plan)
+                .containsPattern("exception_case_run_pkey|exception_case_run_exception_idx|exception_case_run_day_idx");
     }
 
     private String explain(String sql) {

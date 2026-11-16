@@ -65,9 +65,9 @@ The root package is `com.reconflow.paymentreconflow`. Each module is a top-level
 | `ledger` | The normalized transaction store, its writer and its search API | `transaction_record` (and its partitions) |
 | `reconciliation` | Runs, the matching engine, matches | `reconciliation_run`, `reconciliation_match` |
 | `exceptions` | Cases, the workflow state machine, notes, history | `exception_case`, `exception_case_record`, `exception_case_run` (added in M6), `exception_note`, `exception_status_history` |
-| `reporting` | Read-only aggregate reports and CSV export | none |
+| `reporting` | Read-only aggregate reports and CSV export (large exports through an `EXPORT` job) | none |
 | `audit` | `AuditService`, the audit timeline API | `audit_event` |
-| `shared` | Cross-cutting building blocks: UUIDv7 IDs, money helpers, errors / `ProblemDetail`, pagination, request ID, the job queue (`shared.jobs`), and the **interfaces** `TenantContext`, `CurrentUser`, `TenantScope`, `Permission` (implemented in `security`) | `job` |
+| `shared` | Cross-cutting building blocks: UUIDv7 IDs, money helpers, errors / `ProblemDetail`, pagination, request ID, the job queue (`shared.jobs`), object storage (`shared.storage`, moved from `ingestion` in M8 so exports can use it), and the **interfaces** `TenantContext`, `CurrentUser`, `TenantScope`, `Permission` (implemented in `security`) | `job` |
 
 ---
 
@@ -79,7 +79,7 @@ An arrow means "may call the public API of".
 ingestion      ──▶ ledger, audit, shared
 reconciliation ──▶ ledger, ingestion, exceptions, audit, shared
 exceptions     ──▶ audit, shared, security (user-directory API only)
-reporting      ──▶ shared                       (reads via SQL, no module APIs)
+reporting      ──▶ audit, shared                (reads via SQL, no module APIs; audits exports)
 organization   ──▶ audit, shared
 security       ──▶ organization, audit, shared
 audit          ──▶ shared
@@ -95,7 +95,7 @@ flowchart TD
     reconciliation --> exceptions
     exceptions -->|user directory only| security
     security --> organization
-    ingestion & reconciliation & exceptions & organization & security --> audit
+    ingestion & reconciliation & exceptions & organization & security & reporting --> audit
     ingestion & reconciliation & exceptions & organization & security & audit & ledger & reporting --> shared
 ```
 
@@ -110,7 +110,7 @@ The rules, and why:
 - **Transaction search joins `import_batch` the same way.** `GET /transactions` lives in `ledger` and must show only records of accepted batches (rule P3); it reads `ingestion`'s `import_batch.status` in its SQL, read-only, rather than calling `ingestion` (which `ledger` may not depend on) once per page. `SourceType` lives in `ledger`'s public API for the same direction-of-dependency reason.
 - **The exception detail view joins `transaction_record` the same way.** `GET /exceptions/{id}` shows every linked record side by side; `exceptions` may not depend on `ledger` (that would invert `reconciliation → exceptions`), and one call per record would be N+1, so one read-only join on `(id, transaction_date)`, confined to `ExceptionQueries`, reads them (M7.7).
 - **The audit timeline carries actor ids, not names.** `audit` depends on `shared` only and `security` depends on `audit`, so `GET /audit-events` can't ask the user directory for display names without a cycle; a client resolves names separately (M7.13).
-- **`reporting` depends on nothing but `shared`.** Reports are read-only SQL over the other modules' tables. Going through each module's API would mean N+1 calls and in-memory joins for every report.
+- **`reporting` depends on `shared` and `audit` only: read-model SQL (M8).** Reports are read-only SQL over the other modules' tables through `JdbcClient`, returning final aggregates. Going through each module's API would mean N+1 calls and in-memory joins for every report (option A in phase-M8 §2.4); an event-fed read model (option C) would decouple the schemas but costs machinery and eventual consistency. The coupling this leaves is to other modules' **schemas**, not their Java types (so `ModularityTest` stays green), and it is contained three ways: `reporting` never writes another module's table; all of its SQL lives in one `*Queries` class per report (plus the exporter's one statement); and every statement runs against the migrated schema in CI (`ReportQueryPlanIT` EXPLAINs each one, the report ITs check its results), so a renamed column fails the build. `audit` was added in M8.4 because an export is financial data leaving the system. If modules ever moved to separate databases, this becomes an event-fed read model.
 
 These rules become `ApplicationModules.verify()` tests in M2.9, plus an ArchUnit rule that nothing outside `security` imports `security.auth` or `security.token`.
 

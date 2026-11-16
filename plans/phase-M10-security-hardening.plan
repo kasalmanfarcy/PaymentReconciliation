@@ -257,6 +257,8 @@ ALTER TABLE app_user DROP COLUMN password_hash,
 
 ### M10.2 — CSV injection protection on export
 
+> **Already built in M8.4** (`reporting.export.CsvCell`, `CsvCellTest`, `ExceptionExportIT`), because requirements.md FR-20 promises an export that is safe to open in a spreadsheet. It escapes text cells starting with `= + - @`, tab, CR or LF (also after leading spaces, and the full-width forms), and exempts money, dates and timestamps it formats itself, so a `-50.0000` difference stays a number. Commons CSV quotes cells only when needed (commas, quotes, newlines) rather than every cell. M10.2 reduces to reviewing it and applying it to any new export.
+
 **What.** Every free-text cell written to an exported CSV that begins with `=`, `+`, `-`, `@`, a tab (`0x09`) or a carriage return (`0x0D`) is prefixed with a single quote `'`, and every cell is quoted.
 
 **Why.** See §2.5. Tab and CR are on the list because some spreadsheet programs strip leading whitespace and then evaluate what follows. The `'` prefix is the convention Excel itself uses to mean "this is text"; it is shown in the formula bar but not in the cell. Quoting the cell stops embedded commas and newlines from breaking the row structure, which is a separate bug that can also be abused.

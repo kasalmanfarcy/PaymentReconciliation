@@ -240,12 +240,12 @@ Built early so later milestones emit events as they go, instead of retrofitting 
 
 ## M8 — Reporting
 
-- [ ] **M8.1** `GET /api/v1/reports/reconciliation?runId=` or by date range: matched count and total, unmatched counts and totals on each side, mismatch count and net difference, duplicate count, and open versus resolved exceptions.
-- [ ] **M8.2** Import quality report: error rows by error code, for each batch and over time.
-- [ ] **M8.3** Exception ageing: open exceptions grouped by age bucket and by assignee.
-- [ ] **M8.4** CSV export of exceptions for a run.
-- [ ] **M8.5** Use aggregate SQL queries rather than loading entities into memory. Check the plans with `EXPLAIN ANALYZE`.
-- [ ] **M8.6** **Test:** report totals reconcile against raw counts from the sample dataset.
+- [x] **M8.1** `GET /api/v1/reports/reconciliation?runId=` or by date range: matched count and total, unmatched counts and totals on each side, mismatch count and net difference, duplicate count, and open versus resolved exceptions.
+- [x] **M8.2** Import quality report: error rows by error code, for each batch and over time.
+- [x] **M8.3** Exception ageing: open exceptions grouped by age bucket and by assignee.
+- [x] **M8.4** CSV export of exceptions for a run.
+- [x] **M8.5** Use aggregate SQL queries rather than loading entities into memory. Check the plans with `EXPLAIN ANALYZE`.
+- [x] **M8.6** **Test:** report totals reconcile against raw counts from the sample dataset.
 
 **Exit criteria:** a single API call answers the four questions in the README ("Which match? Which don't? Why? Who resolved them?") for a run.
 

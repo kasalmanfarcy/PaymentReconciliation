@@ -271,7 +271,7 @@ Permissions are from [authentication.plan §5](../plans/authentication.plan), pl
 | `GET /reports/exports/{id}` | `REPORT_READ` + `EXCEPTION_READ` | 200 | 404 | M8.4 |
 | `GET /reports/exports/{id}/file` | `REPORT_READ` + `EXCEPTION_READ` | 200 `text/csv` | 404, 409 `export-not-ready` | M8.4 |
 
-All paths are under `/api/v1`. The detailed reference below covers the import (M5), reconciliation-run (M6), exception and audit-timeline (M7) endpoints; each later milestone adds its section here as its endpoints land, so this document grows with the API.
+All paths are under `/api/v1`. The detailed reference below covers the import (M5), reconciliation-run (M6), exception and audit-timeline (M7) and report (M8) endpoints; each later milestone adds its section here as its endpoints land, so this document grows with the API.
 
 ### 8.2 `POST /api/v1/imports`
 
@@ -654,6 +654,70 @@ Decisions already made that the later endpoint sections must reflect:
 - **Exception detail** shows every linked record side by side, including all records of a duplicate case, which may span several days and both sources.
 - **`GET /transactions`** requires `transactionDateFrom` and `transactionDateTo` (at most 366 days apart) so every query prunes partitions, returns a slice, and only shows records from accepted batches (rule P3). `reference` is normalized with rules N1–N3 before comparing.
 - **Run request validation:** `periodStart`, `periodEnd` required, `periodEnd ≥ periodStart`, at most 92 days; `currency` a valid ISO-4217 code; `leftSource` / `rightSource` default to `INTERNAL_LEDGER` / `GATEWAY` and must differ.
+
+### 8.21 `GET /api/v1/reports/reconciliation`
+
+One call answers "which match, which don't, why, who resolved them" (M8.1). **Exactly one mode**:
+
+- `?runId=` — one run: its precomputed summary plus the cases it observed. A run that isn't `COMPLETED` is `409 run-not-completed` (`currentStatus`): totals are written at completion, never shown half-written.
+- `?from=&to=&currency=` — a date range (`YYYY-MM-DD`, inclusive, at most 366 days; `currency` required, trimmed and upper-cased). For each day the **authoritative run** is the most recently completed run of the organization and currency whose period contains it, and only its results for that day count, so overlapping runs (or a re-run with a new `Idempotency-Key`) never count a day twice. Days no completed run covered are listed in `coverage.missingDays`, never reported as zero activity. Runs completed before M8 (no per-day rows) show as missing.
+
+```json
+{
+  "scope": { "mode": "RUN", "runId": "0193c0a1-…", "from": "2026-10-01", "to": "2026-10-02" },
+  "currency": "AED",
+  "matched":            { "count": 3, "amount": "1420.5000" },
+  "unmatchedLedger":    { "count": 1, "amount": "500.0000" },
+  "unmatchedGateway":   { "count": 1, "amount": "200.0000" },
+  "mismatches":         { "count": 1, "netDifference": "-50.0000" },
+  "duplicates":         { "count": 1 },
+  "currencyMismatches": { "count": 0 },
+  "excluded":           { "count": 1 },
+  "exceptionsByReason": [ { "type": "AMOUNT_MISMATCH", "reasonCode": null, "count": 1, "open": 0, "inReview": 0,
+                            "resolved": 1, "amount": "750.0000", "amountDifference": "-50.0000" } ],
+  "resolution": { "open": 3, "inReview": 0, "resolved": 1,
+                  "byResolver": [ { "userId": "…", "displayName": "Ravi", "resolved": 1 } ] },
+  "runsUsed":   [ { "runId": "0193c0a1-…", "completedAt": "…", "days": ["2026-10-01", "2026-10-02"] } ],
+  "coverage":   { "requestedDays": 2, "coveredDays": 2, "missingDays": [] }
+}
+```
+
+- Counts are **cases**, as in the run summary (§8.10). `unmatchedLedger`/`unmatchedGateway` are per **source** (a run with swapped sources still reports its ledger records as the ledger's). `excluded` (records, rules P4/P5) exists in run mode only; `null` in date-range mode, because it has no day.
+- **The cases of a run are the cases it observed** (`exception_case_run`, as `GET /exceptions?runId=` and the run summary count them), not only the ones it raised: a re-run that re-observes an active case reports it. In date-range mode, the cases the authoritative runs observed **on their authoritative days**, so the breakdown agrees with the totals.
+- Needs `REPORT_READ` **and** `EXCEPTION_READ` (it shows cases and resolvers). **Errors:** `400 validation-failed` (no mode, both modes: `conflicting-parameters`, a missing range field: `required`, `must-not-be-before-start`, `range-too-long`, `invalid-currency`), `404 not-found` (unknown or another tenant's run), `409 run-not-completed`.
+
+### 8.22 `GET /api/v1/reports/import-quality`
+
+Which validation rules the files fail (M8.2). Exactly one mode:
+
+- `?batchId=` — one batch: its own counters (`totalRows`, `validRows`, `errorRows`: every bad row, even past the 10,000 stored errors), `status` (a `FAILED` batch may hold partial errors), and the **stored** errors: `stored {errors, errorRows}`, `byErrorCode[]`, `byErrorCodeAndColumn[]` (`column` null for whole-row errors).
+- `?from=&to=` (UTC days, inclusive, ≤ 366) with optional `granularity` (`day` default, `week` (ISO, Monday), `month`) and `sourceType` — buckets by when the batch **arrived** (`import_batch.created_at`, UTC), not by transaction date. Each bucket: `batches`, `totalRows` and `errorRows` from the batches' counters (the denominator for a rate), `stored {errors, errorRows}`, `byErrorCode[]`. Buckets without batches are omitted.
+
+`errors` counts stored errors; `errorRows` counts distinct rows with at least one: a row with two bad columns is two errors and one error row. **Errors:** `400` (no or both modes, `required`, `must-not-be-before-start`, `range-too-long`, `invalid-granularity`, `invalid-source-type`), `404` (unknown or another tenant's batch).
+
+### 8.23 `GET /api/v1/reports/exception-ageing`
+
+`OPEN` and `IN_REVIEW` cases by age bucket, overall and per assignee (M8.3). Filters: `type` (repeatable), `assignedTo` (a user id, `me` or `unassigned`, §4), `currency`.
+
+- Five buckets, always all five in order, zeros included: `0-1d`, `1-3d`, `3-7d`, `7-30d`, `30d+`; each lower bound inclusive (exactly one day old is `1-3d`).
+- **Age runs from `created_at`**, when the case was first raised: a reopened case keeps its age, because the discrepancy has existed that long. (Age since the last reopen is in `exception_status_history`; deliberately not used.) Ages are measured against one instant, the database's `now()`, returned as `asOf`.
+- `amountAtStake` is the sum of the cases' `amount` (§8.20), **per currency**: `[{ "currency": "AED", "amount": "100.0000" }]`.
+- `byAssignee[]`: `{assignee: {id, displayName} | null, cases, buckets[]}`, the unassigned row (`assignee: null`) first.
+
+**Errors:** `400` (`invalid-type`, `invalid-assignee-filter`, `invalid-currency`).
+
+### 8.24 `GET /api/v1/reports/exceptions/export?runId=`
+
+A run's cases (as in §8.21) as CSV (M8.4): one row per case with `case_id, type, reason_code, status, discrepancy_key, currency, amount, amount_difference`, the ledger and gateway records side by side (`*_references`, `*_amounts`, `*_dates`, several records joined by ` | `), `assignee, resolution_code, resolution_note, resolved_by, resolved_at, created_at`. UTF-8 with a BOM (so Excel detects the encoding), CRLF rows, RFC 4180 quoting.
+
+- **Up to `reconflow.export.sync-max-rows` (50,000) cases: `200 text/csv`**, streamed while it is read (`Content-Disposition: attachment`). **Above: `202 Accepted`**, an `EXPORT` job, `Location: /api/v1/reports/exports/{id}`, `Retry-After: 2`, and the export's status body (§8.25).
+- **Safe to open in a spreadsheet** (FR-20): every text cell starting with `=`, `+`, `-`, `@`, tab, CR or LF (also after leading spaces, and their full-width forms) is prefixed with `'`. Amounts, dates and timestamps the server formats are not, so `-50.0000` stays a number.
+- Audited: `EXCEPTIONS_EXPORTED` (`mode` `SYNC`, `rowCount`) when the stream starts; `EXPORT_REQUESTED` (`jobId`, `rowCount`) for a job, then `EXCEPTIONS_EXPORTED` (`mode` `ASYNC`) when its file is written, with the requester as actor.
+- **Errors:** `400` (missing or invalid `runId`), `404` (unknown or another tenant's run).
+
+### 8.25 `GET /api/v1/reports/exports/{id}` and `…/{id}/file`
+
+A background export: `{ "id", "runId", "status": "QUEUED|RUNNING|DONE|FAILED", "createdAt", "updatedAt", "fileUrl" }`, with `Retry-After: 2` until `DONE` or `FAILED`; `fileUrl` is set once `DONE`. `…/file` streams the CSV (byte for byte what the synchronous path gives) from object storage. Another tenant's export, an unknown id or a job that isn't an export: `404`. Downloading before `DONE`: `409 export-not-ready` (`currentStatus`).
 
 ---
 

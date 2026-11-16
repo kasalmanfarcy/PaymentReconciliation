@@ -2,7 +2,7 @@
 
 A payment reconciliation and exception resolution platform. ReconFlow compares a business's internal payment ledger against payment gateway settlements, surfaces the discrepancies, and tracks how each one was investigated and resolved.
 
-> **Project status: reconciliation engine done (M6).** On top of M2–M5 (profiles, error model, in-house JWT authentication, tenant resolution with PostgreSQL row-level security, a permission matrix, an append-only audit log, CSV ingestion through a PostgreSQL job queue with leases and fencing): a set-based matching engine in SQL that processes a run one anchor day per transaction with a resumable checkpoint, idempotent run requests (`Idempotency-Key` or a derived key, races settled by unique constraints), one active run per scope enforced by the database, exact matches and the five exception types created through the exceptions module in the same transaction, deduplicated across runs by a deterministic discrepancy key, retry of failed runs from their checkpoint, and APIs to request, follow and inspect runs. Exception workflow starts in M7. See [Roadmap](#roadmap).
+> **Project status: exception management done (M7).** On top of M2–M6 (profiles, error model, in-house JWT authentication, tenant resolution with PostgreSQL row-level security, a permission matrix, an append-only audit log, CSV ingestion through a PostgreSQL job queue, and a set-based matching engine that creates exception cases deduplicated by a deterministic discrepancy key): an exception workflow where investigators list, filter and open cases with both source records side by side, assign them, add append-only notes, and resolve them with a resolution code, and org admins reopen them with a reason. Every status change goes through one state machine that writes status history and an audit event in the same transaction; every update is guarded by optimistic locking (`ETag`/`If-Match`, `428` when missing, `409` when stale, proven by a two-writer race test); and admins can read any entity's audit timeline. Reporting starts in M8. See [Roadmap](#roadmap).
 
 ---
 
@@ -193,7 +193,7 @@ S3 API on `localhost:9000` and its console on `http://localhost:9001` (log in wi
 SPRING_PROFILES_ACTIVE=local,api,worker ./mvnw spring-boot:run
 ```
 
-Flyway applies `V1`–`V5` on first startup (`V5` is M6's engine support: summary columns, `exception_case_run`, `uuid_generate_v7()`, the reference index and the one-active-run-per-scope index). Hibernate runs in `validate` mode, so a mismatch between
+Flyway applies `V1`–`V6` on first startup (`V5` is M6's engine support: summary columns, `exception_case_run`, `uuid_generate_v7()`, the reference index and the one-active-run-per-scope index; `V6` makes exception notes and status history append-only with triggers). Hibernate runs in `validate` mode, so a mismatch between
 the entities and the schema fails the boot rather than silently altering it.
 
 | Profile | Kind | Effect |
@@ -274,6 +274,25 @@ Repeating the same request returns the same run (`200`); a fresh `Idempotency-Ke
 without duplicating active exception cases. The expected summary is in
 [docs/samples/README.md §1](docs/samples/README.md#1-ledger-basiccsv--gateway-basiccsv).
 
+Then work the PAY-103 case (ledger 750.00, gateway 700.00). Every update sends the `ETag` it last
+saw as `If-Match`; a stale one gets `409 stale-version`, a missing one `428`.
+
+```bash
+CASE=$(curl -s "localhost:8080/api/v1/exceptions?type=AMOUNT_MISMATCH" -H "Authorization: Bearer $TOKEN" \
+  | jq -r '.content[] | select(.reference=="PAY-103") | .id')
+curl -s -X PATCH localhost:8080/api/v1/exceptions/$CASE -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/merge-patch+json' -H 'If-Match: "0"' \
+  -d '{"status":"IN_REVIEW"}' | jq '{status, version}'
+curl -s localhost:8080/api/v1/exceptions/$CASE/notes -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"body":"Gateway confirms a 50 AED fee, ticket GW-8812"}'
+curl -s localhost:8080/api/v1/exceptions/$CASE/resolve -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H 'If-Match: "1"' -d '{"resolutionCode":"GATEWAY_FEE"}' \
+  | jq '{status, resolution, history}'
+```
+
+`{"assignedTo": "<user id>"}` (or `null`) in the same PATCH assigns the case. An org admin can then reopen it (`POST .../reopen` with `If-Match: "2"` and a `reason`) and read
+the whole trail with `GET /api/v1/audit-events?entityType=EXCEPTION_CASE&entityId=$CASE`.
+
 Access tokens last 15 minutes; the refresh token is an `HttpOnly` cookie scoped to `/api/v1/auth`.
 Users never sign up: an org admin creates them with a temporary password (`POST /api/v1/members`),
 which must be changed at first login. Design: [authentication.plan](plans/authentication.plan),
@@ -326,7 +345,7 @@ request.
 | M4 | Append-only audit | Done |
 | M5 | Transaction ingestion: CSV upload, job queue, validation | Done |
 | M6 | Reconciliation engine: matching, idempotent runs | Done |
-| M7 | Exception management: workflow, optimistic locking | Not started |
+| M7 | Exception management: workflow, optimistic locking | Done |
 | M8 | Reporting and export | Not started |
 | M9 | Reliability and performance | Not started |
 | M10 | Security hardening | Not started |
@@ -351,16 +370,20 @@ request.
 | `GET /api/v1/reconciliation-runs/{id}/matches` | A run's matches, both records side by side, paginated (`RUN_READ`) |
 | `POST /api/v1/reconciliation-runs/{id}/retry` | Resume a `FAILED` run from its checkpoint, with a reason (`RUN_CREATE`) |
 
+| `GET /api/v1/exceptions` | The work queue: filter by `type`, `status` (default `OPEN`, `IN_REVIEW`), `assignedTo` (`me`, `unassigned` or a user id), `runId`, `createdFrom`/`createdTo`, `amountMin`/`amountMax`; paginated (`EXCEPTION_READ`) |
+| `GET /api/v1/exceptions/{id}` | One case: both sides' records (raw and normalized), runs, notes, status history, `ETag` (`EXCEPTION_READ`) |
+| `PATCH /api/v1/exceptions/{id}` | Assign/unassign and move between `OPEN` and `IN_REVIEW`; `application/merge-patch+json`, `If-Match` required (`EXCEPTION_UPDATE`) |
+| `POST /api/v1/exceptions/{id}/notes` | Add an append-only investigation note (`EXCEPTION_UPDATE`) |
+| `POST /api/v1/exceptions/{id}/resolve` | Resolve with a resolution code (and a note where required), `If-Match` (`EXCEPTION_RESOLVE`) |
+| `POST /api/v1/exceptions/{id}/reopen` | Reopen a resolved case with a reason, `If-Match`, org admins only (`EXCEPTION_REOPEN`) |
+| `GET /api/v1/audit-events?entityType=&entityId=` | One entity's audit timeline (`AUDIT_READ`) |
+
 Permissions per endpoint: [api-design.md §8.1](docs/api-design.md#81-index) and §9.
 
 ### Planned API surface
 
 | Endpoint | Purpose |
 | -------- | ------- |
-| `GET /api/v1/exceptions` | List and filter exceptions |
-| `GET /api/v1/exceptions/{id}` | Exception detail with both source records |
-| `PATCH /api/v1/exceptions/{id}` | Assign or update an exception |
-| `POST /api/v1/exceptions/{id}/resolve` | Resolve with a reason |
 | `GET /api/v1/reports/reconciliation` | Summary metrics |
 
 Build order is ingestion → reconciliation → exceptions. Not every endpoint is required for the first working version.

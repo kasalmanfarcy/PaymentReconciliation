@@ -199,6 +199,8 @@ Exception cases are edited by several people, so every update is guarded by opti
   - Missing → `428 precondition-required`.
   - Doesn't match the current version → `409 stale-version`, with `currentVersion` in the body; the client re-reads and decides.
 - Adding a note (`POST /exceptions/{id}/notes`) doesn't change the case row, so it needs no `If-Match`, and two people adding notes at once both succeed.
+- `If-Match` must be exactly one strong ETag as received, `"3"`. `*` ("any version") would defeat the check, a weak `W/"3"` never matches under the strong comparison `If-Match` uses (RFC 9110 §13.1.1), and a list or an unquoted value is malformed: each is `400 validation-failed` (`errors[].code` `invalid-if-match`). `If-Match` is checked after authorization and body parsing (and, for resolve and reopen, Bean Validation of the body), before the case is loaded: a request for an unknown or foreign id without `If-Match` is `428`, which reveals nothing.
+- The server compares `If-Match` with the loaded version **explicitly** (the slow race: a stale page), and `@Version`'s `UPDATE … WHERE version = ?` catches two requests that pass that compare at once (the fast race). Both answer `409 stale-version` with the current version. A version changes on every write to the case row: assignment, status change, resolve, reopen; never on a note. A re-run of reconciliation that re-observes an active case links it to the run but doesn't change its row, so it never makes a client's `ETag` stale.
 
 Strict HTTP says a failed `If-Match` is `412 Precondition Failed`. The project uses `409` to follow TASKS.md M7.8 and to keep every "someone else changed this" response the same status; ADR 0007 records `412` as the rejected alternative.
 
@@ -265,7 +267,7 @@ Permissions are from [authentication.plan §5](../plans/authentication.plan), pl
 | `GET /reports/exception-ageing` | `REPORT_READ` | 200 | 400 | M8.3 |
 | `GET /reports/exceptions/export?runId=` | `REPORT_READ` + `EXCEPTION_READ` | 200 `text/csv` | 404 | M8.4 |
 
-All paths are under `/api/v1`. The detailed reference below covers the import (M5) and reconciliation-run (M6) endpoints; each later milestone adds its section here as its endpoints land, so this document grows with the API.
+All paths are under `/api/v1`. The detailed reference below covers the import (M5), reconciliation-run (M6), exception and audit-timeline (M7) endpoints; each later milestone adds its section here as its endpoints land, so this document grows with the API.
 
 ### 8.2 `POST /api/v1/imports`
 
@@ -516,7 +518,130 @@ The organization's runs, newest first (M6.17), served by `reconciliation_run_lis
 
 **Errors:** `400 validation-failed` (unknown sort field or direction, reversed range, bad enum or date).
 
-### 8.13 Notes for later sections
+### 8.13 `GET /api/v1/exceptions`
+
+The investigator's work queue (M7.6), newest first. Response: a page (§4) of:
+
+```json
+{ "id": "0193c0b4-…", "type": "AMOUNT_MISMATCH", "status": "IN_REVIEW", "reasonCode": null,
+  "reference": "PAY-103", "currency": "AED", "amount": "750.0000", "amountDifference": "-50.0000",
+  "assignedTo": { "id": "…", "displayName": "Ravi" }, "runId": "…", "version": 2,
+  "createdAt": "2026-11-16T09:12:45Z", "updatedAt": "2026-11-16T09:30:02Z" }
+```
+
+| Parameter | Notes |
+|---|---|
+| `type` | Repeatable; the five exception types |
+| `status` | Repeatable. **Default `OPEN` and `IN_REVIEW`**: resolved cases appear only when asked for |
+| `assignedTo` | A user id, `me` or `unassigned`. A user of another organization (or no user) matches nothing |
+| `runId` | Cases that run **observed** (`exception_case_run`), whether it raised them or re-observed them. Another organization's run matches nothing |
+| `createdFrom`, `createdTo` | `YYYY-MM-DD`, inclusive, UTC days; `createdTo ≥ createdFrom` |
+| `amountMin`, `amountMax` | Decimal strings, on `amount` (the amount at stake, §8.20), inclusive; `amountMax ≥ amountMin` |
+| `sort` | `createdAt` (default `desc`), `amount`, `status`, `type`, each `,asc` or `,desc` (ascending when omitted); repeatable; `id` breaks ties. Anything else is `400 validation-failed` (`unsupported-sort-field`) |
+| `page`, `size` | As §4; `size` is clamped to 200 |
+
+`reference` is the normalized reference from the discrepancy key (rules §6; a reference may contain `:`). **Errors:** `400 validation-failed` (bad enum, UUID, date, amount, reversed range, unknown sort field, an `assignedTo` that isn't a UUID, `me` or `unassigned`).
+
+### 8.14 `GET /api/v1/exceptions/{id}`
+
+Everything an investigator needs on one screen (M7.7), with **`ETag: "<version>"`**. `If-None-Match` with the current ETag answers `304`.
+
+```json
+{
+  "id": "0193c0b4-…", "type": "AMOUNT_MISMATCH", "status": "RESOLVED", "reasonCode": null,
+  "discrepancyKey": "AMOUNT_MISMATCH:PAY-103:PAYMENT:AED", "reference": "PAY-103",
+  "currency": "AED", "amount": "750.0000", "amountDifference": "-50.0000",
+  "assignedTo": { "id": "…", "displayName": "Ravi" },
+  "resolution": { "code": "GATEWAY_FEE", "note": null, "resolvedBy": { "id": "…", "displayName": "Ravi" },
+                  "resolvedAt": "2026-11-16T09:41:10Z" },
+  "runId": "…", "version": 3, "createdAt": "…", "updatedAt": "…",
+  "records": {
+    "ledger":  [ { "id": "…", "rawReference": " pay-103 ", "normalizedReference": "PAY-103", "amount": "750.0000",
+                   "currency": "AED", "transactionType": "PAYMENT", "status": "SUCCESS", "transactionDate": "2026-10-03",
+                   "transactionAt": null, "batchId": "…", "sourceRowNumber": 3, "duplicateInSource": false,
+                   "rawValues": { "reference": "pay-103", "amount": "750.00" } } ],
+    "gateway": [ { "…": "same shape" } ]
+  },
+  "runs":    [ { "runId": "…", "created": true, "observedAt": "…" } ],
+  "notes":   [ { "id": "…", "author": { "id": "…", "displayName": "Ravi" }, "body": "…", "createdAt": "…" } ],
+  "history": [ { "id": "…", "from": null, "to": "OPEN", "reason": null, "resolutionCode": null,
+                 "resolutionNote": null, "actor": null, "at": "…" } ]
+}
+```
+
+- `records` lists every linked record, ledger and gateway side by side, raw values next to normalized ones; a duplicate case may link many, across days and both sources. **Capped at 500 records** per case in v1 (no paging).
+- `resolution` is `null` unless the case is `RESOLVED`. Earlier resolutions are in `history`: the resolve row carries its code and note, and a reopen row carries the code and note it undid.
+- `notes` and `history` are complete, oldest first (`created_at`, then id). `actor` is `null` for the engine. Note bodies are returned as plain text exactly as written; a UI must escape them (XSS).
+- `runs` lists every run that observed the case; `created` marks the one that raised it.
+
+**Errors:** `404 not-found` (unknown, or another tenant's case: byte-identical).
+
+### 8.15 `PATCH /api/v1/exceptions/{id}`
+
+Assign/unassign, and move between `OPEN` and `IN_REVIEW` (M7.8). **`Content-Type: application/merge-patch+json`** (RFC 7396) only; a plain `application/json` PATCH is `415`, so a client never gets null-means-clear semantics by accident. **`If-Match` required** (§6).
+
+```http
+PATCH /api/v1/exceptions/0193c0b4-…
+Content-Type: application/merge-patch+json
+If-Match: "3"
+
+{ "assignedTo": "0193b9e2-…", "status": "IN_REVIEW" }
+```
+
+| Field | Meaning |
+|---|---|
+| `assignedTo` | A user id to assign, `null` to unassign; absent leaves it |
+| `status` | `IN_REVIEW` (from `OPEN`) or `OPEN` (from `IN_REVIEW`, needs `reason`) |
+| `reason` | Why the case goes back to `OPEN`; ≤ 1,000 characters |
+
+- The assignee must be an **active** member of this organization whose role grants `EXCEPTION_UPDATE` (an investigator or org admin); anything else, including a user of another organization or no user at all, is one `422 invalid-assignee` that never says which.
+- Assigning the current assignee changes nothing (no audit event, no new version), but `If-Match` must still match. Assigning and changing status in one patch is one new version.
+- A `RESOLVED` case can't be assigned, unassigned or moved: `409 invalid-transition` (reopen it first).
+
+**Response `200`:** the case as §8.14, with the new `ETag`. **Errors:** `400 validation-failed` (`{}`: `nothing-to-update`; an unknown field; a bad `assignedTo` or `status`; `status: RESOLVED`: `use-resolve-endpoint`, pointing at §8.17; a missing reason; a malformed `If-Match`), `404`, `409 stale-version` (`currentVersion`), `409 invalid-transition` (`currentStatus`, `allowedTransitions`), `415`, `422 invalid-assignee`, `428 precondition-required`.
+
+### 8.16 `POST /api/v1/exceptions/{id}/notes`
+
+Add an investigation note (M7.9). `{ "body": "Gateway support confirms a 50 AED fee. Ticket GW-8812." }`: required, not blank, ≤ 4,000 characters, stored exactly as sent. Allowed in **any** status, including `RESOLVED`.
+
+**No `If-Match`, no new version** (§6). **Response `201 Created`** with `Location: /api/v1/exceptions/{id}/notes/{noteId}` and the note (shape as in §8.14). Notes are read through the case's detail; there is no separate note resource to `GET` in v1. Notes are append-only: there is no edit or delete, and the database rejects both (V6). **Errors:** `400 validation-failed`, `404`.
+
+### 8.17 `POST /api/v1/exceptions/{id}/resolve`
+
+Close the case (M7.10). **`If-Match` required.** `{ "resolutionCode": "GATEWAY_FEE", "note": "50 AED fee, confirmed in GW-8812" }`.
+
+- `resolutionCode` is required and one of [reconciliation-rules.md §5.3](reconciliation-rules.md#53-resolution-codes); `DATA_ENTRY_ERROR`, `DUPLICATE_CONFIRMED`, `WRITTEN_OFF`, `FALSE_POSITIVE` and `OTHER` also need a non-blank `note` (≤ 4,000 characters). A blank note on another code is stored as no note.
+- Allowed from `OPEN` and `IN_REVIEW`. Any user with `EXCEPTION_RESOLVE` may resolve, assignee or not (v1). Resolving doesn't unassign.
+- An action endpoint, not `PATCH {status: RESOLVED}`: resolving has its own permission, inputs and audit event.
+
+**Response `200`:** the case with its new `ETag`. **Errors:** `400 validation-failed` (`resolutionCode`: `required` / `unknown-resolution-code`; `note`: `required-for-code` / `size`), `404`, `409 stale-version`, `409 invalid-transition` (already `RESOLVED`; `allowedTransitions: ["REOPEN"]`), `428`.
+
+### 8.18 `POST /api/v1/exceptions/{id}/reopen`
+
+Reopen a resolved case (M7.11), org admins only. **`If-Match` required.** `{ "reason": "Fee schedule shows 25 AED, not 50." }`, required, not blank, ≤ 1,000 characters.
+
+The case goes back to `OPEN`; its resolution fields are cleared and survive in its history (the reopen row carries the code and note it undid, and the reason). The assignee is kept.
+
+**Response `200`:** the case with its new `ETag`. **Errors:** `400 validation-failed` (no reason), `404`, `409 stale-version`, `409 invalid-transition` (not `RESOLVED`), `409 active-case-exists` (a later run opened a new case for the same discrepancy, rule K4; `existingCaseId` names it; also when that run commits between the pre-check and the update, through the unique index), `428`.
+
+### 8.19 `GET /api/v1/audit-events?entityType=&entityId=`
+
+One entity's audit timeline (M7.13), for `AUDIT_READ`. Both parameters are required: `entityType` is one of `USER`, `MEMBERSHIP`, `ORGANIZATION`, `REFRESH_TOKEN_FAMILY`, `IMPORT_BATCH`, `RECONCILIATION_RUN`, `EXCEPTION_CASE`; `entityId` a UUID. A page (§4, `page`/`size`), oldest first:
+
+```json
+{ "id": "…", "action": "EXCEPTION_RESOLVED", "actorId": "0193b9e2-…",
+  "payload": { "from": "IN_REVIEW", "to": "RESOLVED", "resolutionCode": "GATEWAY_FEE", "version": 3 },
+  "requestId": "4f1c2a9e8b7d4c3a", "at": "2026-11-16T09:41:10Z" }
+```
+
+- `actorId` is `null` for system actions (the engine, workers). Ids only, no display names: the audit module depends on `shared` alone, and `security` depends on `audit`, so a name lookup would be a module cycle.
+- `requestId` links the event to the logs of the request that caused it.
+- An exception case's timeline holds every action on it, notes and assignments included (all recorded with `entityType` `EXCEPTION_CASE`).
+- Another organization's entity has an **empty** timeline (the organization filter and RLS), the same answer as an unknown id: a `404` would need a lookup in a table the audit module doesn't own. There is no unfiltered "list all events" in v1.
+
+**Errors:** `400 validation-failed` (missing or invalid parameter).
+
+### 8.20 Notes for later sections
 
 Decisions already made that the later endpoint sections must reflect:
 

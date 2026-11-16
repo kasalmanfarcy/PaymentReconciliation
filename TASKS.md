@@ -211,28 +211,28 @@ Built early so later milestones emit events as they go, instead of retrofitting 
 ## M7 — Exception management
 
 ### Data model
-- [ ] **M7.1** Write a migration and entity for `exception_case`: org, run, type, reason code, status, linked records, `assigned_to`, resolution code, resolution note, `@Version`, and timestamps.
-- [ ] **M7.2** Write a migration and entity for `exception_note`, as an append-only investigation history.
-- [ ] **M7.3** Add a partial unique index so the same discrepancy has only one *active* case, e.g. `WHERE status <> 'RESOLVED'`.
-- [ ] **M7.4** Keep resolution history: reopening creates a history entry and never overwrites the previous resolution.
+- [x] **M7.1** Write a migration and entity for `exception_case`: org, run, type, reason code, status, linked records, `assigned_to`, resolution code, resolution note, `@Version`, and timestamps.
+- [x] **M7.2** Write a migration and entity for `exception_note`, as an append-only investigation history.
+- [x] **M7.3** Add a partial unique index so the same discrepancy has only one *active* case, e.g. `WHERE status <> 'RESOLVED'`.
+- [x] **M7.4** Keep resolution history: reopening creates a history entry and never overwrites the previous resolution.
 
 ### Workflow
-- [ ] **M7.5** Status transitions `OPEN → IN_REVIEW → RESOLVED`, plus `RESOLVED → OPEN` (reopen), enforced centrally with the permissions from M1.7.
-- [ ] **M7.6** `GET /api/v1/exceptions` with filters for type, status, assignee, run, date and amount range, paginated.
-- [ ] **M7.7** `GET /api/v1/exceptions/{id}`, including both source records side by side, notes and history.
-- [ ] **M7.8** `PATCH /api/v1/exceptions/{id}` to assign it or move it to `IN_REVIEW`. Requires `If-Match` or a version, and returns `409` on a stale version.
-- [ ] **M7.9** `POST /api/v1/exceptions/{id}/notes` to add an investigation note.
-- [ ] **M7.10** `POST /api/v1/exceptions/{id}/resolve` with a required resolution code and reason.
-- [ ] **M7.11** `POST /api/v1/exceptions/{id}/reopen` with a required reason, limited to authorized roles.
-- [ ] **M7.12** Emit an audit event for every assignment, status change, note, resolution and reopen.
-- [ ] **M7.13** `GET /api/v1/audit-events?entityType=&entityId=` for the timeline of a single entity.
+- [x] **M7.5** Status transitions `OPEN → IN_REVIEW → RESOLVED`, plus `RESOLVED → OPEN` (reopen), enforced centrally with the permissions from M1.7.
+- [x] **M7.6** `GET /api/v1/exceptions` with filters for type, status, assignee, run, date and amount range, paginated.
+- [x] **M7.7** `GET /api/v1/exceptions/{id}`, including both source records side by side, notes and history.
+- [x] **M7.8** `PATCH /api/v1/exceptions/{id}` to assign it or move it to `IN_REVIEW`. Requires `If-Match` or a version, and returns `409` on a stale version.
+- [x] **M7.9** `POST /api/v1/exceptions/{id}/notes` to add an investigation note.
+- [x] **M7.10** `POST /api/v1/exceptions/{id}/resolve` with a required resolution code and reason.
+- [x] **M7.11** `POST /api/v1/exceptions/{id}/reopen` with a required reason, limited to authorized roles.
+- [x] **M7.12** Emit an audit event for every assignment, status change, note, resolution and reopen.
+- [x] **M7.13** `GET /api/v1/audit-events?entityType=&entityId=` for the timeline of a single entity.
 
 ### Tests
-- [ ] **M7.14** Concurrency test: two simultaneous resolves give one success and one `409`, with no silent overwrite.
-- [ ] **M7.15** Invalid transitions (e.g. resolving an `OPEN` case without a reason, or resolving an already `RESOLVED` case) are rejected.
-- [ ] **M7.16** Each role can only perform the transitions it's allowed.
-- [ ] **M7.17** After a reopen, the earlier resolution is still visible in the history.
-- [ ] **M7.18** Add the cross-tenant tests for every exception endpoint.
+- [x] **M7.14** Concurrency test: two simultaneous resolves give one success and one `409`, with no silent overwrite.
+- [x] **M7.15** Invalid transitions (e.g. resolving an `OPEN` case without a reason, or resolving an already `RESOLVED` case) are rejected.
+- [x] **M7.16** Each role can only perform the transitions it's allowed.
+- [x] **M7.17** After a reopen, the earlier resolution is still visible in the history.
+- [x] **M7.18** Add the cross-tenant tests for every exception endpoint.
 
 **Exit criteria:** a finance user can take an exception from `OPEN` to `RESOLVED` with a full audit trail, and concurrent edits are detected.
 

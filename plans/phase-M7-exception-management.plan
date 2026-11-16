@@ -1,6 +1,6 @@
 # Phase M7 — Exception Management
 
-**Status:** Not started · **Tasks:** TASKS.md M7.1–M7.18 · **Depends on:** M3 (tenant context, permissions), M4 (audit), M6 (exception cases created by `DiscrepancyRecorder`) · **Date:** 2026-11-01
+**Status:** Done (2026-11-16; as-built notes in §9) · **Tasks:** TASKS.md M7.1–M7.18 · **Depends on:** M3 (tenant context, permissions), M4 (audit), M6 (exception cases created by `DiscrepancyRecorder`) · **Date:** 2026-11-01
 
 M6 finds discrepancies. This phase lets people **work** them: look at both sides, assign an owner, write investigation notes, resolve with a reason, and reopen when a resolution turns out to be wrong. It answers the fourth of the README's questions: *who investigated it, and how was it resolved?*
 
@@ -1046,20 +1046,20 @@ Every test creates its own organization (M3 convention). No `TRUNCATE`, no `@Tra
 
 ## 6. Exit criteria checklist
 
-- [ ] Migration with append-only triggers on `exception_note` and `exception_status_history` applied; trigger test passes.
-- [ ] `ExceptionCase` entity with `@Version`; no public setters; `ddl-auto: validate` passes.
-- [ ] `ExceptionStateMachine` is the only code that changes `status` (grep: `moveTo(` appears only there).
-- [ ] `GET /exceptions` with every filter, paginated, default `OPEN,IN_REVIEW`; `EXPLAIN` checked for the four main shapes.
-- [ ] `GET /exceptions/{id}` shows both sides, notes, history, runs, and returns `ETag`.
-- [ ] `PATCH`, `/resolve`, `/reopen` require `If-Match`: `428` when missing, `409 stale-version` when stale.
-- [ ] Notes: `201`, any status, no version bump.
-- [ ] Reopen: admin-only, reason required, previous resolution kept in history, `409 active-case-exists` on collision.
-- [ ] Audit event for every action, same transaction; rollback test passes.
-- [ ] `GET /audit-events?entityType=&entityId=` for `AUDIT_READ`.
-- [ ] Concurrency test (both variants) passes reliably.
-- [ ] Role matrix and cross-tenant suites cover every endpoint in this phase.
-- [ ] `docs/api-design.md` updated: endpoints, merge-patch, `ETag`/`If-Match` rules, error codes, record cap on detail.
-- [ ] `docs/reconciliation-rules.md` updated: resolution codes, note rules, re-raise-after-resolve behaviour, reopen collision rule.
+- [x] Migration with append-only triggers on `exception_note` and `exception_status_history` applied; trigger test passes.
+- [x] `ExceptionCase` entity with `@Version`; no public setters; `ddl-auto: validate` passes.
+- [x] `ExceptionStateMachine` is the only code that changes `status` (grep: `moveTo(` appears only there).
+- [x] `GET /exceptions` with every filter, paginated, default `OPEN,IN_REVIEW`; `EXPLAIN` checked for the four main shapes.
+- [x] `GET /exceptions/{id}` shows both sides, notes, history, runs, and returns `ETag`.
+- [x] `PATCH`, `/resolve`, `/reopen` require `If-Match`: `428` when missing, `409 stale-version` when stale.
+- [x] Notes: `201`, any status, no version bump.
+- [x] Reopen: admin-only, reason required, previous resolution kept in history, `409 active-case-exists` on collision.
+- [x] Audit event for every action, same transaction; rollback test passes.
+- [x] `GET /audit-events?entityType=&entityId=` for `AUDIT_READ`.
+- [x] Concurrency test (both variants) passes reliably.
+- [x] Role matrix and cross-tenant suites cover every endpoint in this phase.
+- [x] `docs/api-design.md` updated: endpoints, merge-patch, `ETag`/`If-Match` rules, error codes, record cap on detail.
+- [x] `docs/reconciliation-rules.md` updated: resolution codes, note rules, re-raise-after-resolve behaviour, reopen collision rule.
 
 Verification:
 
@@ -1123,3 +1123,35 @@ Every query filters by the caller's organization ID, PostgreSQL row-level securi
 | Asserting only HTTP status in concurrency tests | A silent overwrite with correct status codes passes | Assert the database state too |
 | Concatenating the `sort` parameter into SQL | SQL injection | Whitelist map from API name to column |
 | `TRUNCATE` in test cleanup | Triggers raise; tests depend on order | Fresh organization per test |
+
+---
+
+## 9. As built: where the code differs from this plan, and why
+
+docs/ win over this plan wherever they disagree (api-design.md §3.1, §4, §6, reconciliation-rules.md §5.3, §6, §7.3, ADR 0007). Choices made while building M7:
+
+| Plan said | Built | Why |
+|---|---|---|
+| List filter `assignee` | `assignedTo` (a user id, `me` or `unassigned`); amounts `amountMin`/`amountMax`, dates `createdFrom`/`createdTo` | api-design.md §4 names filters after the response field, with `<field>Min/Max` and `<field>From/To` suffixes |
+| Package `internal/{api,application,domain,persistence}`; `ExceptionStateMachine` maybe in `application` | `internal/{api,application,domain}`; the state machine, entities and repositories in `domain` | The plan's own "simplest working answer": the entity's mutators stay package-private, so the compiler enforces one owner; repositories sit next to the entities as in `reconciliation.domain` |
+| `ExceptionAssignments` changes the assignee | The state machine's `assign` changes and audits it; `ExceptionAssignments` only validates membership through the directory | One class mutates a case, so one ArchUnit rule (`onlyTheExceptionStateMachineChangesACase`, like RunLifecycle's) covers status *and* assignee |
+| `currentUser.hasPermission(...)` | `TenantContext.has(...)` | The existing seam; `CurrentUser` carries identity only |
+| `UserDirectory` "or whatever M3 exposes" | New `security.directory.UserDirectory` (`isActiveMemberWith`, `displayNames`), the named interface Modulith already allowed | M3 had declared the package but nothing in it. Assignees must also be **active** users: a disabled user can't be given work |
+| If-Match: accept `W/"3"` or reject, decide | Strong `"3"` only; `W/`, `*`, lists and unquoted values are `400` (`invalid-if-match`) | RFC 9110: `If-Match` uses strong comparison, so a weak tag can never match; `*` defeats the check |
+| Merge patch: decide whether `application/json` is accepted | `application/merge-patch+json` only; `application/json` is `415` | A client must opt in to null-means-clear semantics. Unknown fields and `{}` are `400`; `reason` without `status` is ignored |
+| `PATCH {status: OPEN}` on a RESOLVED case | `409 invalid-transition` with a hint to `/reopen` | Rules §7: anything not allowed is `409`; the PATCH path covers OPEN ↔ IN_REVIEW only |
+| `@Transactional` command methods; map `ObjectOptimisticLockingFailureException` in the advice | `TransactionTemplate` in `ExceptionCommands`; the fast-race failure is caught outside and answered `409 stale-version` **with** `currentVersion` from a new transaction | The aborted transaction can't be queried; the explicit compare and the `@Version` race now give the same body |
+| Reopen collision lookup "in the advice, in a new transaction" | In `ExceptionCommands.reopen`, in a new transaction, then `ActiveCaseExistsException(existingCaseId)` | Same effect, kept next to the code that knows the key; the pre-check skips non-RESOLVED cases (they would find themselves) |
+| Note response | `201` with the note read back after commit | `created_at` is the database's `now()`; refreshing an `@Immutable` entity isn't allowed |
+| Audit timeline: actor resolved to a display name or "system" | `actorId` (null for the system), no names | `audit` may depend on `shared` only, and `security → audit` exists, so a directory lookup would be a cycle (architecture.md §4) |
+| Audit payloads per table §M7.12 | As planned, plus `from`/`to` on every status event and `version` (the version produced) on every versioned change, including assignments | AuditEntry's payload rule: "what changed, why, and the entity's version after the change" |
+| Fault hook "the same mechanism M9.4 uses" | `ExceptionWriteHook` (no-op in production, `@Primary` armable bean in tests) with `afterVersionCheck` and `beforeCommit` | The pattern M5/M6 already use (`ImportProcessingHook`, `RunChunkHook`); serves both the barrier (M7.14) and the forced rollback (M7.12) |
+| Partial index for `assignee=unassigned` "if EXPLAIN shows it's needed" | Not added, no `V7` | `ExceptionListQueryPlanIT` (120,000 cases, four tenants): V1's indexes serve all four shapes; plans recorded in database-design.md §3.5 |
+| Detail reads `transaction_record` | One read-only join in `ExceptionQueries`, documented in architecture.md §4 | `exceptions` may not depend on `ledger`; same trade as the engine and transaction search |
+| Cross-tenant cases need `If-Match` and a merge-patch body | `CrossTenantCase` gained a `headers` component (old constructor kept); `TenantFixture` gained an open and a resolved case of org B, and its snapshot covers cases, notes, history and audit counts | Without `If-Match` every write would stop at `428` before the tenant check; the 422 assignee case and byte-identical 404s are in `ExceptionCrossTenantIT` |
+| `GET /audit-events` returns 400 without both parameters | As planned; `entityType` binds to `AuditEntityType`, so it is a whitelist | — |
+
+Tests added: `ExceptionStateMachineTest` (12 status × transition cells, 16 role × transition pairs, reason rules), `ExceptionStatusHistoryTest`, `DiscrepancyKeyTest` (reference parsing), `ExceptionCaseRepositoryIT`, `ExceptionHistoryAppendOnlyIT`, `ExceptionDetailIT`, `ExceptionListIT`, `ExceptionListQueryPlanIT`, `ExceptionPatchIT`, `ExceptionNoteIT`, `ExceptionResolveIT`, `ExceptionReopenIT`, `ExceptionActiveCaseIT` (including a reopen racing an uncommitted run insert, stopped by the index), `ExceptionAuditIT`, `AuditTimelineIT`, `ExceptionConcurrencyIT` (slow race, barrier-forced fast race, assign vs resolve, a 20× smoke test), `ExceptionInvalidTransitionIT`, `ExceptionRoleMatrixIT` (hard-coded matrix, platform admin 404), `ResolutionHistoryIT`, `ExceptionCrossTenantIT`; plus exception rows in `AuthorizationMatrixIT` and the shared cross-tenant registry.
+
+Not built, deliberately: "only the assignee may resolve" (a possible later rule, rules §5.3); auto-resolving cases that no longer reproduce (v2); keyset pagination for the queue; a `GET` for a single note.
+

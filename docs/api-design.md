@@ -486,6 +486,23 @@ A run's status, progress and, once `COMPLETED`, its summary (M6.15). Cheap to po
 
 **Errors:** `404 not-found`.
 
+### 8.11 `GET /api/v1/reconciliation-runs/{id}/matches`
+
+The run's matches, paginated (§4: `page`, `size` default 50, clamped to 200), sorted by the ledger record's normalized reference, then the match id. One query joins both records on `(id, transaction_date)`, so each lookup prunes to one partition.
+
+```json
+{
+  "content": [
+    { "id": "0193c0a2-…", "matchType": "EXACT", "currency": "AED", "amountDifference": "0.0000",
+      "ledger":  { "id": "…", "reference": " pay-106 ", "normalizedReference": "PAY-106", "amount": "120.5000", "transactionDate": "2026-10-01" },
+      "gateway": { "id": "…", "reference": "PAY-106",   "normalizedReference": "PAY-106", "amount": "120.5000", "transactionDate": "2026-10-01" } }
+  ],
+  "page": { "number": 0, "size": 50, "totalElements": 3, "totalPages": 1 }
+}
+```
+
+`reference` is the raw reference exactly as in the file; `normalizedReference` is what was matched on. **Errors:** `404 not-found` for an unknown run or another tenant's (the run is checked first, so it is never an empty page).
+
 ### 8.13 Notes for later sections
 
 Decisions already made that the later endpoint sections must reflect:

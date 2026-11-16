@@ -36,6 +36,13 @@ class ReconciliationCrossTenantCases implements CrossTenantCases {
                         f -> Map.of("id", f.orgBRun()),
                         null,
                         NOT_FOUND),
+                new CrossTenantCase(
+                        "read org B's run matches",
+                        HttpMethod.GET,
+                        "/api/v1/reconciliation-runs/{id}/matches",
+                        f -> Map.of("id", f.orgBRun()),
+                        null,
+                        NOT_FOUND),
                 // Org B's failed run must stay FAILED, its job count unchanged (the snapshot).
                 new CrossTenantCase(
                         "retry org B's failed run",

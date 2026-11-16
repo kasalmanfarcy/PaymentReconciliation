@@ -98,6 +98,10 @@ class AuthorizationMatrixIT extends AbstractIntegrationTest {
                 Permission.RUN_READ,
                 target -> get("/api/v1/reconciliation-runs/" + target.runId())),
         new Endpoint(
+                "GET /reconciliation-runs/{id}/matches",
+                Permission.RUN_READ,
+                target -> get("/api/v1/reconciliation-runs/" + target.runId() + "/matches")),
+        new Endpoint(
                 "POST /reconciliation-runs/{id}/retry",
                 Permission.RUN_CREATE,
                 target -> post("/api/v1/reconciliation-runs/" + target.runId() + "/retry")

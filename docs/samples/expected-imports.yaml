@@ -1,0 +1,117 @@
+# The import outcome of every sample file, transcribed from README.md in this folder (§1–§6).
+# ImportSamplesIT (TASKS.md M5.22) uploads each file into a fresh organization, runs the import and
+# compares the result with this table; it also fails if a .csv here has no entry. When you add a
+# sample, add its expectations here and its explanation to README.md. README.md stays the
+# human-readable source of truth: if the two disagree, fix this file.
+#
+# Keys per file:
+#   sourceType           how it is uploaded
+#   rejected             synchronous upload rejection (no batch is created): status, code, missingColumns
+#   status, totalRows, validRows, errorRows      the batch after processing
+#   errors               every stored row error: row, column (null = whole row), code
+#   duplicates           source_row_numbers flagged is_duplicate_in_source (rule D1)
+#   records              selected rows: expected normalized (and raw) values by source_row_number
+#   sameRecordsAs        another sample whose normalized records must be identical, row for row
+#   rawValueKeys         header keys kept in raw_values (rule N11), checked on row 1
+# Dates are quoted so the YAML parser keeps them as strings.
+
+ledger-basic.csv:
+  sourceType: INTERNAL_LEDGER
+  status: COMPLETED
+  totalRows: 7
+  validRows: 7
+  errorRows: 0
+  errors: []
+  duplicates: []
+  records:
+    1: {normalizedReference: PAY-101, amount: "1000.0000", currency: AED, status: SUCCESS, transactionType: PAYMENT, transactionDate: "2026-10-01"}
+    6: {rawReference: " pay-106 ", normalizedReference: PAY-106, amount: "120.5000", currency: AED, transactionDate: "2026-10-02"}
+    7: {normalizedReference: PAY-107, status: FAILED}
+
+gateway-basic.csv:
+  sourceType: GATEWAY
+  status: COMPLETED
+  totalRows: 7
+  validRows: 7
+  errorRows: 0
+  errors: []
+  duplicates: [3, 4]
+  records:
+    1: {normalizedReference: PAY-101, amount: "1000.0000", currency: AED, status: SUCCESS, transactionType: PAYMENT, transactionDate: "2026-10-01"}
+    5: {normalizedReference: PAY-105, amount: "300.0000", status: SUCCESS}
+  rawValueKeys: [merchant_reference, amount, currency, status, transaction_at, gateway_transaction_id]
+
+ledger-bom-crlf.csv:
+  sourceType: INTERNAL_LEDGER
+  status: COMPLETED
+  totalRows: 7
+  validRows: 7
+  errorRows: 0
+  errors: []
+  duplicates: []
+  sameRecordsAs: ledger-basic.csv
+  rawValueKeys: [Transaction_At, AMOUNT, " Reference ", currency, Status, TRANSACTION_TYPE]
+
+ledger-currency-mismatch.csv:
+  sourceType: INTERNAL_LEDGER
+  status: COMPLETED
+  totalRows: 2
+  validRows: 2
+  errorRows: 0
+  errors: []
+  duplicates: []
+  records:
+    1: {normalizedReference: PAY-201, currency: AED, transactionType: PAYMENT, transactionDate: "2026-10-03"}
+    2: {normalizedReference: PAY-202, transactionDate: "2026-10-03"}
+
+gateway-currency-mismatch.csv:
+  sourceType: GATEWAY
+  status: COMPLETED
+  totalRows: 3
+  validRows: 3
+  errorRows: 0
+  errors: []
+  duplicates: []
+  records:
+    1: {normalizedReference: PAY-201, amount: "108.9200", currency: USD, transactionDate: "2026-10-03"}
+    2: {normalizedReference: PAY-202, currency: AED, transactionDate: "2026-10-03"}
+    3: {normalizedReference: PAY-203, currency: USD}
+
+gateway-duplicates.csv:
+  sourceType: GATEWAY
+  status: COMPLETED
+  totalRows: 6
+  validRows: 6
+  errorRows: 0
+  errors: []
+  duplicates: [1, 2, 3]
+  records:
+    4: {normalizedReference: PAY-302, amount: "60.0000"}
+    5: {normalizedReference: PAY-302, amount: "65.0000"}
+
+ledger-malformed.csv:
+  sourceType: INTERNAL_LEDGER
+  status: COMPLETED_WITH_ERRORS
+  totalRows: 9
+  validRows: 1
+  errorRows: 8
+  errors:
+    - {row: 2, column: amount, code: INVALID_AMOUNT}
+    - {row: 3, column: amount, code: AMOUNT_SCALE_EXCEEDED}
+    - {row: 4, column: amount, code: AMOUNT_NOT_POSITIVE}
+    - {row: 5, column: currency, code: INVALID_CURRENCY}
+    - {row: 6, column: transaction_date, code: INVALID_DATE}
+    - {row: 7, column: status, code: UNKNOWN_STATUS}
+    - {row: 8, column: reference, code: MISSING_REQUIRED_FIELD}
+    - {row: 9, column: null, code: MALFORMED_ROW}
+  duplicates: []
+  records:
+    1: {normalizedReference: PAY-401, amount: "100.0000", transactionDate: "2026-10-05"}
+
+gateway-wrong-headers.csv:
+  sourceType: GATEWAY
+  rejected: {status: 400, code: missing-columns, missingColumns: [merchant_reference, amount, currency]}
+
+ledger-header-only.csv:
+  sourceType: INTERNAL_LEDGER
+  rejected: {status: 400, code: empty-file}

@@ -6,6 +6,8 @@ Small, hand-checkable files covering every import and engine scenario. They are 
 
 These expected outcomes were written from the rules **before** any engine code existed. If the engine and this file disagree, find out which one breaks a rule in reconciliation-rules.md; don't just copy what the code does.
 
+**Machine-checked.** [expected-imports.yaml](expected-imports.yaml) transcribes the import outcomes below (status, counts, every row error, duplicate flags, selected normalized values). `ImportSamplesIT` (M5.22) imports every `.csv` here into a fresh organization and compares; it also fails if a sample has no entry. When you add a sample, add its section here and its entry there.
+
 **Do not reformat these files.** `.gitattributes` marks them `-text` so Git keeps their bytes exactly (the BOM, the CRLF line endings, the spaces around ` pay-106 `), and `.editorconfig` turns off whitespace trimming for them.
 
 ---

@@ -67,7 +67,7 @@ public class JobRunner {
     }
 
     /** {@code host:pid:<slot>}: exactly which worker holds a job, as stored in {@code locked_by}. */
-    String workerId(String slot) {
+    public String workerId(String slot) {
         return node + ":" + slot;
     }
 
@@ -92,12 +92,17 @@ public class JobRunner {
         return ran;
     }
 
-    Optional<Job> claim(String workerId, @Nullable Collection<UUID> organizations) {
+    /**
+     * Claims the oldest runnable job for {@code workerId}, optionally only among some organizations
+     * (tests share one database). The worker calls this per free slot; tests call it to play two
+     * workers at once (a zombie and its successor).
+     */
+    public Optional<Job> claim(String workerId, @Nullable Collection<UUID> organizations) {
         return store.claim(workerId, props.lease(), props.perOrgMaxRunning(), organizations);
     }
 
     /** Runs one claimed job to an outcome: DONE, re-queued with backoff, FAILED, released, or abandoned. */
-    void execute(Job job) {
+    public void execute(Job job) {
         if (TransactionSynchronizationManager.isActualTransactionActive()) {
             throw new IllegalStateException("Jobs run outside any transaction; each chunk opens its own");
         }

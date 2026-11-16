@@ -31,6 +31,9 @@ public interface ImportBatchRepository extends Repository<ImportBatch, UUID> {
     @Query("select b from ImportBatch b where b.id = :id and b.organizationId = :organizationId")
     Optional<ImportBatch> lockByIdAndOrganizationId(@Param("id") UUID id, @Param("organizationId") UUID organizationId);
 
+    /** For the orphan sweeper: is any batch of this organization still pointing at the object? */
+    boolean existsByOrganizationIdAndStorageKey(UUID organizationId, String storageKey);
+
     /** The duplicate-file fast path (M5.9), served by import_batch_content_uk. */
     Optional<ImportBatch> findByOrganizationIdAndSourceTypeAndContentHash(
             UUID organizationId, SourceType sourceType, String contentHash);

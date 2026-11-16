@@ -8,7 +8,9 @@ import org.springframework.validation.annotation.Validated;
  * Object storage settings ({@code reconflow.storage.*}), bound from the {@code S3_*} environment
  * variables. A typed record instead of scattered {@code @Value} strings: one place to see every
  * setting, and {@link Validated} fails startup on a blank region or bucket rather than on the
- * first upload. Endpoint and keys may be blank until FileStorage needs them (M5).
+ * first upload. A blank endpoint means AWS's own S3 endpoints (otherwise path-style requests to
+ * the endpoint, as MinIO needs); blank keys mean the SDK's default credential chain (an IAM role in
+ * production) instead of static keys. Used by ingestion's S3 FileStorage (M5.8).
  */
 @Validated
 @ConfigurationProperties("reconflow.storage")

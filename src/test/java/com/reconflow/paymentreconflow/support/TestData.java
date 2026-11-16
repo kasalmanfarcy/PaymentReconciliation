@@ -79,6 +79,27 @@ public final class TestData {
         jdbc.update("update app_user set status = ? where id = ?", status, userId);
     }
 
+    /**
+     * An import batch row in the given status, written with SQL (no file, no job): enough for a
+     * transaction record's foreign key or a read-API test.
+     */
+    public UUID newImportBatch(UUID organizationId, UUID uploadedBy, String sourceType, String status) {
+        UUID id = Ids.newId();
+        jdbc.update(
+                "insert into import_batch (id, organization_id, source_type, status, file_name, file_size_bytes,"
+                        + " content_hash, storage_key, uploaded_by) values (?, ?, ?, ?, ?, 1, ?, ?, ?)",
+                id,
+                organizationId,
+                sourceType,
+                status,
+                "fixture-" + id + ".csv",
+                String.format("%064x", new java.math.BigInteger(1, id.toString().getBytes()))
+                        .substring(0, 64),
+                organizationId + "/imports/" + id + "/original.csv",
+                uploadedBy);
+        return id;
+    }
+
     public void suspendOrganization(UUID organizationId) {
         jdbc.update("update organization set status = 'SUSPENDED' where id = ?", organizationId);
     }

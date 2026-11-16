@@ -13,6 +13,8 @@ import com.reconflow.paymentreconflow.exceptions.internal.application.IfMatch;
 import com.reconflow.paymentreconflow.exceptions.internal.domain.ExceptionStatus;
 import com.reconflow.paymentreconflow.shared.context.Permission;
 import com.reconflow.paymentreconflow.shared.context.RequiresPermission;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import io.swagger.v3.oas.annotations.responses.ApiResponses;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
@@ -64,6 +66,10 @@ class ExceptionController {
      * {@code amountMin}/{@code amountMax} are decimal strings.
      */
     @GetMapping
+    @ApiResponses({
+        @ApiResponse(responseCode = "200", description = "A page of cases"),
+        @ApiResponse(responseCode = "400", description = "validation-failed or a bad parameter")
+    })
     @RequiresPermission(Permission.EXCEPTION_READ)
     PagedModel<ExceptionSummaryView> list(
             @RequestParam(required = false) @Nullable List<ExceptionType> type,
@@ -87,6 +93,10 @@ class ExceptionController {
      * it back in {@code If-Match} (ADR 0007).
      */
     @GetMapping("/{id}")
+    @ApiResponses({
+        @ApiResponse(responseCode = "200", description = "The case, with its ETag"),
+        @ApiResponse(responseCode = "404", description = "not found (or another tenant's id)")
+    })
     @RequiresPermission(Permission.EXCEPTION_READ)
     ResponseEntity<ExceptionDetailView> get(@PathVariable UUID id) {
         return withETag(queries.detail(id));
@@ -101,6 +111,16 @@ class ExceptionController {
      * <p>If-Match is parsed before the body is applied: missing is 428, malformed 400.
      */
     @PatchMapping(path = "/{id}", consumes = MERGE_PATCH_JSON)
+    @ApiResponses({
+        @ApiResponse(responseCode = "200", description = "The updated case, with its new ETag"),
+        @ApiResponse(responseCode = "400", description = "validation-failed or a bad parameter"),
+        @ApiResponse(responseCode = "404", description = "not found (or another tenant's id)"),
+        @ApiResponse(
+                responseCode = "409",
+                description = "conflict: the code in the problem detail says which (api-design.md §3.1)"),
+        @ApiResponse(responseCode = "422", description = "unprocessable: see the code in the problem detail"),
+        @ApiResponse(responseCode = "428", description = "If-Match header missing")
+    })
     @RequiresPermission(Permission.EXCEPTION_UPDATE)
     ResponseEntity<ExceptionDetailView> patch(
             @PathVariable UUID id,
@@ -119,6 +139,11 @@ class ExceptionController {
      * doesn't change). The Location names the note; notes are read through the case's detail view.
      */
     @PostMapping("/{id}/notes")
+    @ApiResponses({
+        @ApiResponse(responseCode = "201", description = "The note"),
+        @ApiResponse(responseCode = "400", description = "validation-failed or a bad parameter"),
+        @ApiResponse(responseCode = "404", description = "not found (or another tenant's id)")
+    })
     @RequiresPermission(Permission.EXCEPTION_UPDATE)
     ResponseEntity<NoteView> addNote(@PathVariable UUID id, @Valid @RequestBody NoteRequest request) {
         NoteView note = queries.note(id, commands.addNote(id, request.body()));
@@ -139,6 +164,15 @@ class ExceptionController {
      * required inputs and its own audit event, which a generic patch handler would bury.
      */
     @PostMapping("/{id}/resolve")
+    @ApiResponses({
+        @ApiResponse(responseCode = "200", description = "The resolved case, with its new ETag"),
+        @ApiResponse(responseCode = "400", description = "validation-failed or a bad parameter"),
+        @ApiResponse(responseCode = "404", description = "not found (or another tenant's id)"),
+        @ApiResponse(
+                responseCode = "409",
+                description = "conflict: the code in the problem detail says which (api-design.md §3.1)"),
+        @ApiResponse(responseCode = "428", description = "If-Match header missing")
+    })
     @RequiresPermission(Permission.EXCEPTION_RESOLVE)
     ResponseEntity<ExceptionDetailView> resolve(
             @PathVariable UUID id,
@@ -158,6 +192,15 @@ class ExceptionController {
      * if a later run already opened a new case for the same discrepancy.
      */
     @PostMapping("/{id}/reopen")
+    @ApiResponses({
+        @ApiResponse(responseCode = "200", description = "The reopened case, with its new ETag"),
+        @ApiResponse(responseCode = "400", description = "validation-failed or a bad parameter"),
+        @ApiResponse(responseCode = "404", description = "not found (or another tenant's id)"),
+        @ApiResponse(
+                responseCode = "409",
+                description = "conflict: the code in the problem detail says which (api-design.md §3.1)"),
+        @ApiResponse(responseCode = "428", description = "If-Match header missing")
+    })
     @RequiresPermission(Permission.EXCEPTION_REOPEN)
     ResponseEntity<ExceptionDetailView> reopen(
             @PathVariable UUID id,

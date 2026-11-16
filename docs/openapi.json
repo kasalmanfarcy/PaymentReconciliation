@@ -1,0 +1,4851 @@
+{
+  "openapi" : "3.1.0",
+  "info" : {
+    "description" : "Payment reconciliation: imports, runs, exceptions, reports. Errors are RFC 9457 problem details (docs/api-design.md §3).",
+    "license" : {
+      "name" : "Apache-2.0"
+    },
+    "title" : "ReconFlow API",
+    "version" : "v1"
+  },
+  "security" : [ {
+    "bearer" : [ ]
+  } ],
+  "paths" : {
+    "/api/v1/audit-events" : {
+      "get" : {
+        "operationId" : "timeline",
+        "parameters" : [ {
+          "in" : "query",
+          "name" : "entityType",
+          "required" : true,
+          "schema" : {
+            "type" : "string",
+            "enum" : [ "USER", "MEMBERSHIP", "ORGANIZATION", "REFRESH_TOKEN_FAMILY", "IMPORT_BATCH", "RECONCILIATION_RUN", "EXCEPTION_CASE" ]
+          }
+        }, {
+          "in" : "query",
+          "name" : "entityId",
+          "required" : true,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        }, {
+          "in" : "query",
+          "name" : "page",
+          "required" : false,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int32",
+            "default" : 0
+          }
+        }, {
+          "in" : "query",
+          "name" : "size",
+          "required" : false,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int32",
+            "default" : 50
+          }
+        }, {
+          "in" : "query",
+          "name" : "sort",
+          "required" : false,
+          "schema" : {
+            "type" : [ "array", "null" ],
+            "items" : {
+              "type" : "string"
+            }
+          }
+        }, {
+          "description" : "The organization to act in. Required when the caller belongs to more than one; otherwise their only organization is used.",
+          "in" : "header",
+          "name" : "X-Organization-Id",
+          "required" : false,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/PagedModelAuditEventView"
+                }
+              }
+            },
+            "description" : "A page of the entity's audit events"
+          },
+          "400" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "validation-failed or a bad parameter"
+          },
+          "401" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unauthenticated: no valid access token"
+          },
+          "403" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "forbidden: the caller lacks the permission"
+          },
+          "429" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "rate-limited: see Retry-After"
+          }
+        },
+        "tags" : [ "audit-event-controller" ]
+      }
+    },
+    "/api/v1/exceptions" : {
+      "get" : {
+        "operationId" : "list_4",
+        "parameters" : [ {
+          "in" : "query",
+          "name" : "type",
+          "required" : false,
+          "schema" : {
+            "type" : [ "array", "null" ],
+            "items" : {
+              "type" : "string",
+              "enum" : [ "MISSING_IN_GATEWAY", "MISSING_IN_LEDGER", "AMOUNT_MISMATCH", "CURRENCY_MISMATCH", "DUPLICATE_IN_SOURCE" ]
+            }
+          }
+        }, {
+          "in" : "query",
+          "name" : "status",
+          "required" : false,
+          "schema" : {
+            "type" : [ "array", "null" ],
+            "items" : {
+              "type" : "string",
+              "enum" : [ "OPEN", "IN_REVIEW", "RESOLVED" ]
+            }
+          }
+        }, {
+          "in" : "query",
+          "name" : "assignedTo",
+          "required" : false,
+          "schema" : {
+            "type" : [ "string", "null" ]
+          }
+        }, {
+          "in" : "query",
+          "name" : "runId",
+          "required" : false,
+          "schema" : {
+            "type" : [ "string", "null" ],
+            "format" : "uuid"
+          }
+        }, {
+          "in" : "query",
+          "name" : "createdFrom",
+          "required" : false,
+          "schema" : {
+            "type" : [ "string", "null" ],
+            "format" : "date"
+          }
+        }, {
+          "in" : "query",
+          "name" : "createdTo",
+          "required" : false,
+          "schema" : {
+            "type" : [ "string", "null" ],
+            "format" : "date"
+          }
+        }, {
+          "in" : "query",
+          "name" : "amountMin",
+          "required" : false,
+          "schema" : {
+            "type" : [ "number", "null" ]
+          }
+        }, {
+          "in" : "query",
+          "name" : "amountMax",
+          "required" : false,
+          "schema" : {
+            "type" : [ "number", "null" ]
+          }
+        }, {
+          "in" : "query",
+          "name" : "sort",
+          "required" : false,
+          "schema" : {
+            "type" : [ "array", "null" ],
+            "items" : {
+              "type" : "string"
+            }
+          }
+        }, {
+          "in" : "query",
+          "name" : "page",
+          "required" : false,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int32",
+            "default" : 0
+          }
+        }, {
+          "in" : "query",
+          "name" : "size",
+          "required" : false,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int32",
+            "default" : 50
+          }
+        }, {
+          "description" : "The organization to act in. Required when the caller belongs to more than one; otherwise their only organization is used.",
+          "in" : "header",
+          "name" : "X-Organization-Id",
+          "required" : false,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/PagedModelExceptionSummaryView"
+                }
+              }
+            },
+            "description" : "A page of cases"
+          },
+          "400" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "validation-failed or a bad parameter"
+          },
+          "401" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unauthenticated: no valid access token"
+          },
+          "403" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "forbidden: the caller lacks the permission"
+          },
+          "429" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "rate-limited: see Retry-After"
+          }
+        },
+        "tags" : [ "exception-controller" ]
+      }
+    },
+    "/api/v1/exceptions/{id}" : {
+      "get" : {
+        "operationId" : "get",
+        "parameters" : [ {
+          "in" : "path",
+          "name" : "id",
+          "required" : true,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        }, {
+          "description" : "The organization to act in. Required when the caller belongs to more than one; otherwise their only organization is used.",
+          "in" : "header",
+          "name" : "X-Organization-Id",
+          "required" : false,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ExceptionDetailView"
+                }
+              }
+            },
+            "description" : "The case, with its ETag"
+          },
+          "401" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unauthenticated: no valid access token"
+          },
+          "403" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "forbidden: the caller lacks the permission"
+          },
+          "404" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "not found (or another tenant's id)"
+          },
+          "429" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "rate-limited: see Retry-After"
+          }
+        },
+        "tags" : [ "exception-controller" ]
+      },
+      "patch" : {
+        "operationId" : "patch",
+        "parameters" : [ {
+          "in" : "path",
+          "name" : "id",
+          "required" : true,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        }, {
+          "in" : "header",
+          "name" : "If-Match",
+          "required" : false,
+          "schema" : {
+            "type" : [ "string", "null" ]
+          }
+        }, {
+          "description" : "The organization to act in. Required when the caller belongs to more than one; otherwise their only organization is used.",
+          "in" : "header",
+          "name" : "X-Organization-Id",
+          "required" : false,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        } ],
+        "requestBody" : {
+          "content" : {
+            "application/merge-patch+json" : {
+              "schema" : {
+                "$ref" : "#/components/schemas/JsonNode"
+              }
+            }
+          },
+          "required" : true
+        },
+        "responses" : {
+          "200" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ExceptionDetailView"
+                }
+              }
+            },
+            "description" : "The updated case, with its new ETag"
+          },
+          "400" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "validation-failed or a bad parameter"
+          },
+          "401" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unauthenticated: no valid access token"
+          },
+          "403" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "forbidden: the caller lacks the permission"
+          },
+          "404" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "not found (or another tenant's id)"
+          },
+          "409" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "conflict: the code in the problem detail says which (api-design.md §3.1)"
+          },
+          "422" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unprocessable: see the code in the problem detail"
+          },
+          "428" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "If-Match header missing"
+          },
+          "429" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "rate-limited: see Retry-After"
+          }
+        },
+        "tags" : [ "exception-controller" ]
+      }
+    },
+    "/api/v1/exceptions/{id}/notes" : {
+      "post" : {
+        "operationId" : "addNote",
+        "parameters" : [ {
+          "in" : "path",
+          "name" : "id",
+          "required" : true,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        }, {
+          "description" : "The organization to act in. Required when the caller belongs to more than one; otherwise their only organization is used.",
+          "in" : "header",
+          "name" : "X-Organization-Id",
+          "required" : false,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        } ],
+        "requestBody" : {
+          "content" : {
+            "application/json" : {
+              "schema" : {
+                "$ref" : "#/components/schemas/NoteRequest"
+              }
+            }
+          },
+          "required" : true
+        },
+        "responses" : {
+          "201" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/NoteView"
+                }
+              }
+            },
+            "description" : "The note"
+          },
+          "400" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "validation-failed or a bad parameter"
+          },
+          "401" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unauthenticated: no valid access token"
+          },
+          "403" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "forbidden: the caller lacks the permission"
+          },
+          "404" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "not found (or another tenant's id)"
+          },
+          "429" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "rate-limited: see Retry-After"
+          }
+        },
+        "tags" : [ "exception-controller" ]
+      }
+    },
+    "/api/v1/exceptions/{id}/reopen" : {
+      "post" : {
+        "operationId" : "reopen",
+        "parameters" : [ {
+          "in" : "path",
+          "name" : "id",
+          "required" : true,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        }, {
+          "in" : "header",
+          "name" : "If-Match",
+          "required" : false,
+          "schema" : {
+            "type" : [ "string", "null" ]
+          }
+        }, {
+          "description" : "The organization to act in. Required when the caller belongs to more than one; otherwise their only organization is used.",
+          "in" : "header",
+          "name" : "X-Organization-Id",
+          "required" : false,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        } ],
+        "requestBody" : {
+          "content" : {
+            "application/json" : {
+              "schema" : {
+                "$ref" : "#/components/schemas/ReopenRequest"
+              }
+            }
+          },
+          "required" : true
+        },
+        "responses" : {
+          "200" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ExceptionDetailView"
+                }
+              }
+            },
+            "description" : "The reopened case, with its new ETag"
+          },
+          "400" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "validation-failed or a bad parameter"
+          },
+          "401" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unauthenticated: no valid access token"
+          },
+          "403" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "forbidden: the caller lacks the permission"
+          },
+          "404" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "not found (or another tenant's id)"
+          },
+          "409" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "conflict: the code in the problem detail says which (api-design.md §3.1)"
+          },
+          "428" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "If-Match header missing"
+          },
+          "429" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "rate-limited: see Retry-After"
+          }
+        },
+        "tags" : [ "exception-controller" ]
+      }
+    },
+    "/api/v1/exceptions/{id}/resolve" : {
+      "post" : {
+        "operationId" : "resolve",
+        "parameters" : [ {
+          "in" : "path",
+          "name" : "id",
+          "required" : true,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        }, {
+          "in" : "header",
+          "name" : "If-Match",
+          "required" : false,
+          "schema" : {
+            "type" : [ "string", "null" ]
+          }
+        }, {
+          "description" : "The organization to act in. Required when the caller belongs to more than one; otherwise their only organization is used.",
+          "in" : "header",
+          "name" : "X-Organization-Id",
+          "required" : false,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        } ],
+        "requestBody" : {
+          "content" : {
+            "application/json" : {
+              "schema" : {
+                "$ref" : "#/components/schemas/ResolveRequest"
+              }
+            }
+          },
+          "required" : true
+        },
+        "responses" : {
+          "200" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ExceptionDetailView"
+                }
+              }
+            },
+            "description" : "The resolved case, with its new ETag"
+          },
+          "400" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "validation-failed or a bad parameter"
+          },
+          "401" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unauthenticated: no valid access token"
+          },
+          "403" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "forbidden: the caller lacks the permission"
+          },
+          "404" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "not found (or another tenant's id)"
+          },
+          "409" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "conflict: the code in the problem detail says which (api-design.md §3.1)"
+          },
+          "428" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "If-Match header missing"
+          },
+          "429" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "rate-limited: see Retry-After"
+          }
+        },
+        "tags" : [ "exception-controller" ]
+      }
+    },
+    "/api/v1/imports" : {
+      "get" : {
+        "operationId" : "list_3",
+        "parameters" : [ {
+          "in" : "query",
+          "name" : "status",
+          "required" : false,
+          "schema" : {
+            "type" : [ "array", "null" ],
+            "items" : {
+              "type" : "string",
+              "enum" : [ "RECEIVED", "PROCESSING", "COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED" ]
+            }
+          }
+        }, {
+          "in" : "query",
+          "name" : "sourceType",
+          "required" : false,
+          "schema" : {
+            "type" : [ "string", "null" ],
+            "enum" : [ "INTERNAL_LEDGER", "GATEWAY" ]
+          }
+        }, {
+          "in" : "query",
+          "name" : "sort",
+          "required" : false,
+          "schema" : {
+            "type" : [ "array", "null" ],
+            "items" : {
+              "type" : "string"
+            }
+          }
+        }, {
+          "in" : "query",
+          "name" : "page",
+          "required" : false,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int32",
+            "default" : 0
+          }
+        }, {
+          "in" : "query",
+          "name" : "size",
+          "required" : false,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int32",
+            "default" : 50
+          }
+        }, {
+          "description" : "The organization to act in. Required when the caller belongs to more than one; otherwise their only organization is used.",
+          "in" : "header",
+          "name" : "X-Organization-Id",
+          "required" : false,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/PagedModelImportView"
+                }
+              }
+            },
+            "description" : "A page of imports"
+          },
+          "400" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "validation-failed or a bad parameter"
+          },
+          "401" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unauthenticated: no valid access token"
+          },
+          "403" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "forbidden: the caller lacks the permission"
+          },
+          "429" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "rate-limited: see Retry-After"
+          }
+        },
+        "tags" : [ "import-controller" ]
+      },
+      "post" : {
+        "operationId" : "upload",
+        "parameters" : [ {
+          "in" : "query",
+          "name" : "sourceType",
+          "required" : true,
+          "schema" : {
+            "type" : "string",
+            "enum" : [ "INTERNAL_LEDGER", "GATEWAY" ]
+          }
+        }, {
+          "description" : "The organization to act in. Required when the caller belongs to more than one; otherwise their only organization is used.",
+          "in" : "header",
+          "name" : "X-Organization-Id",
+          "required" : false,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        } ],
+        "requestBody" : {
+          "content" : {
+            "multipart/form-data" : {
+              "schema" : {
+                "type" : "object",
+                "properties" : {
+                  "file" : {
+                    "type" : "string",
+                    "format" : "binary"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses" : {
+          "202" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ImportView"
+                }
+              }
+            },
+            "description" : "The batch was stored and queued; poll the Location"
+          },
+          "400" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "validation-failed or a bad parameter"
+          },
+          "401" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unauthenticated: no valid access token"
+          },
+          "403" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "forbidden: the caller lacks the permission"
+          },
+          "409" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "conflict: the code in the problem detail says which (api-design.md §3.1)"
+          },
+          "413" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "file-too-large"
+          },
+          "415" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unsupported media type"
+          },
+          "429" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "rate-limited: see Retry-After"
+          }
+        },
+        "tags" : [ "import-controller" ]
+      }
+    },
+    "/api/v1/imports/{id}" : {
+      "get" : {
+        "operationId" : "get_2",
+        "parameters" : [ {
+          "in" : "path",
+          "name" : "id",
+          "required" : true,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        }, {
+          "description" : "The organization to act in. Required when the caller belongs to more than one; otherwise their only organization is used.",
+          "in" : "header",
+          "name" : "X-Organization-Id",
+          "required" : false,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ImportView"
+                }
+              }
+            },
+            "description" : "The import, with Retry-After while it is processing"
+          },
+          "401" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unauthenticated: no valid access token"
+          },
+          "403" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "forbidden: the caller lacks the permission"
+          },
+          "404" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "not found (or another tenant's id)"
+          },
+          "429" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "rate-limited: see Retry-After"
+          }
+        },
+        "tags" : [ "import-controller" ]
+      }
+    },
+    "/api/v1/imports/{id}/errors" : {
+      "get" : {
+        "operationId" : "errors",
+        "parameters" : [ {
+          "in" : "path",
+          "name" : "id",
+          "required" : true,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        }, {
+          "in" : "query",
+          "name" : "page",
+          "required" : false,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int32",
+            "default" : 0
+          }
+        }, {
+          "in" : "query",
+          "name" : "size",
+          "required" : false,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int32",
+            "default" : 50
+          }
+        }, {
+          "in" : "query",
+          "name" : "sort",
+          "required" : false,
+          "schema" : {
+            "type" : [ "array", "null" ],
+            "items" : {
+              "type" : "string"
+            }
+          }
+        }, {
+          "description" : "The organization to act in. Required when the caller belongs to more than one; otherwise their only organization is used.",
+          "in" : "header",
+          "name" : "X-Organization-Id",
+          "required" : false,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/PagedModelRowErrorView"
+                }
+              }
+            },
+            "description" : "A page of row errors"
+          },
+          "401" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unauthenticated: no valid access token"
+          },
+          "403" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "forbidden: the caller lacks the permission"
+          },
+          "404" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "not found (or another tenant's id)"
+          },
+          "429" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "rate-limited: see Retry-After"
+          }
+        },
+        "tags" : [ "import-controller" ]
+      }
+    },
+    "/api/v1/imports/{id}/retry" : {
+      "post" : {
+        "operationId" : "retry_1",
+        "parameters" : [ {
+          "in" : "path",
+          "name" : "id",
+          "required" : true,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        }, {
+          "description" : "The organization to act in. Required when the caller belongs to more than one; otherwise their only organization is used.",
+          "in" : "header",
+          "name" : "X-Organization-Id",
+          "required" : false,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        } ],
+        "requestBody" : {
+          "content" : {
+            "application/json" : {
+              "schema" : {
+                "$ref" : "#/components/schemas/RetryRequest"
+              }
+            }
+          },
+          "required" : true
+        },
+        "responses" : {
+          "202" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ImportView"
+                }
+              }
+            },
+            "description" : "The failed import was queued again"
+          },
+          "401" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unauthenticated: no valid access token"
+          },
+          "403" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "forbidden: the caller lacks the permission"
+          },
+          "404" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "not found (or another tenant's id)"
+          },
+          "409" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "conflict: the code in the problem detail says which (api-design.md §3.1)"
+          },
+          "429" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "rate-limited: see Retry-After"
+          }
+        },
+        "tags" : [ "import-controller" ]
+      }
+    },
+    "/api/v1/members" : {
+      "get" : {
+        "operationId" : "list_2",
+        "parameters" : [ {
+          "in" : "query",
+          "name" : "page",
+          "required" : false,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int32",
+            "default" : 0
+          }
+        }, {
+          "in" : "query",
+          "name" : "size",
+          "required" : false,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int32",
+            "default" : 50
+          }
+        }, {
+          "in" : "query",
+          "name" : "sort",
+          "required" : false,
+          "schema" : {
+            "type" : [ "array", "null" ],
+            "items" : {
+              "type" : "string"
+            }
+          }
+        }, {
+          "description" : "The organization to act in. Required when the caller belongs to more than one; otherwise their only organization is used.",
+          "in" : "header",
+          "name" : "X-Organization-Id",
+          "required" : false,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/PagedModelMemberView"
+                }
+              }
+            },
+            "description" : "A page of members"
+          },
+          "401" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unauthenticated: no valid access token"
+          },
+          "403" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "forbidden: the caller lacks the permission"
+          },
+          "429" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "rate-limited: see Retry-After"
+          }
+        },
+        "tags" : [ "member-controller" ]
+      },
+      "post" : {
+        "operationId" : "create_2",
+        "parameters" : [ {
+          "description" : "The organization to act in. Required when the caller belongs to more than one; otherwise their only organization is used.",
+          "in" : "header",
+          "name" : "X-Organization-Id",
+          "required" : false,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        } ],
+        "requestBody" : {
+          "content" : {
+            "application/json" : {
+              "schema" : {
+                "$ref" : "#/components/schemas/CreateMemberRequest"
+              }
+            }
+          },
+          "required" : true
+        },
+        "responses" : {
+          "201" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/CreatedMemberResponse"
+                }
+              }
+            },
+            "description" : "The member, with a one-time temporary password"
+          },
+          "400" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "validation-failed or a bad parameter"
+          },
+          "401" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unauthenticated: no valid access token"
+          },
+          "403" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "forbidden: the caller lacks the permission"
+          },
+          "409" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "conflict: the code in the problem detail says which (api-design.md §3.1)"
+          },
+          "429" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "rate-limited: see Retry-After"
+          },
+          "503" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "a dependency is unavailable; retry later"
+          }
+        },
+        "tags" : [ "member-controller" ]
+      }
+    },
+    "/api/v1/members/{userId}" : {
+      "patch" : {
+        "operationId" : "changeRole",
+        "parameters" : [ {
+          "in" : "path",
+          "name" : "userId",
+          "required" : true,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        }, {
+          "description" : "The organization to act in. Required when the caller belongs to more than one; otherwise their only organization is used.",
+          "in" : "header",
+          "name" : "X-Organization-Id",
+          "required" : false,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        } ],
+        "requestBody" : {
+          "content" : {
+            "application/json" : {
+              "schema" : {
+                "$ref" : "#/components/schemas/ChangeRoleRequest"
+              }
+            },
+            "application/merge-patch+json" : {
+              "schema" : {
+                "$ref" : "#/components/schemas/ChangeRoleRequest"
+              }
+            }
+          },
+          "required" : true
+        },
+        "responses" : {
+          "200" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/MemberView"
+                }
+              }
+            },
+            "description" : "The updated member"
+          },
+          "401" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unauthenticated: no valid access token"
+          },
+          "403" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "forbidden: the caller lacks the permission"
+          },
+          "404" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "not found (or another tenant's id)"
+          },
+          "409" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "conflict: the code in the problem detail says which (api-design.md §3.1)"
+          },
+          "429" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "rate-limited: see Retry-After"
+          }
+        },
+        "tags" : [ "member-controller" ]
+      }
+    },
+    "/api/v1/members/{userId}/disable" : {
+      "post" : {
+        "operationId" : "disable",
+        "parameters" : [ {
+          "in" : "path",
+          "name" : "userId",
+          "required" : true,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        }, {
+          "description" : "The organization to act in. Required when the caller belongs to more than one; otherwise their only organization is used.",
+          "in" : "header",
+          "name" : "X-Organization-Id",
+          "required" : false,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/MemberView"
+                }
+              }
+            },
+            "description" : "The disabled member"
+          },
+          "401" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unauthenticated: no valid access token"
+          },
+          "403" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "forbidden: the caller lacks the permission"
+          },
+          "404" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "not found (or another tenant's id)"
+          },
+          "409" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "conflict: the code in the problem detail says which (api-design.md §3.1)"
+          },
+          "429" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "rate-limited: see Retry-After"
+          },
+          "503" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "a dependency is unavailable; retry later"
+          }
+        },
+        "tags" : [ "member-controller" ]
+      }
+    },
+    "/api/v1/members/{userId}/reset-password" : {
+      "post" : {
+        "operationId" : "resetPassword",
+        "parameters" : [ {
+          "in" : "path",
+          "name" : "userId",
+          "required" : true,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        }, {
+          "description" : "The organization to act in. Required when the caller belongs to more than one; otherwise their only organization is used.",
+          "in" : "header",
+          "name" : "X-Organization-Id",
+          "required" : false,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/TemporaryPasswordResponse"
+                }
+              }
+            },
+            "description" : "A new temporary password"
+          },
+          "401" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unauthenticated: no valid access token"
+          },
+          "403" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "forbidden: the caller lacks the permission"
+          },
+          "404" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "not found (or another tenant's id)"
+          },
+          "429" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "rate-limited: see Retry-After"
+          },
+          "503" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "a dependency is unavailable; retry later"
+          }
+        },
+        "tags" : [ "member-controller" ]
+      }
+    },
+    "/api/v1/platform/organizations" : {
+      "get" : {
+        "operationId" : "list_1",
+        "parameters" : [ {
+          "in" : "query",
+          "name" : "page",
+          "required" : false,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int32",
+            "default" : 0
+          }
+        }, {
+          "in" : "query",
+          "name" : "size",
+          "required" : false,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int32",
+            "default" : 50
+          }
+        }, {
+          "in" : "query",
+          "name" : "sort",
+          "required" : false,
+          "schema" : {
+            "type" : [ "array", "null" ],
+            "items" : {
+              "type" : "string"
+            }
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/PagedModelOrganizationResponse"
+                }
+              }
+            },
+            "description" : "A page of organizations"
+          },
+          "401" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unauthenticated: no valid access token"
+          },
+          "403" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "forbidden: the caller lacks the permission"
+          },
+          "429" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "rate-limited: see Retry-After"
+          }
+        },
+        "tags" : [ "platform-organization-controller" ]
+      },
+      "post" : {
+        "operationId" : "create_1",
+        "requestBody" : {
+          "content" : {
+            "application/json" : {
+              "schema" : {
+                "$ref" : "#/components/schemas/CreateOrganizationRequest"
+              }
+            }
+          },
+          "required" : true
+        },
+        "responses" : {
+          "201" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/CreatedOrganizationResponse"
+                }
+              }
+            },
+            "description" : "The organization and its first admin"
+          },
+          "400" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "validation-failed or a bad parameter"
+          },
+          "401" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unauthenticated: no valid access token"
+          },
+          "403" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "forbidden: the caller lacks the permission"
+          },
+          "429" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "rate-limited: see Retry-After"
+          }
+        },
+        "tags" : [ "platform-organization-controller" ]
+      }
+    },
+    "/api/v1/reconciliation-runs" : {
+      "get" : {
+        "operationId" : "list",
+        "parameters" : [ {
+          "in" : "query",
+          "name" : "status",
+          "required" : false,
+          "schema" : {
+            "type" : [ "array", "null" ],
+            "items" : {
+              "type" : "string",
+              "enum" : [ "PENDING", "RUNNING", "COMPLETED", "FAILED" ]
+            }
+          }
+        }, {
+          "in" : "query",
+          "name" : "from",
+          "required" : false,
+          "schema" : {
+            "type" : [ "string", "null" ],
+            "format" : "date"
+          }
+        }, {
+          "in" : "query",
+          "name" : "to",
+          "required" : false,
+          "schema" : {
+            "type" : [ "string", "null" ],
+            "format" : "date"
+          }
+        }, {
+          "in" : "query",
+          "name" : "sort",
+          "required" : false,
+          "schema" : {
+            "type" : [ "array", "null" ],
+            "items" : {
+              "type" : "string"
+            }
+          }
+        }, {
+          "in" : "query",
+          "name" : "page",
+          "required" : false,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int32",
+            "default" : 0
+          }
+        }, {
+          "in" : "query",
+          "name" : "size",
+          "required" : false,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int32",
+            "default" : 50
+          }
+        }, {
+          "description" : "The organization to act in. Required when the caller belongs to more than one; otherwise their only organization is used.",
+          "in" : "header",
+          "name" : "X-Organization-Id",
+          "required" : false,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/PagedModelRunView"
+                }
+              }
+            },
+            "description" : "A page of runs"
+          },
+          "400" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "validation-failed or a bad parameter"
+          },
+          "401" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unauthenticated: no valid access token"
+          },
+          "403" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "forbidden: the caller lacks the permission"
+          },
+          "429" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "rate-limited: see Retry-After"
+          }
+        },
+        "tags" : [ "reconciliation-run-controller" ]
+      },
+      "post" : {
+        "operationId" : "create",
+        "parameters" : [ {
+          "in" : "header",
+          "name" : "Idempotency-Key",
+          "required" : false,
+          "schema" : {
+            "type" : [ "string", "null" ]
+          }
+        }, {
+          "description" : "The organization to act in. Required when the caller belongs to more than one; otherwise their only organization is used.",
+          "in" : "header",
+          "name" : "X-Organization-Id",
+          "required" : false,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        } ],
+        "requestBody" : {
+          "content" : {
+            "application/json" : {
+              "schema" : {
+                "$ref" : "#/components/schemas/RunRequest"
+              }
+            }
+          },
+          "required" : true
+        },
+        "responses" : {
+          "200" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/RunView"
+                }
+              }
+            },
+            "description" : "The same request was made before: the existing run (idempotent)"
+          },
+          "202" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/RunView"
+                }
+              }
+            },
+            "description" : "A new run was queued"
+          },
+          "400" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "validation-failed or a bad parameter"
+          },
+          "401" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unauthenticated: no valid access token"
+          },
+          "403" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "forbidden: the caller lacks the permission"
+          },
+          "409" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "conflict: the code in the problem detail says which (api-design.md §3.1)"
+          },
+          "422" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unprocessable: see the code in the problem detail"
+          },
+          "429" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "rate-limited: see Retry-After"
+          }
+        },
+        "tags" : [ "reconciliation-run-controller" ]
+      }
+    },
+    "/api/v1/reconciliation-runs/{id}" : {
+      "get" : {
+        "operationId" : "get_1",
+        "parameters" : [ {
+          "in" : "path",
+          "name" : "id",
+          "required" : true,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        }, {
+          "description" : "The organization to act in. Required when the caller belongs to more than one; otherwise their only organization is used.",
+          "in" : "header",
+          "name" : "X-Organization-Id",
+          "required" : false,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/RunView"
+                }
+              }
+            },
+            "description" : "The run, with Retry-After while it is running"
+          },
+          "401" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unauthenticated: no valid access token"
+          },
+          "403" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "forbidden: the caller lacks the permission"
+          },
+          "404" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "not found (or another tenant's id)"
+          },
+          "429" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "rate-limited: see Retry-After"
+          }
+        },
+        "tags" : [ "reconciliation-run-controller" ]
+      }
+    },
+    "/api/v1/reconciliation-runs/{id}/matches" : {
+      "get" : {
+        "operationId" : "matches",
+        "parameters" : [ {
+          "in" : "path",
+          "name" : "id",
+          "required" : true,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        }, {
+          "in" : "query",
+          "name" : "page",
+          "required" : false,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int32",
+            "default" : 0
+          }
+        }, {
+          "in" : "query",
+          "name" : "size",
+          "required" : false,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int32",
+            "default" : 50
+          }
+        }, {
+          "in" : "query",
+          "name" : "sort",
+          "required" : false,
+          "schema" : {
+            "type" : [ "array", "null" ],
+            "items" : {
+              "type" : "string"
+            }
+          }
+        }, {
+          "description" : "The organization to act in. Required when the caller belongs to more than one; otherwise their only organization is used.",
+          "in" : "header",
+          "name" : "X-Organization-Id",
+          "required" : false,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/PagedModelMatchView"
+                }
+              }
+            },
+            "description" : "A page of matches, both records side by side"
+          },
+          "401" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unauthenticated: no valid access token"
+          },
+          "403" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "forbidden: the caller lacks the permission"
+          },
+          "404" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "not found (or another tenant's id)"
+          },
+          "429" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "rate-limited: see Retry-After"
+          }
+        },
+        "tags" : [ "reconciliation-run-controller" ]
+      }
+    },
+    "/api/v1/reconciliation-runs/{id}/retry" : {
+      "post" : {
+        "operationId" : "retry",
+        "parameters" : [ {
+          "in" : "path",
+          "name" : "id",
+          "required" : true,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        }, {
+          "description" : "The organization to act in. Required when the caller belongs to more than one; otherwise their only organization is used.",
+          "in" : "header",
+          "name" : "X-Organization-Id",
+          "required" : false,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        } ],
+        "requestBody" : {
+          "content" : {
+            "application/json" : {
+              "schema" : {
+                "$ref" : "#/components/schemas/RetryRequest"
+              }
+            }
+          },
+          "required" : true
+        },
+        "responses" : {
+          "202" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/RunView"
+                }
+              }
+            },
+            "description" : "The failed run resumes from its checkpoint"
+          },
+          "400" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "validation-failed or a bad parameter"
+          },
+          "401" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unauthenticated: no valid access token"
+          },
+          "403" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "forbidden: the caller lacks the permission"
+          },
+          "404" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "not found (or another tenant's id)"
+          },
+          "409" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "conflict: the code in the problem detail says which (api-design.md §3.1)"
+          },
+          "429" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "rate-limited: see Retry-After"
+          }
+        },
+        "tags" : [ "reconciliation-run-controller" ]
+      }
+    },
+    "/api/v1/reports/exception-ageing" : {
+      "get" : {
+        "operationId" : "exceptionAgeing",
+        "parameters" : [ {
+          "in" : "query",
+          "name" : "type",
+          "required" : false,
+          "schema" : {
+            "type" : [ "array", "null" ],
+            "items" : {
+              "type" : "string"
+            }
+          }
+        }, {
+          "in" : "query",
+          "name" : "assignedTo",
+          "required" : false,
+          "schema" : {
+            "type" : [ "string", "null" ]
+          }
+        }, {
+          "in" : "query",
+          "name" : "currency",
+          "required" : false,
+          "schema" : {
+            "type" : [ "string", "null" ]
+          }
+        }, {
+          "description" : "The organization to act in. Required when the caller belongs to more than one; otherwise their only organization is used.",
+          "in" : "header",
+          "name" : "X-Organization-Id",
+          "required" : false,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ExceptionAgeingReport"
+                }
+              }
+            },
+            "description" : "Exception ageing"
+          },
+          "400" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "validation-failed or a bad parameter"
+          },
+          "401" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unauthenticated: no valid access token"
+          },
+          "403" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "forbidden: the caller lacks the permission"
+          },
+          "429" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "rate-limited: see Retry-After"
+          }
+        },
+        "tags" : [ "report-controller" ]
+      }
+    },
+    "/api/v1/reports/exceptions/export" : {
+      "get" : {
+        "operationId" : "exportExceptions",
+        "parameters" : [ {
+          "in" : "query",
+          "name" : "runId",
+          "required" : true,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        }, {
+          "description" : "The organization to act in. Required when the caller belongs to more than one; otherwise their only organization is used.",
+          "in" : "header",
+          "name" : "X-Organization-Id",
+          "required" : false,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/StreamingResponseBody"
+                }
+              }
+            },
+            "description" : "The CSV, streamed (runs up to the sync limit)"
+          },
+          "202" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/StreamingResponseBody"
+                }
+              }
+            },
+            "description" : "An export job was queued (larger runs); poll the Location"
+          },
+          "400" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "validation-failed or a bad parameter"
+          },
+          "401" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unauthenticated: no valid access token"
+          },
+          "403" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "forbidden: the caller lacks the permission"
+          },
+          "404" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "not found (or another tenant's id)"
+          },
+          "429" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "rate-limited: see Retry-After"
+          }
+        },
+        "tags" : [ "report-controller" ]
+      }
+    },
+    "/api/v1/reports/exports/{id}" : {
+      "get" : {
+        "operationId" : "export",
+        "parameters" : [ {
+          "in" : "path",
+          "name" : "id",
+          "required" : true,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        }, {
+          "description" : "The organization to act in. Required when the caller belongs to more than one; otherwise their only organization is used.",
+          "in" : "header",
+          "name" : "X-Organization-Id",
+          "required" : false,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ExportView"
+                }
+              }
+            },
+            "description" : "The export job"
+          },
+          "401" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unauthenticated: no valid access token"
+          },
+          "403" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "forbidden: the caller lacks the permission"
+          },
+          "404" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "not found (or another tenant's id)"
+          },
+          "429" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "rate-limited: see Retry-After"
+          }
+        },
+        "tags" : [ "report-controller" ]
+      }
+    },
+    "/api/v1/reports/exports/{id}/file" : {
+      "get" : {
+        "operationId" : "exportFile",
+        "parameters" : [ {
+          "in" : "path",
+          "name" : "id",
+          "required" : true,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        }, {
+          "description" : "The organization to act in. Required when the caller belongs to more than one; otherwise their only organization is used.",
+          "in" : "header",
+          "name" : "X-Organization-Id",
+          "required" : false,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/StreamingResponseBody"
+                }
+              }
+            },
+            "description" : "The exported CSV"
+          },
+          "401" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unauthenticated: no valid access token"
+          },
+          "403" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "forbidden: the caller lacks the permission"
+          },
+          "404" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "not found (or another tenant's id)"
+          },
+          "409" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "conflict: the code in the problem detail says which (api-design.md §3.1)"
+          },
+          "429" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "rate-limited: see Retry-After"
+          }
+        },
+        "tags" : [ "report-controller" ]
+      }
+    },
+    "/api/v1/reports/import-quality" : {
+      "get" : {
+        "operationId" : "importQuality",
+        "parameters" : [ {
+          "in" : "query",
+          "name" : "batchId",
+          "required" : false,
+          "schema" : {
+            "type" : [ "string", "null" ],
+            "format" : "uuid"
+          }
+        }, {
+          "in" : "query",
+          "name" : "from",
+          "required" : false,
+          "schema" : {
+            "type" : [ "string", "null" ],
+            "format" : "date"
+          }
+        }, {
+          "in" : "query",
+          "name" : "to",
+          "required" : false,
+          "schema" : {
+            "type" : [ "string", "null" ],
+            "format" : "date"
+          }
+        }, {
+          "in" : "query",
+          "name" : "granularity",
+          "required" : false,
+          "schema" : {
+            "type" : [ "string", "null" ]
+          }
+        }, {
+          "in" : "query",
+          "name" : "sourceType",
+          "required" : false,
+          "schema" : {
+            "type" : [ "string", "null" ]
+          }
+        }, {
+          "description" : "The organization to act in. Required when the caller belongs to more than one; otherwise their only organization is used.",
+          "in" : "header",
+          "name" : "X-Organization-Id",
+          "required" : false,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ImportQualityReport"
+                }
+              }
+            },
+            "description" : "Import quality"
+          },
+          "400" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "validation-failed or a bad parameter"
+          },
+          "401" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unauthenticated: no valid access token"
+          },
+          "403" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "forbidden: the caller lacks the permission"
+          },
+          "404" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "not found (or another tenant's id)"
+          },
+          "429" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "rate-limited: see Retry-After"
+          }
+        },
+        "tags" : [ "report-controller" ]
+      }
+    },
+    "/api/v1/reports/reconciliation" : {
+      "get" : {
+        "operationId" : "reconciliation",
+        "parameters" : [ {
+          "in" : "query",
+          "name" : "runId",
+          "required" : false,
+          "schema" : {
+            "type" : [ "string", "null" ],
+            "format" : "uuid"
+          }
+        }, {
+          "in" : "query",
+          "name" : "from",
+          "required" : false,
+          "schema" : {
+            "type" : [ "string", "null" ],
+            "format" : "date"
+          }
+        }, {
+          "in" : "query",
+          "name" : "to",
+          "required" : false,
+          "schema" : {
+            "type" : [ "string", "null" ],
+            "format" : "date"
+          }
+        }, {
+          "in" : "query",
+          "name" : "currency",
+          "required" : false,
+          "schema" : {
+            "type" : [ "string", "null" ]
+          }
+        }, {
+          "description" : "The organization to act in. Required when the caller belongs to more than one; otherwise their only organization is used.",
+          "in" : "header",
+          "name" : "X-Organization-Id",
+          "required" : false,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ReconciliationReport"
+                }
+              }
+            },
+            "description" : "The reconciliation report"
+          },
+          "400" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "validation-failed or a bad parameter"
+          },
+          "401" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unauthenticated: no valid access token"
+          },
+          "403" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "forbidden: the caller lacks the permission"
+          },
+          "404" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "not found (or another tenant's id)"
+          },
+          "409" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "conflict: the code in the problem detail says which (api-design.md §3.1)"
+          },
+          "429" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "rate-limited: see Retry-After"
+          }
+        },
+        "tags" : [ "report-controller" ]
+      }
+    },
+    "/api/v1/transactions" : {
+      "get" : {
+        "operationId" : "search",
+        "parameters" : [ {
+          "in" : "query",
+          "name" : "transactionDateFrom",
+          "required" : true,
+          "schema" : {
+            "type" : "string",
+            "format" : "date"
+          }
+        }, {
+          "in" : "query",
+          "name" : "transactionDateTo",
+          "required" : true,
+          "schema" : {
+            "type" : "string",
+            "format" : "date"
+          }
+        }, {
+          "in" : "query",
+          "name" : "sourceType",
+          "required" : false,
+          "schema" : {
+            "type" : [ "string", "null" ],
+            "enum" : [ "INTERNAL_LEDGER", "GATEWAY" ]
+          }
+        }, {
+          "in" : "query",
+          "name" : "reference",
+          "required" : false,
+          "schema" : {
+            "type" : [ "string", "null" ]
+          }
+        }, {
+          "in" : "query",
+          "name" : "currency",
+          "required" : false,
+          "schema" : {
+            "type" : [ "string", "null" ]
+          }
+        }, {
+          "in" : "query",
+          "name" : "batchId",
+          "required" : false,
+          "schema" : {
+            "type" : [ "string", "null" ],
+            "format" : "uuid"
+          }
+        }, {
+          "in" : "query",
+          "name" : "sort",
+          "required" : false,
+          "schema" : {
+            "type" : [ "array", "null" ],
+            "items" : {
+              "type" : "string"
+            }
+          }
+        }, {
+          "in" : "query",
+          "name" : "page",
+          "required" : false,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int32",
+            "default" : 0
+          }
+        }, {
+          "in" : "query",
+          "name" : "size",
+          "required" : false,
+          "schema" : {
+            "type" : "integer",
+            "format" : "int32",
+            "default" : 50
+          }
+        }, {
+          "description" : "The organization to act in. Required when the caller belongs to more than one; otherwise their only organization is used.",
+          "in" : "header",
+          "name" : "X-Organization-Id",
+          "required" : false,
+          "schema" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "content" : {
+              "*/*" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/SliceViewTransactionView"
+                }
+              }
+            },
+            "description" : "A slice of records (no total count)"
+          },
+          "400" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "validation-failed or a bad parameter"
+          },
+          "401" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "unauthenticated: no valid access token"
+          },
+          "403" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "forbidden: the caller lacks the permission"
+          },
+          "429" : {
+            "content" : {
+              "application/problem+json" : {
+                "schema" : {
+                  "$ref" : "#/components/schemas/ProblemDetail"
+                }
+              }
+            },
+            "description" : "rate-limited: see Retry-After"
+          }
+        },
+        "tags" : [ "transaction-controller" ]
+      }
+    }
+  },
+  "components" : {
+    "schemas" : {
+      "AdminResponse" : {
+        "type" : "object",
+        "properties" : {
+          "email" : {
+            "type" : "string"
+          },
+          "temporaryPassword" : {
+            "type" : "string"
+          },
+          "userId" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        }
+      },
+      "Amount" : {
+        "type" : "object",
+        "properties" : {
+          "amount" : {
+            "type" : "number"
+          },
+          "count" : {
+            "type" : "integer",
+            "format" : "int32"
+          }
+        }
+      },
+      "Assignee" : {
+        "type" : "object",
+        "properties" : {
+          "displayName" : {
+            "type" : "string"
+          },
+          "id" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        }
+      },
+      "AssigneeRow" : {
+        "type" : "object",
+        "properties" : {
+          "assignee" : {
+            "$ref" : "#/components/schemas/Assignee"
+          },
+          "buckets" : {
+            "type" : "array",
+            "items" : {
+              "$ref" : "#/components/schemas/BucketTotal"
+            }
+          },
+          "cases" : {
+            "type" : "integer",
+            "format" : "int64"
+          }
+        }
+      },
+      "AuditEventView" : {
+        "type" : "object",
+        "properties" : {
+          "action" : {
+            "type" : "string",
+            "enum" : [ "LOGIN_SUCCEEDED", "LOGIN_FAILED", "ACCOUNT_LOCKED", "LOGOUT", "PASSWORD_CHANGED", "REFRESH_TOKEN_REUSE", "PASSWORD_RESET_BY_ADMIN", "MEMBER_CREATED", "MEMBER_ROLE_CHANGED", "MEMBER_DISABLED", "ORGANIZATION_CREATED", "PLATFORM_ADMIN_BOOTSTRAPPED", "IMPORT_RECEIVED", "IMPORT_COMPLETED", "IMPORT_FAILED", "IMPORT_RETRIED", "IMPORT_RETRY_REQUESTED", "RUN_STARTED", "RUN_COMPLETED", "RUN_FAILED", "RUN_REQUESTED", "RUN_RETRY_REQUESTED", "EXCEPTION_CREATED", "EXCEPTION_ASSIGNED", "EXCEPTION_STATUS_CHANGED", "EXCEPTION_NOTE_ADDED", "EXCEPTION_RESOLVED", "EXCEPTION_REOPENED", "EXPORT_REQUESTED", "EXCEPTIONS_EXPORTED", "PARTITION_ARCHIVED", "USER_LINKED" ]
+          },
+          "actorId" : {
+            "type" : "string",
+            "format" : "uuid"
+          },
+          "at" : {
+            "type" : "string",
+            "format" : "date-time"
+          },
+          "id" : {
+            "type" : "string",
+            "format" : "uuid"
+          },
+          "payload" : {
+            "type" : "object",
+            "additionalProperties" : { }
+          },
+          "requestId" : {
+            "type" : "string"
+          }
+        }
+      },
+      "BatchQuality" : {
+        "type" : "object",
+        "properties" : {
+          "byErrorCode" : {
+            "type" : "array",
+            "items" : {
+              "$ref" : "#/components/schemas/CodeCount"
+            }
+          },
+          "byErrorCodeAndColumn" : {
+            "type" : "array",
+            "items" : {
+              "$ref" : "#/components/schemas/CodeColumnCount"
+            }
+          },
+          "createdAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          },
+          "errorRows" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "fileName" : {
+            "type" : "string"
+          },
+          "id" : {
+            "type" : "string",
+            "format" : "uuid"
+          },
+          "sourceType" : {
+            "type" : "string"
+          },
+          "status" : {
+            "type" : "string"
+          },
+          "stored" : {
+            "$ref" : "#/components/schemas/Counts"
+          },
+          "totalRows" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "validRows" : {
+            "type" : "integer",
+            "format" : "int64"
+          }
+        }
+      },
+      "Bucket" : {
+        "type" : "object",
+        "properties" : {
+          "batches" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "bucket" : {
+            "type" : "string",
+            "format" : "date"
+          },
+          "byErrorCode" : {
+            "type" : "array",
+            "items" : {
+              "$ref" : "#/components/schemas/CodeCount"
+            }
+          },
+          "errorRows" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "stored" : {
+            "$ref" : "#/components/schemas/Counts"
+          },
+          "totalRows" : {
+            "type" : "integer",
+            "format" : "int64"
+          }
+        }
+      },
+      "BucketTotal" : {
+        "type" : "object",
+        "properties" : {
+          "amountAtStake" : {
+            "type" : "array",
+            "items" : {
+              "$ref" : "#/components/schemas/Money"
+            }
+          },
+          "bucket" : {
+            "type" : "string"
+          },
+          "cases" : {
+            "type" : "integer",
+            "format" : "int64"
+          }
+        }
+      },
+      "ChangeRoleRequest" : {
+        "type" : "object",
+        "properties" : {
+          "role" : {
+            "type" : "string",
+            "enum" : [ "ORG_ADMIN", "INVESTIGATOR", "UPLOADER", "VIEWER" ]
+          }
+        },
+        "required" : [ "role" ]
+      },
+      "CodeColumnCount" : {
+        "type" : "object",
+        "properties" : {
+          "column" : {
+            "type" : "string"
+          },
+          "errorCode" : {
+            "type" : "string"
+          },
+          "errorRows" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "errors" : {
+            "type" : "integer",
+            "format" : "int64"
+          }
+        }
+      },
+      "CodeCount" : {
+        "type" : "object",
+        "properties" : {
+          "errorCode" : {
+            "type" : "string"
+          },
+          "errorRows" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "errors" : {
+            "type" : "integer",
+            "format" : "int64"
+          }
+        }
+      },
+      "Count" : {
+        "type" : "object",
+        "properties" : {
+          "count" : {
+            "type" : "integer",
+            "format" : "int32"
+          }
+        }
+      },
+      "CountAndAmount" : {
+        "type" : "object",
+        "properties" : {
+          "amount" : {
+            "type" : "number"
+          },
+          "count" : {
+            "type" : "integer",
+            "format" : "int64"
+          }
+        }
+      },
+      "Counts" : {
+        "type" : "object",
+        "properties" : {
+          "errorRows" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "errors" : {
+            "type" : "integer",
+            "format" : "int64"
+          }
+        }
+      },
+      "Coverage" : {
+        "type" : "object",
+        "properties" : {
+          "coveredDays" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "missingDays" : {
+            "type" : "array",
+            "items" : {
+              "type" : "string",
+              "format" : "date"
+            }
+          },
+          "requestedDays" : {
+            "type" : "integer",
+            "format" : "int64"
+          }
+        }
+      },
+      "CreateMemberRequest" : {
+        "type" : "object",
+        "properties" : {
+          "displayName" : {
+            "type" : "string",
+            "maxLength" : 200,
+            "minLength" : 0
+          },
+          "email" : {
+            "type" : "string",
+            "format" : "email",
+            "maxLength" : 254,
+            "minLength" : 0
+          },
+          "role" : {
+            "type" : "string",
+            "enum" : [ "ORG_ADMIN", "INVESTIGATOR", "UPLOADER", "VIEWER" ]
+          }
+        },
+        "required" : [ "displayName", "email", "role" ]
+      },
+      "CreateOrganizationRequest" : {
+        "type" : "object",
+        "properties" : {
+          "adminDisplayName" : {
+            "type" : "string",
+            "maxLength" : 200,
+            "minLength" : 0
+          },
+          "adminEmail" : {
+            "type" : "string",
+            "format" : "email",
+            "maxLength" : 254,
+            "minLength" : 0
+          },
+          "name" : {
+            "type" : "string",
+            "maxLength" : 200,
+            "minLength" : 0
+          }
+        },
+        "required" : [ "adminDisplayName", "adminEmail", "name" ]
+      },
+      "CreatedMemberResponse" : {
+        "type" : "object",
+        "properties" : {
+          "createdAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          },
+          "displayName" : {
+            "type" : "string"
+          },
+          "email" : {
+            "type" : "string"
+          },
+          "role" : {
+            "type" : "string",
+            "enum" : [ "ORG_ADMIN", "INVESTIGATOR", "UPLOADER", "VIEWER" ]
+          },
+          "status" : {
+            "type" : "string",
+            "enum" : [ "ACTIVE", "LOCKED", "DISABLED" ]
+          },
+          "temporaryPassword" : {
+            "type" : "string"
+          },
+          "userId" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        }
+      },
+      "CreatedOrganizationResponse" : {
+        "type" : "object",
+        "properties" : {
+          "admin" : {
+            "$ref" : "#/components/schemas/AdminResponse"
+          },
+          "organization" : {
+            "$ref" : "#/components/schemas/OrganizationResponse"
+          }
+        }
+      },
+      "Difference" : {
+        "type" : "object",
+        "properties" : {
+          "count" : {
+            "type" : "integer",
+            "format" : "int32"
+          },
+          "netDifference" : {
+            "type" : "number"
+          }
+        }
+      },
+      "ExceptionAgeingReport" : {
+        "type" : "object",
+        "properties" : {
+          "asOf" : {
+            "type" : "string",
+            "format" : "date-time"
+          },
+          "buckets" : {
+            "type" : "array",
+            "items" : {
+              "$ref" : "#/components/schemas/BucketTotal"
+            }
+          },
+          "byAssignee" : {
+            "type" : "array",
+            "items" : {
+              "$ref" : "#/components/schemas/AssigneeRow"
+            }
+          },
+          "filters" : {
+            "$ref" : "#/components/schemas/Filters"
+          }
+        }
+      },
+      "ExceptionDetailView" : {
+        "type" : "object",
+        "properties" : {
+          "amount" : {
+            "type" : "number"
+          },
+          "amountDifference" : {
+            "type" : "number"
+          },
+          "assignedTo" : {
+            "$ref" : "#/components/schemas/UserRef"
+          },
+          "createdAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          },
+          "currency" : {
+            "type" : "string"
+          },
+          "discrepancyKey" : {
+            "type" : "string"
+          },
+          "history" : {
+            "type" : "array",
+            "items" : {
+              "$ref" : "#/components/schemas/HistoryView"
+            }
+          },
+          "id" : {
+            "type" : "string",
+            "format" : "uuid"
+          },
+          "notes" : {
+            "type" : "array",
+            "items" : {
+              "$ref" : "#/components/schemas/NoteView"
+            }
+          },
+          "reasonCode" : {
+            "type" : "string"
+          },
+          "records" : {
+            "$ref" : "#/components/schemas/Records"
+          },
+          "reference" : {
+            "type" : "string"
+          },
+          "resolution" : {
+            "$ref" : "#/components/schemas/Resolution"
+          },
+          "runId" : {
+            "type" : "string",
+            "format" : "uuid"
+          },
+          "runs" : {
+            "type" : "array",
+            "items" : {
+              "$ref" : "#/components/schemas/RunRef"
+            }
+          },
+          "status" : {
+            "type" : "string",
+            "enum" : [ "OPEN", "IN_REVIEW", "RESOLVED" ]
+          },
+          "type" : {
+            "type" : "string",
+            "enum" : [ "MISSING_IN_GATEWAY", "MISSING_IN_LEDGER", "AMOUNT_MISMATCH", "CURRENCY_MISMATCH", "DUPLICATE_IN_SOURCE" ]
+          },
+          "updatedAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          },
+          "version" : {
+            "type" : "integer",
+            "format" : "int64"
+          }
+        }
+      },
+      "ExceptionSummaryView" : {
+        "type" : "object",
+        "properties" : {
+          "amount" : {
+            "type" : "number"
+          },
+          "amountDifference" : {
+            "type" : "number"
+          },
+          "assignedTo" : {
+            "$ref" : "#/components/schemas/UserRef"
+          },
+          "createdAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          },
+          "currency" : {
+            "type" : "string"
+          },
+          "id" : {
+            "type" : "string",
+            "format" : "uuid"
+          },
+          "reasonCode" : {
+            "type" : "string"
+          },
+          "reference" : {
+            "type" : "string"
+          },
+          "runId" : {
+            "type" : "string",
+            "format" : "uuid"
+          },
+          "status" : {
+            "type" : "string",
+            "enum" : [ "OPEN", "IN_REVIEW", "RESOLVED" ]
+          },
+          "type" : {
+            "type" : "string",
+            "enum" : [ "MISSING_IN_GATEWAY", "MISSING_IN_LEDGER", "AMOUNT_MISMATCH", "CURRENCY_MISMATCH", "DUPLICATE_IN_SOURCE" ]
+          },
+          "updatedAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          },
+          "version" : {
+            "type" : "integer",
+            "format" : "int64"
+          }
+        }
+      },
+      "ExportView" : {
+        "type" : "object",
+        "properties" : {
+          "createdAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          },
+          "fileUrl" : {
+            "type" : "string"
+          },
+          "id" : {
+            "type" : "string",
+            "format" : "uuid"
+          },
+          "runId" : {
+            "type" : "string",
+            "format" : "uuid"
+          },
+          "status" : {
+            "type" : "string"
+          },
+          "terminal" : {
+            "type" : "boolean"
+          },
+          "updatedAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          }
+        }
+      },
+      "Filters" : {
+        "type" : "object",
+        "properties" : {
+          "assignedTo" : {
+            "type" : "string"
+          },
+          "currency" : {
+            "type" : "string"
+          },
+          "type" : {
+            "type" : "array",
+            "items" : {
+              "type" : "string"
+            }
+          }
+        }
+      },
+      "HistoryView" : {
+        "type" : "object",
+        "properties" : {
+          "actor" : {
+            "$ref" : "#/components/schemas/UserRef"
+          },
+          "at" : {
+            "type" : "string",
+            "format" : "date-time"
+          },
+          "from" : {
+            "type" : "string",
+            "enum" : [ "OPEN", "IN_REVIEW", "RESOLVED" ]
+          },
+          "id" : {
+            "type" : "string",
+            "format" : "uuid"
+          },
+          "reason" : {
+            "type" : "string"
+          },
+          "resolutionCode" : {
+            "type" : "string",
+            "enum" : [ "TIMING_DIFFERENCE", "GATEWAY_FEE", "DATA_ENTRY_ERROR", "DUPLICATE_CONFIRMED", "DUPLICATE_FILE_ARTIFACT", "WRITTEN_OFF", "FALSE_POSITIVE", "OTHER" ]
+          },
+          "resolutionNote" : {
+            "type" : "string"
+          },
+          "to" : {
+            "type" : "string",
+            "enum" : [ "OPEN", "IN_REVIEW", "RESOLVED" ]
+          }
+        }
+      },
+      "ImportQualityReport" : {
+        "type" : "object",
+        "properties" : {
+          "batch" : {
+            "$ref" : "#/components/schemas/BatchQuality"
+          },
+          "buckets" : {
+            "type" : "array",
+            "items" : {
+              "$ref" : "#/components/schemas/Bucket"
+            }
+          },
+          "mode" : {
+            "type" : "string",
+            "enum" : [ "BATCH", "OVER_TIME" ]
+          },
+          "period" : {
+            "$ref" : "#/components/schemas/Period"
+          }
+        }
+      },
+      "ImportView" : {
+        "type" : "object",
+        "properties" : {
+          "completedAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          },
+          "createdAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          },
+          "errorRows" : {
+            "type" : "integer",
+            "format" : "int32"
+          },
+          "failureReason" : {
+            "type" : "string"
+          },
+          "fileName" : {
+            "type" : "string"
+          },
+          "id" : {
+            "type" : "string",
+            "format" : "uuid"
+          },
+          "sizeBytes" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "sourceType" : {
+            "type" : "string",
+            "enum" : [ "INTERNAL_LEDGER", "GATEWAY" ]
+          },
+          "startedAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          },
+          "status" : {
+            "type" : "string",
+            "enum" : [ "RECEIVED", "PROCESSING", "COMPLETED", "COMPLETED_WITH_ERRORS", "FAILED" ]
+          },
+          "storedErrors" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "totalRows" : {
+            "type" : "integer",
+            "format" : "int32"
+          },
+          "uploadedBy" : {
+            "type" : "string",
+            "format" : "uuid"
+          },
+          "validRows" : {
+            "type" : "integer",
+            "format" : "int32"
+          }
+        }
+      },
+      "JsonNode" : {
+        "type" : "object",
+        "properties" : {
+          "array" : {
+            "type" : "boolean"
+          },
+          "bigDecimal" : {
+            "type" : "boolean"
+          },
+          "bigInteger" : {
+            "type" : "boolean"
+          },
+          "binary" : {
+            "type" : "boolean"
+          },
+          "boolean" : {
+            "type" : "boolean"
+          },
+          "container" : {
+            "type" : "boolean"
+          },
+          "double" : {
+            "type" : "boolean"
+          },
+          "embeddedValue" : {
+            "type" : "boolean"
+          },
+          "empty" : {
+            "type" : "boolean"
+          },
+          "float" : {
+            "type" : "boolean"
+          },
+          "floatingPointNumber" : {
+            "type" : "boolean"
+          },
+          "int" : {
+            "type" : "boolean"
+          },
+          "integralNumber" : {
+            "type" : "boolean"
+          },
+          "long" : {
+            "type" : "boolean"
+          },
+          "missingNode" : {
+            "type" : "boolean"
+          },
+          "nodeType" : {
+            "type" : "string",
+            "enum" : [ "ARRAY", "BINARY", "BOOLEAN", "MISSING", "NULL", "NUMBER", "OBJECT", "POJO", "STRING" ]
+          },
+          "null" : {
+            "type" : "boolean"
+          },
+          "number" : {
+            "type" : "boolean"
+          },
+          "object" : {
+            "type" : "boolean"
+          },
+          "pojo" : {
+            "type" : "boolean"
+          },
+          "short" : {
+            "type" : "boolean"
+          },
+          "string" : {
+            "type" : "boolean"
+          },
+          "textual" : {
+            "type" : "boolean",
+            "deprecated" : true
+          },
+          "valueNode" : {
+            "type" : "boolean"
+          }
+        }
+      },
+      "MatchView" : {
+        "type" : "object",
+        "properties" : {
+          "amountDifference" : {
+            "type" : "number"
+          },
+          "currency" : {
+            "type" : "string"
+          },
+          "gateway" : {
+            "$ref" : "#/components/schemas/Side"
+          },
+          "id" : {
+            "type" : "string",
+            "format" : "uuid"
+          },
+          "ledger" : {
+            "$ref" : "#/components/schemas/Side"
+          },
+          "matchType" : {
+            "type" : "string",
+            "enum" : [ "EXACT" ]
+          }
+        }
+      },
+      "MemberView" : {
+        "type" : "object",
+        "properties" : {
+          "createdAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          },
+          "displayName" : {
+            "type" : "string"
+          },
+          "email" : {
+            "type" : "string"
+          },
+          "role" : {
+            "type" : "string",
+            "enum" : [ "ORG_ADMIN", "INVESTIGATOR", "UPLOADER", "VIEWER" ]
+          },
+          "status" : {
+            "type" : "string",
+            "enum" : [ "ACTIVE", "LOCKED", "DISABLED" ]
+          },
+          "userId" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        }
+      },
+      "MismatchSummary" : {
+        "type" : "object",
+        "properties" : {
+          "count" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "netDifference" : {
+            "type" : "number"
+          }
+        }
+      },
+      "Money" : {
+        "type" : "object",
+        "properties" : {
+          "amount" : {
+            "type" : "number"
+          },
+          "currency" : {
+            "type" : "string"
+          }
+        }
+      },
+      "NoteRequest" : {
+        "type" : "object",
+        "properties" : {
+          "body" : {
+            "type" : "string",
+            "maxLength" : 4000,
+            "minLength" : 0
+          }
+        },
+        "required" : [ "body" ]
+      },
+      "NoteView" : {
+        "type" : "object",
+        "properties" : {
+          "author" : {
+            "$ref" : "#/components/schemas/UserRef"
+          },
+          "body" : {
+            "type" : "string"
+          },
+          "createdAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          },
+          "id" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        }
+      },
+      "OrganizationResponse" : {
+        "type" : "object",
+        "properties" : {
+          "createdAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          },
+          "id" : {
+            "type" : "string",
+            "format" : "uuid"
+          },
+          "name" : {
+            "type" : "string"
+          },
+          "status" : {
+            "type" : "string",
+            "enum" : [ "ACTIVE", "SUSPENDED" ]
+          }
+        }
+      },
+      "PageInfo" : {
+        "type" : "object",
+        "properties" : {
+          "hasNext" : {
+            "type" : "boolean"
+          },
+          "number" : {
+            "type" : "integer",
+            "format" : "int32"
+          },
+          "size" : {
+            "type" : "integer",
+            "format" : "int32"
+          }
+        }
+      },
+      "PageMetadata" : {
+        "type" : "object",
+        "properties" : {
+          "number" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "size" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "totalElements" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "totalPages" : {
+            "type" : "integer",
+            "format" : "int64"
+          }
+        },
+        "required" : [ "number", "size", "totalElements", "totalPages" ]
+      },
+      "PagedModelAuditEventView" : {
+        "type" : "object",
+        "properties" : {
+          "content" : {
+            "type" : "array",
+            "items" : {
+              "$ref" : "#/components/schemas/AuditEventView"
+            }
+          },
+          "page" : {
+            "$ref" : "#/components/schemas/PageMetadata"
+          }
+        },
+        "required" : [ "content", "page" ]
+      },
+      "PagedModelExceptionSummaryView" : {
+        "type" : "object",
+        "properties" : {
+          "content" : {
+            "type" : "array",
+            "items" : {
+              "$ref" : "#/components/schemas/ExceptionSummaryView"
+            }
+          },
+          "page" : {
+            "$ref" : "#/components/schemas/PageMetadata"
+          }
+        },
+        "required" : [ "content", "page" ]
+      },
+      "PagedModelImportView" : {
+        "type" : "object",
+        "properties" : {
+          "content" : {
+            "type" : "array",
+            "items" : {
+              "$ref" : "#/components/schemas/ImportView"
+            }
+          },
+          "page" : {
+            "$ref" : "#/components/schemas/PageMetadata"
+          }
+        },
+        "required" : [ "content", "page" ]
+      },
+      "PagedModelMatchView" : {
+        "type" : "object",
+        "properties" : {
+          "content" : {
+            "type" : "array",
+            "items" : {
+              "$ref" : "#/components/schemas/MatchView"
+            }
+          },
+          "page" : {
+            "$ref" : "#/components/schemas/PageMetadata"
+          }
+        },
+        "required" : [ "content", "page" ]
+      },
+      "PagedModelMemberView" : {
+        "type" : "object",
+        "properties" : {
+          "content" : {
+            "type" : "array",
+            "items" : {
+              "$ref" : "#/components/schemas/MemberView"
+            }
+          },
+          "page" : {
+            "$ref" : "#/components/schemas/PageMetadata"
+          }
+        },
+        "required" : [ "content", "page" ]
+      },
+      "PagedModelOrganizationResponse" : {
+        "type" : "object",
+        "properties" : {
+          "content" : {
+            "type" : "array",
+            "items" : {
+              "$ref" : "#/components/schemas/OrganizationResponse"
+            }
+          },
+          "page" : {
+            "$ref" : "#/components/schemas/PageMetadata"
+          }
+        },
+        "required" : [ "content", "page" ]
+      },
+      "PagedModelRowErrorView" : {
+        "type" : "object",
+        "properties" : {
+          "content" : {
+            "type" : "array",
+            "items" : {
+              "$ref" : "#/components/schemas/RowErrorView"
+            }
+          },
+          "page" : {
+            "$ref" : "#/components/schemas/PageMetadata"
+          }
+        },
+        "required" : [ "content", "page" ]
+      },
+      "PagedModelRunView" : {
+        "type" : "object",
+        "properties" : {
+          "content" : {
+            "type" : "array",
+            "items" : {
+              "$ref" : "#/components/schemas/RunView"
+            }
+          },
+          "page" : {
+            "$ref" : "#/components/schemas/PageMetadata"
+          }
+        },
+        "required" : [ "content", "page" ]
+      },
+      "Period" : {
+        "type" : "object",
+        "properties" : {
+          "from" : {
+            "type" : "string",
+            "format" : "date"
+          },
+          "granularity" : {
+            "type" : "string",
+            "enum" : [ "DAY", "WEEK", "MONTH" ]
+          },
+          "sourceType" : {
+            "type" : "string"
+          },
+          "to" : {
+            "type" : "string",
+            "format" : "date"
+          }
+        }
+      },
+      "ProblemDetail" : {
+        "type" : "object",
+        "description" : "RFC 9457 problem detail",
+        "properties" : {
+          "code" : {
+            "type" : "string",
+            "description" : "Stable error code (api-design.md §3.1)"
+          },
+          "detail" : {
+            "type" : "string"
+          },
+          "instance" : {
+            "type" : "string"
+          },
+          "requestId" : {
+            "type" : "string",
+            "description" : "Also in the X-Request-Id response header"
+          },
+          "status" : {
+            "type" : "integer",
+            "format" : "int32"
+          },
+          "title" : {
+            "type" : "string"
+          },
+          "type" : {
+            "type" : "string",
+            "format" : "uri"
+          }
+        }
+      },
+      "Progress" : {
+        "type" : "object",
+        "properties" : {
+          "lastCompletedDate" : {
+            "type" : "string",
+            "format" : "date"
+          }
+        }
+      },
+      "ReasonCount" : {
+        "type" : "object",
+        "properties" : {
+          "amount" : {
+            "type" : "number"
+          },
+          "amountDifference" : {
+            "type" : "number"
+          },
+          "count" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "inReview" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "open" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "reasonCode" : {
+            "type" : "string"
+          },
+          "resolved" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "type" : {
+            "type" : "string"
+          }
+        }
+      },
+      "ReconciliationReport" : {
+        "type" : "object",
+        "properties" : {
+          "coverage" : {
+            "$ref" : "#/components/schemas/Coverage"
+          },
+          "currency" : {
+            "type" : "string"
+          },
+          "currencyMismatches" : {
+            "$ref" : "#/components/schemas/Count"
+          },
+          "duplicates" : {
+            "$ref" : "#/components/schemas/Count"
+          },
+          "exceptionsByReason" : {
+            "type" : "array",
+            "items" : {
+              "$ref" : "#/components/schemas/ReasonCount"
+            }
+          },
+          "excluded" : {
+            "$ref" : "#/components/schemas/Count"
+          },
+          "matched" : {
+            "$ref" : "#/components/schemas/CountAndAmount"
+          },
+          "mismatches" : {
+            "$ref" : "#/components/schemas/MismatchSummary"
+          },
+          "resolution" : {
+            "$ref" : "#/components/schemas/ResolutionSummary"
+          },
+          "runsUsed" : {
+            "type" : "array",
+            "items" : {
+              "$ref" : "#/components/schemas/RunRef"
+            }
+          },
+          "scope" : {
+            "$ref" : "#/components/schemas/Scope"
+          },
+          "unmatchedGateway" : {
+            "$ref" : "#/components/schemas/CountAndAmount"
+          },
+          "unmatchedLedger" : {
+            "$ref" : "#/components/schemas/CountAndAmount"
+          }
+        }
+      },
+      "RecordView" : {
+        "type" : "object",
+        "properties" : {
+          "amount" : {
+            "type" : "number"
+          },
+          "batchId" : {
+            "type" : "string",
+            "format" : "uuid"
+          },
+          "currency" : {
+            "type" : "string"
+          },
+          "duplicateInSource" : {
+            "type" : "boolean"
+          },
+          "id" : {
+            "type" : "string",
+            "format" : "uuid"
+          },
+          "normalizedReference" : {
+            "type" : "string"
+          },
+          "rawReference" : {
+            "type" : "string"
+          },
+          "rawValues" : {
+            "$ref" : "#/components/schemas/JsonNode"
+          },
+          "sourceRowNumber" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "status" : {
+            "type" : "string"
+          },
+          "transactionAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          },
+          "transactionDate" : {
+            "type" : "string",
+            "format" : "date"
+          },
+          "transactionType" : {
+            "type" : "string"
+          }
+        }
+      },
+      "Records" : {
+        "type" : "object",
+        "properties" : {
+          "gateway" : {
+            "type" : "array",
+            "items" : {
+              "$ref" : "#/components/schemas/RecordView"
+            }
+          },
+          "ledger" : {
+            "type" : "array",
+            "items" : {
+              "$ref" : "#/components/schemas/RecordView"
+            }
+          }
+        }
+      },
+      "ReopenRequest" : {
+        "type" : "object",
+        "properties" : {
+          "reason" : {
+            "type" : "string"
+          }
+        }
+      },
+      "Resolution" : {
+        "type" : "object",
+        "properties" : {
+          "code" : {
+            "type" : "string",
+            "enum" : [ "TIMING_DIFFERENCE", "GATEWAY_FEE", "DATA_ENTRY_ERROR", "DUPLICATE_CONFIRMED", "DUPLICATE_FILE_ARTIFACT", "WRITTEN_OFF", "FALSE_POSITIVE", "OTHER" ]
+          },
+          "note" : {
+            "type" : "string"
+          },
+          "resolvedAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          },
+          "resolvedBy" : {
+            "$ref" : "#/components/schemas/UserRef"
+          }
+        }
+      },
+      "ResolutionSummary" : {
+        "type" : "object",
+        "properties" : {
+          "byResolver" : {
+            "type" : "array",
+            "items" : {
+              "$ref" : "#/components/schemas/ResolverCount"
+            }
+          },
+          "inReview" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "open" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "resolved" : {
+            "type" : "integer",
+            "format" : "int64"
+          }
+        }
+      },
+      "ResolveRequest" : {
+        "type" : "object",
+        "properties" : {
+          "note" : {
+            "type" : "string",
+            "maxLength" : 4000,
+            "minLength" : 0
+          },
+          "resolutionCode" : {
+            "type" : "string"
+          }
+        }
+      },
+      "ResolverCount" : {
+        "type" : "object",
+        "properties" : {
+          "displayName" : {
+            "type" : "string"
+          },
+          "resolved" : {
+            "type" : "integer",
+            "format" : "int64"
+          },
+          "userId" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        }
+      },
+      "RetryRequest" : {
+        "type" : "object",
+        "properties" : {
+          "reason" : {
+            "type" : "string",
+            "maxLength" : 1000,
+            "minLength" : 0
+          }
+        },
+        "required" : [ "reason" ]
+      },
+      "RowErrorView" : {
+        "type" : "object",
+        "properties" : {
+          "code" : {
+            "type" : "string"
+          },
+          "column" : {
+            "type" : "string"
+          },
+          "message" : {
+            "type" : "string"
+          },
+          "rawRow" : {
+            "type" : "string"
+          },
+          "rowNumber" : {
+            "type" : "integer",
+            "format" : "int32"
+          }
+        }
+      },
+      "RunRef" : {
+        "type" : "object",
+        "properties" : {
+          "created" : {
+            "type" : "boolean"
+          },
+          "observedAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          },
+          "runId" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        }
+      },
+      "RunRequest" : {
+        "type" : "object",
+        "properties" : {
+          "currency" : {
+            "type" : "string",
+            "minLength" : 1
+          },
+          "leftSource" : {
+            "type" : "string",
+            "enum" : [ "INTERNAL_LEDGER", "GATEWAY" ]
+          },
+          "periodEnd" : {
+            "type" : "string",
+            "format" : "date"
+          },
+          "periodStart" : {
+            "type" : "string",
+            "format" : "date"
+          },
+          "rightSource" : {
+            "type" : "string",
+            "enum" : [ "INTERNAL_LEDGER", "GATEWAY" ]
+          }
+        },
+        "required" : [ "currency", "periodEnd", "periodStart" ]
+      },
+      "RunView" : {
+        "type" : "object",
+        "properties" : {
+          "completedAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          },
+          "createdAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          },
+          "currency" : {
+            "type" : "string"
+          },
+          "failureReason" : {
+            "type" : "string"
+          },
+          "id" : {
+            "type" : "string",
+            "format" : "uuid"
+          },
+          "leftSource" : {
+            "type" : "string",
+            "enum" : [ "INTERNAL_LEDGER", "GATEWAY" ]
+          },
+          "periodEnd" : {
+            "type" : "string",
+            "format" : "date"
+          },
+          "periodStart" : {
+            "type" : "string",
+            "format" : "date"
+          },
+          "progress" : {
+            "$ref" : "#/components/schemas/Progress"
+          },
+          "rightSource" : {
+            "type" : "string",
+            "enum" : [ "INTERNAL_LEDGER", "GATEWAY" ]
+          },
+          "startedAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          },
+          "status" : {
+            "type" : "string",
+            "enum" : [ "PENDING", "RUNNING", "COMPLETED", "FAILED" ]
+          },
+          "summary" : {
+            "$ref" : "#/components/schemas/Summary"
+          },
+          "triggeredBy" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        }
+      },
+      "Scope" : {
+        "type" : "object",
+        "properties" : {
+          "from" : {
+            "type" : "string",
+            "format" : "date"
+          },
+          "mode" : {
+            "type" : "string",
+            "enum" : [ "RUN", "DATE_RANGE" ]
+          },
+          "runId" : {
+            "type" : "string",
+            "format" : "uuid"
+          },
+          "to" : {
+            "type" : "string",
+            "format" : "date"
+          }
+        }
+      },
+      "Side" : {
+        "type" : "object",
+        "properties" : {
+          "amount" : {
+            "type" : "number"
+          },
+          "id" : {
+            "type" : "string",
+            "format" : "uuid"
+          },
+          "normalizedReference" : {
+            "type" : "string"
+          },
+          "reference" : {
+            "type" : "string"
+          },
+          "transactionDate" : {
+            "type" : "string",
+            "format" : "date"
+          }
+        }
+      },
+      "SliceViewTransactionView" : {
+        "type" : "object",
+        "properties" : {
+          "content" : {
+            "type" : "array",
+            "items" : {
+              "$ref" : "#/components/schemas/TransactionView"
+            }
+          },
+          "page" : {
+            "$ref" : "#/components/schemas/PageInfo"
+          }
+        }
+      },
+      "StreamingResponseBody" : { },
+      "Summary" : {
+        "type" : "object",
+        "properties" : {
+          "amountMismatch" : {
+            "$ref" : "#/components/schemas/Difference"
+          },
+          "currencyMismatches" : {
+            "$ref" : "#/components/schemas/Count"
+          },
+          "duplicates" : {
+            "$ref" : "#/components/schemas/Count"
+          },
+          "excluded" : {
+            "$ref" : "#/components/schemas/Count"
+          },
+          "matched" : {
+            "$ref" : "#/components/schemas/Amount"
+          },
+          "unmatchedLeft" : {
+            "$ref" : "#/components/schemas/Amount"
+          },
+          "unmatchedRight" : {
+            "$ref" : "#/components/schemas/Amount"
+          }
+        }
+      },
+      "TemporaryPasswordResponse" : {
+        "type" : "object",
+        "properties" : {
+          "temporaryPassword" : {
+            "type" : "string"
+          }
+        }
+      },
+      "TransactionView" : {
+        "type" : "object",
+        "properties" : {
+          "amount" : {
+            "type" : "number"
+          },
+          "batchId" : {
+            "type" : "string",
+            "format" : "uuid"
+          },
+          "createdAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          },
+          "currency" : {
+            "type" : "string"
+          },
+          "duplicateInSource" : {
+            "type" : "boolean"
+          },
+          "id" : {
+            "type" : "string",
+            "format" : "uuid"
+          },
+          "normalizedReference" : {
+            "type" : "string"
+          },
+          "rawReference" : {
+            "type" : "string"
+          },
+          "sourceRowNumber" : {
+            "type" : "integer",
+            "format" : "int32"
+          },
+          "sourceType" : {
+            "type" : "string",
+            "enum" : [ "INTERNAL_LEDGER", "GATEWAY" ]
+          },
+          "status" : {
+            "type" : "string",
+            "enum" : [ "SUCCESS", "PENDING", "FAILED", "REVERSED" ]
+          },
+          "transactionAt" : {
+            "type" : "string",
+            "format" : "date-time"
+          },
+          "transactionDate" : {
+            "type" : "string",
+            "format" : "date"
+          },
+          "transactionType" : {
+            "type" : "string",
+            "enum" : [ "PAYMENT", "REFUND", "CHARGEBACK", "FEE" ]
+          }
+        }
+      },
+      "UserRef" : {
+        "type" : "object",
+        "properties" : {
+          "displayName" : {
+            "type" : "string"
+          },
+          "id" : {
+            "type" : "string",
+            "format" : "uuid"
+          }
+        }
+      }
+    },
+    "securitySchemes" : {
+      "bearer" : {
+        "bearerFormat" : "JWT",
+        "description" : "An access token from Keycloak (realm reconflow, audience reconflow-api)",
+        "scheme" : "bearer",
+        "type" : "http"
+      }
+    }
+  }
+}

@@ -5,6 +5,8 @@ import com.reconflow.paymentreconflow.organization.OrganizationStatus;
 import com.reconflow.paymentreconflow.shared.context.Permission;
 import com.reconflow.paymentreconflow.shared.context.RequiresPermission;
 import com.reconflow.paymentreconflow.shared.web.Pagination;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import io.swagger.v3.oas.annotations.responses.ApiResponses;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
@@ -59,6 +61,7 @@ class PlatformOrganizationController {
     }
 
     @GetMapping
+    @ApiResponses({@ApiResponse(responseCode = "200", description = "A page of organizations")})
     @RequiresPermission(Permission.PLATFORM_ORG_MANAGE)
     PagedModel<OrganizationResponse> list(
             @RequestParam(defaultValue = "0") int page,
@@ -69,6 +72,10 @@ class PlatformOrganizationController {
     }
 
     @PostMapping
+    @ApiResponses({
+        @ApiResponse(responseCode = "201", description = "The organization and its first admin"),
+        @ApiResponse(responseCode = "400", description = "validation-failed or a bad parameter")
+    })
     @RequiresPermission(Permission.PLATFORM_ORG_MANAGE)
     ResponseEntity<CreatedOrganizationResponse> create(@Valid @RequestBody CreateOrganizationRequest request) {
         var created = platform.create(request.name(), request.adminEmail(), request.adminDisplayName());

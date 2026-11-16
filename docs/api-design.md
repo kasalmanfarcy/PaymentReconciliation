@@ -6,6 +6,8 @@ The contract every controller follows. If a controller needs to break a conventi
 
 Authentication and authorization are designed in [plans/authentication.plan](../plans/authentication.plan); this document links to it instead of repeating it.
 
+**Machine-readable contract (M11.7):** [openapi.json](openapi.json), generated from the controllers by springdoc and served as Swagger UI at `/swagger-ui.html` on every profile but `prod`. `OpenApiSpecIT` fails the build when the code no longer generates the committed file, when an `/api/v1` endpoint is missing from it, or when its success and main error codes disagree with the §8.1 index below; so this document, the spec and the code can't drift apart silently.
+
 ---
 
 ## 1. Conventions

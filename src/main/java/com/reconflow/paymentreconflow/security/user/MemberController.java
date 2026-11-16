@@ -3,6 +3,8 @@ package com.reconflow.paymentreconflow.security.user;
 import com.reconflow.paymentreconflow.shared.context.Permission;
 import com.reconflow.paymentreconflow.shared.context.RequiresPermission;
 import com.reconflow.paymentreconflow.shared.context.Role;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import io.swagger.v3.oas.annotations.responses.ApiResponses;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
@@ -57,6 +59,7 @@ class MemberController {
     }
 
     @GetMapping
+    @ApiResponses({@ApiResponse(responseCode = "200", description = "A page of members")})
     @RequiresPermission(Permission.MEMBER_MANAGE)
     PagedModel<MemberView> list(
             @RequestParam(defaultValue = "0") int page,
@@ -70,6 +73,14 @@ class MemberController {
      * created, shown this once, and never logged; it's null when an existing user was attached.
      */
     @PostMapping
+    @ApiResponses({
+        @ApiResponse(responseCode = "201", description = "The member, with a one-time temporary password"),
+        @ApiResponse(responseCode = "400", description = "validation-failed or a bad parameter"),
+        @ApiResponse(
+                responseCode = "409",
+                description = "conflict: the code in the problem detail says which (api-design.md §3.1)"),
+        @ApiResponse(responseCode = "503", description = "a dependency is unavailable; retry later")
+    })
     @RequiresPermission(Permission.MEMBER_MANAGE)
     ResponseEntity<CreatedMemberResponse> create(@Valid @RequestBody CreateMemberRequest request) {
         var created = members.create(request.email(), request.displayName(), request.role());
@@ -88,6 +99,13 @@ class MemberController {
     @PatchMapping(
             path = "/{userId}",
             consumes = {"application/json", "application/merge-patch+json"})
+    @ApiResponses({
+        @ApiResponse(responseCode = "200", description = "The updated member"),
+        @ApiResponse(responseCode = "404", description = "not found (or another tenant's id)"),
+        @ApiResponse(
+                responseCode = "409",
+                description = "conflict: the code in the problem detail says which (api-design.md §3.1)")
+    })
     @RequiresPermission(Permission.MEMBER_MANAGE)
     MemberView changeRole(@PathVariable UUID userId, @Valid @RequestBody ChangeRoleRequest request) {
         return members.changeRole(userId, request.role());
@@ -95,12 +113,25 @@ class MemberController {
 
     /** The only account-recovery path in v1: there is no email, so no self-service reset. */
     @PostMapping("/{userId}/reset-password")
+    @ApiResponses({
+        @ApiResponse(responseCode = "200", description = "A new temporary password"),
+        @ApiResponse(responseCode = "404", description = "not found (or another tenant's id)"),
+        @ApiResponse(responseCode = "503", description = "a dependency is unavailable; retry later")
+    })
     @RequiresPermission(Permission.MEMBER_MANAGE)
     TemporaryPasswordResponse resetPassword(@PathVariable UUID userId) {
         return new TemporaryPasswordResponse(members.resetPassword(userId));
     }
 
     @PostMapping("/{userId}/disable")
+    @ApiResponses({
+        @ApiResponse(responseCode = "200", description = "The disabled member"),
+        @ApiResponse(responseCode = "404", description = "not found (or another tenant's id)"),
+        @ApiResponse(
+                responseCode = "409",
+                description = "conflict: the code in the problem detail says which (api-design.md §3.1)"),
+        @ApiResponse(responseCode = "503", description = "a dependency is unavailable; retry later")
+    })
     @RequiresPermission(Permission.MEMBER_MANAGE)
     MemberView disable(@PathVariable UUID userId) {
         return members.disable(userId);

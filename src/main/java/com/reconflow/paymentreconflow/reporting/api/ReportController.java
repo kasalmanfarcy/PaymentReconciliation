@@ -13,6 +13,8 @@ import com.reconflow.paymentreconflow.shared.context.Permission;
 import com.reconflow.paymentreconflow.shared.context.RequiresBothPermissions;
 import com.reconflow.paymentreconflow.shared.context.RequiresPermission;
 import com.reconflow.paymentreconflow.shared.storage.FileStorage;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import io.swagger.v3.oas.annotations.responses.ApiResponses;
 import java.net.URI;
 import java.time.LocalDate;
 import java.util.List;
@@ -74,6 +76,14 @@ class ReportController {
      * {@code EXCEPTION_READ} too: it shows the cases and who resolved them.
      */
     @GetMapping("/reconciliation")
+    @ApiResponses({
+        @ApiResponse(responseCode = "200", description = "The reconciliation report"),
+        @ApiResponse(responseCode = "400", description = "validation-failed or a bad parameter"),
+        @ApiResponse(responseCode = "404", description = "not found (or another tenant's id)"),
+        @ApiResponse(
+                responseCode = "409",
+                description = "conflict: the code in the problem detail says which (api-design.md §3.1)")
+    })
     @RequiresBothPermissions(value = Permission.REPORT_READ, and = Permission.EXCEPTION_READ)
     ReconciliationReport reconciliation(
             @RequestParam(required = false) @Nullable UUID runId,
@@ -88,6 +98,11 @@ class ReportController {
      * ({@code day} by default, {@code week}, {@code month}) and {@code sourceType}.
      */
     @GetMapping("/import-quality")
+    @ApiResponses({
+        @ApiResponse(responseCode = "200", description = "Import quality"),
+        @ApiResponse(responseCode = "400", description = "validation-failed or a bad parameter"),
+        @ApiResponse(responseCode = "404", description = "not found (or another tenant's id)")
+    })
     @RequiresPermission(Permission.REPORT_READ)
     ImportQualityReport importQuality(
             @RequestParam(required = false) @Nullable UUID batchId,
@@ -103,6 +118,10 @@ class ReportController {
      * {@code assignedTo} (a user id, {@code me} or {@code unassigned}), {@code currency}.
      */
     @GetMapping("/exception-ageing")
+    @ApiResponses({
+        @ApiResponse(responseCode = "200", description = "Exception ageing"),
+        @ApiResponse(responseCode = "400", description = "validation-failed or a bad parameter")
+    })
     @RequiresPermission(Permission.REPORT_READ)
     ExceptionAgeingReport exceptionAgeing(
             @RequestParam(required = false) @Nullable List<String> type,
@@ -125,6 +144,12 @@ class ReportController {
      * declared return type; the 202's small JSON body is simply written by it.
      */
     @GetMapping("/exceptions/export")
+    @ApiResponses({
+        @ApiResponse(responseCode = "200", description = "The CSV, streamed (runs up to the sync limit)"),
+        @ApiResponse(responseCode = "202", description = "An export job was queued (larger runs); poll the Location"),
+        @ApiResponse(responseCode = "400", description = "validation-failed or a bad parameter"),
+        @ApiResponse(responseCode = "404", description = "not found (or another tenant's id)")
+    })
     @RequiresBothPermissions(value = Permission.REPORT_READ, and = Permission.EXCEPTION_READ)
     ResponseEntity<StreamingResponseBody> exportExceptions(@RequestParam UUID runId) {
         return switch (exports.request(runId)) {
@@ -151,6 +176,10 @@ class ReportController {
 
     /** A background export's status; {@code Retry-After} until it is DONE or FAILED. */
     @GetMapping("/exports/{id}")
+    @ApiResponses({
+        @ApiResponse(responseCode = "200", description = "The export job"),
+        @ApiResponse(responseCode = "404", description = "not found (or another tenant's id)")
+    })
     @RequiresBothPermissions(value = Permission.REPORT_READ, and = Permission.EXCEPTION_READ)
     ResponseEntity<ExportView> export(@PathVariable UUID id) {
         ExportView export = exports.status(id);
@@ -163,6 +192,13 @@ class ReportController {
 
     /** A finished background export's CSV, streamed from object storage; {@code 409} until DONE. */
     @GetMapping("/exports/{id}/file")
+    @ApiResponses({
+        @ApiResponse(responseCode = "200", description = "The exported CSV"),
+        @ApiResponse(responseCode = "404", description = "not found (or another tenant's id)"),
+        @ApiResponse(
+                responseCode = "409",
+                description = "conflict: the code in the problem detail says which (api-design.md §3.1)")
+    })
     @RequiresBothPermissions(value = Permission.REPORT_READ, and = Permission.EXCEPTION_READ)
     ResponseEntity<StreamingResponseBody> exportFile(@PathVariable UUID id) {
         String key = exports.fileKey(id); // checks organization and status before anything streams

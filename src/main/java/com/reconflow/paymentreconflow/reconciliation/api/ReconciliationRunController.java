@@ -11,6 +11,8 @@ import com.reconflow.paymentreconflow.shared.context.RequiresPermission;
 import com.reconflow.paymentreconflow.shared.ratelimit.RateLimitPolicy;
 import com.reconflow.paymentreconflow.shared.ratelimit.RateLimited;
 import com.reconflow.paymentreconflow.shared.web.Pagination;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import io.swagger.v3.oas.annotations.responses.ApiResponses;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
@@ -51,6 +53,10 @@ class ReconciliationRunController {
 
     /** The organization's runs, newest first; filters: status (repeatable), a period overlapping from..to. */
     @GetMapping
+    @ApiResponses({
+        @ApiResponse(responseCode = "200", description = "A page of runs"),
+        @ApiResponse(responseCode = "400", description = "validation-failed or a bad parameter")
+    })
     @RequiresPermission(Permission.RUN_READ)
     PagedModel<RunView> list(
             @RequestParam(required = false) @Nullable List<RunStatus> status,
@@ -64,6 +70,10 @@ class ReconciliationRunController {
 
     /** Status, progress and summary; cheap to poll, with Retry-After until the run is terminal. */
     @GetMapping("/{id}")
+    @ApiResponses({
+        @ApiResponse(responseCode = "200", description = "The run, with Retry-After while it is running"),
+        @ApiResponse(responseCode = "404", description = "not found (or another tenant's id)")
+    })
     @RequiresPermission(Permission.RUN_READ)
     ResponseEntity<RunView> get(@PathVariable UUID id) {
         return withRetryAfter(ResponseEntity.ok(), queries.get(id));
@@ -75,6 +85,17 @@ class ReconciliationRunController {
      * repeated request (ADR 0006).
      */
     @PostMapping
+    @ApiResponses({
+        @ApiResponse(responseCode = "202", description = "A new run was queued"),
+        @ApiResponse(
+                responseCode = "200",
+                description = "The same request was made before: the existing run (idempotent)"),
+        @ApiResponse(responseCode = "400", description = "validation-failed or a bad parameter"),
+        @ApiResponse(
+                responseCode = "409",
+                description = "conflict: the code in the problem detail says which (api-design.md §3.1)"),
+        @ApiResponse(responseCode = "422", description = "unprocessable: see the code in the problem detail")
+    })
     @RequiresPermission(Permission.RUN_CREATE)
     @RateLimited(RateLimitPolicy.RUN_CREATE)
     ResponseEntity<RunView> create(
@@ -96,6 +117,14 @@ class ReconciliationRunController {
 
     /** 202 like the request: the run is PENDING again and its new job is queued. */
     @PostMapping("/{id}/retry")
+    @ApiResponses({
+        @ApiResponse(responseCode = "202", description = "The failed run resumes from its checkpoint"),
+        @ApiResponse(responseCode = "400", description = "validation-failed or a bad parameter"),
+        @ApiResponse(responseCode = "404", description = "not found (or another tenant's id)"),
+        @ApiResponse(
+                responseCode = "409",
+                description = "conflict: the code in the problem detail says which (api-design.md §3.1)")
+    })
     @RequiresPermission(Permission.RUN_CREATE)
     @RateLimited(RateLimitPolicy.RUN_CREATE)
     ResponseEntity<RunView> retry(@PathVariable UUID id, @Valid @RequestBody RetryRequest request) {
@@ -108,6 +137,10 @@ class ReconciliationRunController {
 
     /** The run's matches, both records side by side; 404 if the run isn't the caller's. */
     @GetMapping("/{id}/matches")
+    @ApiResponses({
+        @ApiResponse(responseCode = "200", description = "A page of matches, both records side by side"),
+        @ApiResponse(responseCode = "404", description = "not found (or another tenant's id)")
+    })
     @RequiresPermission(Permission.RUN_READ)
     PagedModel<MatchView> matches(
             @PathVariable UUID id,

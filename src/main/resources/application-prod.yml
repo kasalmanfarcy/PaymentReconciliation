@@ -52,3 +52,11 @@ management:
     # forwards only server.port, so metrics are never public; Prometheus and the orchestrator's
     # probes reach this one on the internal network.
     port: ${MANAGEMENT_PORT:8081}
+
+springdoc:
+  # M11.7: no OpenAPI document or Swagger UI in production (both 404); the committed docs/openapi.json
+  # is the published contract.
+  api-docs:
+    enabled: false
+  swagger-ui:
+    enabled: false

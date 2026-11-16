@@ -3,6 +3,8 @@ package com.reconflow.paymentreconflow.ledger.internal;
 import com.reconflow.paymentreconflow.ledger.SourceType;
 import com.reconflow.paymentreconflow.shared.context.Permission;
 import com.reconflow.paymentreconflow.shared.context.RequiresPermission;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import io.swagger.v3.oas.annotations.responses.ApiResponses;
 import java.time.LocalDate;
 import java.util.List;
 import java.util.UUID;
@@ -28,6 +30,10 @@ class TransactionController {
     }
 
     @GetMapping
+    @ApiResponses({
+        @ApiResponse(responseCode = "200", description = "A slice of records (no total count)"),
+        @ApiResponse(responseCode = "400", description = "validation-failed or a bad parameter")
+    })
     @RequiresPermission(Permission.TRANSACTION_READ)
     SliceView<TransactionView> search(
             @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate transactionDateFrom,

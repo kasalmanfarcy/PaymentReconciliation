@@ -12,6 +12,8 @@ import com.reconflow.paymentreconflow.shared.context.RequiresPermission;
 import com.reconflow.paymentreconflow.shared.ratelimit.RateLimitPolicy;
 import com.reconflow.paymentreconflow.shared.ratelimit.RateLimited;
 import com.reconflow.paymentreconflow.shared.web.Pagination;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import io.swagger.v3.oas.annotations.responses.ApiResponses;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
@@ -62,6 +64,15 @@ class ImportController {
      * the upload's natural idempotency key.
      */
     @PostMapping(consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    @ApiResponses({
+        @ApiResponse(responseCode = "202", description = "The batch was stored and queued; poll the Location"),
+        @ApiResponse(responseCode = "400", description = "validation-failed or a bad parameter"),
+        @ApiResponse(
+                responseCode = "409",
+                description = "conflict: the code in the problem detail says which (api-design.md §3.1)"),
+        @ApiResponse(responseCode = "413", description = "file-too-large"),
+        @ApiResponse(responseCode = "415", description = "unsupported media type")
+    })
     @RequiresPermission(Permission.IMPORT_CREATE)
     @RateLimited(RateLimitPolicy.IMPORT_UPLOAD)
     ResponseEntity<ImportView> upload(
@@ -75,6 +86,10 @@ class ImportController {
     }
 
     @GetMapping
+    @ApiResponses({
+        @ApiResponse(responseCode = "200", description = "A page of imports"),
+        @ApiResponse(responseCode = "400", description = "validation-failed or a bad parameter")
+    })
     @RequiresPermission(Permission.IMPORT_READ)
     PagedModel<ImportView> list(
             @RequestParam(required = false) @Nullable List<ImportBatchStatus> status,
@@ -87,12 +102,20 @@ class ImportController {
 
     /** Cheap to poll: one primary-key lookup and one index count. */
     @GetMapping("/{id}")
+    @ApiResponses({
+        @ApiResponse(responseCode = "200", description = "The import, with Retry-After while it is processing"),
+        @ApiResponse(responseCode = "404", description = "not found (or another tenant's id)")
+    })
     @RequiresPermission(Permission.IMPORT_READ)
     ResponseEntity<ImportView> get(@PathVariable UUID id) {
         return withRetryAfter(queries.get(id));
     }
 
     @GetMapping("/{id}/errors")
+    @ApiResponses({
+        @ApiResponse(responseCode = "200", description = "A page of row errors"),
+        @ApiResponse(responseCode = "404", description = "not found (or another tenant's id)")
+    })
     @RequiresPermission(Permission.IMPORT_READ)
     PagedModel<RowErrorView> errors(
             @PathVariable UUID id,
@@ -105,6 +128,13 @@ class ImportController {
 
     /** 202 like the upload: the batch is RECEIVED again and its new job is queued. */
     @PostMapping("/{id}/retry")
+    @ApiResponses({
+        @ApiResponse(responseCode = "202", description = "The failed import was queued again"),
+        @ApiResponse(responseCode = "404", description = "not found (or another tenant's id)"),
+        @ApiResponse(
+                responseCode = "409",
+                description = "conflict: the code in the problem detail says which (api-design.md §3.1)")
+    })
     @RequiresPermission(Permission.IMPORT_CREATE)
     @RateLimited(RateLimitPolicy.IMPORT_UPLOAD)
     ResponseEntity<ImportView> retry(@PathVariable UUID id, @Valid @RequestBody RetryRequest request) {

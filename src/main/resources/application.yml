@@ -239,3 +239,12 @@ logging:
     org.flywaydb: INFO
     # M10.6: bind parameters (every value of every statement) are never logged, in any profile.
     org.hibernate.orm.jdbc.bind: INFO
+
+springdoc:
+  # M11.7: document the API only (not actuator or the error endpoint), with keys sorted so the
+  # generated document is byte-stable and docs/openapi.json diffs show real changes only.
+  paths-to-match: /api/**
+  writer-with-order-by-keys: true
+  writer-with-default-pretty-printer: true
+  swagger-ui:
+    path: /swagger-ui.html

@@ -24,7 +24,13 @@ class CrossTenantCoverageIT extends AbstractIntegrationTest {
      * are covered by PlatformOrganizationIT (org roles get 403, platform admins get 404 on org
      * routes), and /error is the container's error page.
      */
-    static final List<String> EXEMPT_PREFIXES = List.of("/api/v1/auth/", "/api/v1/platform/", "/error");
+    static final List<String> EXEMPT_PREFIXES = List.of(
+            "/api/v1/auth/",
+            "/api/v1/platform/",
+            "/error",
+            // M11.7: the OpenAPI document and Swagger UI describe the API; they read no tenant data.
+            "/v3/api-docs",
+            "/swagger-ui");
 
     @Autowired
     @Qualifier("requestMappingHandlerMapping")

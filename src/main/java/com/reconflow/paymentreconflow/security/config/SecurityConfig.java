@@ -11,8 +11,10 @@ import jakarta.servlet.DispatcherType;
 import java.time.Duration;
 import java.util.List;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnBooleanProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.annotation.Order;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.config.Customizer;
 import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
@@ -49,7 +51,34 @@ import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
 @EnableMethodSecurity
 class SecurityConfig {
 
+    /**
+     * The OpenAPI document and Swagger UI (M11.7): public, read-only, and only where springdoc is on
+     * (every profile but prod, which turns {@code springdoc.api-docs.enabled} off, so this chain
+     * doesn't exist there). Swagger UI is an HTML page with scripts and styles of its own, so it gets a
+     * CSP that allows same-origin resources instead of the API's {@code default-src 'none'}; the
+     * "Try it out" calls go to the API, under the main chain, with a bearer token.
+     */
     @Bean
+    @Order(1)
+    @ConditionalOnBooleanProperty(name = "springdoc.api-docs.enabled", matchIfMissing = true)
+    SecurityFilterChain apiDocsFilterChain(HttpSecurity http) {
+        http.securityMatcher(
+                        "/v3/api-docs", "/v3/api-docs/**", "/v3/api-docs.yaml", "/swagger-ui.html", "/swagger-ui/**")
+                .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                .csrf(AbstractHttpConfigurer::disable)
+                .headers(headers -> headers.contentSecurityPolicy(csp -> csp.policyDirectives(
+                                "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline';"
+                                        + " frame-ancestors 'none'; form-action 'none'"))
+                        .referrerPolicy(referrer -> referrer.policy(ReferrerPolicy.NO_REFERRER)))
+                .authorizeHttpRequests(auth -> auth.requestMatchers(request -> "GET".equals(request.getMethod()))
+                        .permitAll()
+                        .anyRequest()
+                        .denyAll());
+        return http.build();
+    }
+
+    @Bean
+    @Order(2)
     SecurityFilterChain securityFilterChain(
             HttpSecurity http,
             AuthenticationEntryPoint problemEntryPoint,

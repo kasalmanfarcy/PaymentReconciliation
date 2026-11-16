@@ -7,6 +7,8 @@ import com.reconflow.paymentreconflow.audit.internal.AuditTimeline;
 import com.reconflow.paymentreconflow.shared.context.Permission;
 import com.reconflow.paymentreconflow.shared.context.RequiresPermission;
 import com.reconflow.paymentreconflow.shared.web.Pagination;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import io.swagger.v3.oas.annotations.responses.ApiResponses;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -57,6 +59,10 @@ class AuditEventController {
     }
 
     @GetMapping
+    @ApiResponses({
+        @ApiResponse(responseCode = "200", description = "A page of the entity's audit events"),
+        @ApiResponse(responseCode = "400", description = "validation-failed or a bad parameter")
+    })
     @RequiresPermission(Permission.AUDIT_READ)
     PagedModel<AuditEventView> timeline(
             @RequestParam AuditEntityType entityType,

@@ -65,13 +65,13 @@ Design docs come before code. Each one answers questions from projectoverview.md
 - [ ] **M2.1** Add `spring-boot-starter-data-jpa`, the PostgreSQL driver, `flyway-core` and `flyway-database-postgresql`.
 - [ ] **M2.2** Add `spring-boot-starter-actuator` and `spring-boot-starter-security`.
 - [ ] **M2.3** Add Testcontainers (PostgreSQL) and the `spring-boot-testcontainers` support.
-- [ ] **M2.4** Add `compose.yaml` with PostgreSQL (pinned version, named volume, healthcheck).
+- [ ] **M2.4** Add `compose.yaml` with PostgreSQL (pinned version, named volume, healthcheck) and MinIO for S3-compatible file storage (bucket `reconflow-imports`).
 - [ ] **M2.5** Switch configuration to `application.yml` with `local`, `test` and `prod` profiles. Secrets come from environment variables, never from committed files.
 - [ ] **M2.6** Set `spring.jpa.hibernate.ddl-auto=validate` so Flyway owns the schema and Hibernate only checks it.
 - [ ] **M2.7** Set `spring.jpa.open-in-view=false`.
 
 ### Code structure
-- [ ] **M2.8** Create the module packages: `ingestion`, `ledger`, `reconciliation`, `exceptions`, `reporting`, `audit`, `organization`, `shared`.
+- [ ] **M2.8** Create the module packages: `ingestion`, `ledger`, `reconciliation`, `exceptions`, `reporting`, `audit`, `organization`, `security`, `shared`. Add the `api` and `worker` role profiles, which enable different beans (the worker sets `reconflow.jobs.worker.enabled`).
 - [ ] **M2.9** Enforce module boundaries with ArchUnit or Spring Modulith tests.
 - [ ] **M2.10** Add a global `@RestControllerAdvice` that returns `ProblemDetail` for validation, not-found, conflict and generic errors.
 - [ ] **M2.11** Add a request correlation ID: a filter, MDC, and a `X-Request-Id` response header.
@@ -83,7 +83,7 @@ Design docs come before code. Each one answers questions from projectoverview.md
 - [ ] **M2.15** Add a GitHub Actions workflow that runs build, tests (with Testcontainers) and format checks on each PR.
 - [ ] **M2.16** Add a base integration test class that starts the context against a Testcontainers PostgreSQL instance.
 
-**Exit criteria:** `docker compose up` followed by `./mvnw spring-boot:run` starts against PostgreSQL, Flyway applies `V1__baseline.sql`, `/actuator/health` returns `UP`, and CI is green.
+**Exit criteria:** `docker compose up` followed by `./mvnw spring-boot:run` starts against PostgreSQL, Flyway applies `V1__initial_schema.sql`, `V2__auth_hardening.sql` and `V3__refresh_token_constraints.sql`, `/actuator/health` returns `UP`, and CI is green.
 
 ---
 
@@ -105,7 +105,7 @@ Tenant isolation comes before any financial data exists, not after.
   - [ ] **M3.3i** All code reads identity only through `CurrentUser` / `TenantContext`, never from the `SecurityContext` directly.
   - [ ] **M3.3j** Tests: an expired token gives `401`, a tampered signature gives `401`, a reused refresh token revokes its family, lockout triggers after N failures, and the error messages for unknown user and wrong password are identical.
 - [ ] **M3.4** Tenant context: resolve the caller's `organizationId` once per request and expose it through a request-scoped bean.
-- [ ] **M3.5** Repository convention: every tenant-owned query takes `organizationId`. Add an ArchUnit rule or a review checklist item for it.
+- [ ] **M3.5** Repository convention: every tenant-owned query takes `organizationId`. Add an ArchUnit rule or a review checklist item for it. Add PostgreSQL row-level security policies on every tenant-owned table as a second layer, with `app.org_id` set per transaction (`SET LOCAL` / `set_config(..., true)`).
 - [ ] **M3.6** Return `404` (not `403`) for another tenant's resource IDs, so IDs can't be probed.
 - [ ] **M3.7** Add a role-based authorization matrix (`@PreAuthorize`) and document it in `api-design.md`.
 - [ ] **M3.8** Seed data: Flyway `R__` scripts or a `local`-profile seeder creating two organizations and users for each role.
@@ -130,23 +130,26 @@ Built early so later milestones emit events as they go, instead of retrofitting 
 
 ## M5 — Transaction ingestion
 
+### Job queue
+- [ ] **M5.0** DB-backed job queue in `shared.jobs` (moved forward from M9.2, see docs/scalability.md §4): claim with `FOR UPDATE SKIP LOCKED`, leases with heartbeats, a sweeper for expired leases, at most 2 running jobs per organization, exponential backoff, and a `JobHandler` per job type. Enqueue in the same transaction as the business row.
+
 ### Data model
 - [ ] **M5.1** Write a migration and entity for `import_batch`: source type, status, file name, content hash (SHA-256), stored file reference, total/valid/error row counts, timestamps and `uploaded_by`.
 - [ ] **M5.2** Write a migration and entity for `import_row_error`: batch, row number, column, error code, message, raw row.
-- [ ] **M5.3** Write a migration and entity for `transaction_record`: org, batch, source type, raw reference, normalized reference, `amount NUMERIC`, currency, transaction type, status, transaction date, raw values (JSONB) and the source row number.
+- [ ] **M5.3** Write a migration and entity for `transaction_record`: org, batch, source type, raw reference, normalized reference, `amount NUMERIC`, currency, transaction type, status, transaction date, raw values (JSONB) and the source row number. *Note: V1 already creates the table, partitioned by month on `transaction_date`; this task maps the entity and the writer.*
 - [ ] **M5.4** Add a unique constraint on `(organization_id, source_type, content_hash)` for duplicate-file detection.
 - [ ] **M5.5** Add a unique constraint that prevents the same source record being inserted twice by a retried batch, e.g. `(batch_id, source_row_number)`.
 - [ ] **M5.6** Add indexes for the match query: `(organization_id, source_type, normalized_reference)` and `(organization_id, transaction_date)`.
 
 ### Upload and processing
 - [ ] **M5.7** `POST /api/v1/imports` (multipart): check file size, content type, org access and required headers, then create the batch as `RECEIVED`.
-- [ ] **M5.8** File storage: write the original file to a `FileStorage` abstraction, using a local filesystem implementation for v1.
-- [ ] **M5.9** Duplicate-file policy: implement the ADR from M1.12, either rejecting with `409` and the existing batch ID or allowing an explicit re-import.
-- [ ] **M5.10** CSV parser (Apache Commons CSV or similar) that streams rows instead of loading the whole file into memory.
+- [ ] **M5.8** File storage: write the original file to a `FileStorage` abstraction implemented on S3-compatible storage (MinIO locally), so any worker can read a file uploaded through any API instance.
+- [ ] **M5.9** Duplicate-file policy: implement ADR 0005: reject with `409 duplicate-file` and the existing batch ID; a failed batch is retried in place (M5.20), never re-uploaded.
+- [ ] **M5.10** CSV parser (Apache Commons CSV or similar) that streams rows instead of loading the whole file into memory. Rows are processed and committed in chunks of 5,000 with a `last_committed_row` resume checkpoint (M5.14).
 - [ ] **M5.11** Row validator: required fields, amount format and scale, ISO currency, date parsing and enum values. Collect errors for each row and keep going.
 - [ ] **M5.12** Normalizer: produce normalized fields while keeping the raw values intact.
 - [ ] **M5.13** Within-file duplicate detection: flag repeated rows without dropping either one.
-- [ ] **M5.14** Batch inserts: JDBC batching or `saveAll` in chunks, with `hibernate.jdbc.batch_size` and sequence-based IDs.
+- [ ] **M5.14** Batch inserts: JDBC batching in chunks of 5,000 rows, one transaction per chunk that also advances `last_committed_row`, so a crashed import resumes where it stopped. IDs are application-generated UUIDv7 (ADR 0010).
 - [ ] **M5.15** Status transitions `RECEIVED → PROCESSING → COMPLETED | COMPLETED_WITH_ERRORS | FAILED`, enforced in a single place.
 - [ ] **M5.16** Emit audit events for import received, completed and failed.
 - [ ] **M5.17** `GET /api/v1/imports/{id}` for status, counts and paginated row errors.
@@ -162,6 +165,9 @@ Built early so later milestones emit events as they go, instead of retrofitting 
 - [ ] **M5.25** A crash in the middle of processing, simulated by an exception after N rows, followed by a retry, produces no duplicate `transaction_record` rows.
 - [ ] **M5.26** Wrong headers, an empty file or an oversized file are rejected with a clear `ProblemDetail`.
 
+### Partitions
+- [ ] **M5.27** Partition-maintenance job: keep `transaction_record` monthly partitions created 3 months ahead (idempotent, daily, on the worker), and alert when `transaction_record_default` is non-empty. Must exist before real data arrives (plans/README.md, ordering exception 3).
+
 **Exit criteria:** both sample files can be uploaded and the normalized transactions inspected through the API, and every failure case in projectoverview.md §6 that relates to imports has a passing test.
 
 ---
@@ -174,7 +180,7 @@ Built early so later milestones emit events as they go, instead of retrofitting 
 - [ ] **M6.3** Add unique constraints so a record can't be matched twice within a run, and on the run's idempotency key.
 
 ### Engine
-- [ ] **M6.4** Define a `MatchingStrategy` interface and implement `ExactReferenceStrategy` (v1).
+- [ ] **M6.4** Define a `MatchingStrategy` interface and implement `ExactReferenceStrategy` (v1) as set-based SQL inside PostgreSQL, processed one anchor day per chunk with a `last_completed_date` checkpoint (ADR 0012).
 - [ ] **M6.5** Exact match: same normalized reference, the same currency and the same transaction type.
 - [ ] **M6.6** Amount comparison: references that match but amounts that differ produce `AMOUNT_MISMATCH` and are never counted as matched.
 - [ ] **M6.7** Unmatched detection on both sides.
@@ -186,7 +192,7 @@ Built early so later milestones emit events as they go, instead of retrofitting 
 - [ ] **M6.13** Emit audit events for run started, completed and failed.
 
 ### API
-- [ ] **M6.14** `POST /api/v1/reconciliation-runs`, accepting an `Idempotency-Key` header and returning `202` with the run ID (or `201` if synchronous, per the ADR).
+- [ ] **M6.14** `POST /api/v1/reconciliation-runs`, accepting an `Idempotency-Key` header and returning `202` with the run (ADR 0003), or `200` with the existing run for a repeated request (ADR 0006).
 - [ ] **M6.15** `GET /api/v1/reconciliation-runs/{id}` for status, summary counts and totals.
 - [ ] **M6.16** `GET /api/v1/reconciliation-runs/{id}/matches`, paginated.
 - [ ] **M6.17** `GET /api/v1/reconciliation-runs`, listing runs, paginated.
@@ -249,13 +255,13 @@ Built early so later milestones emit events as they go, instead of retrofitting 
 
 ### Reliability
 - [ ] **M9.1** Recover jobs left stuck in `PROCESSING` or `RUNNING` after a restart, using a heartbeat or lease plus a startup sweep.
-- [ ] **M9.2** Move import and reconciliation processing off the request thread (`@Async` or a DB-backed job table) if the M1 ADR chose async.
+- [ ] **M9.2** ~~Move import and reconciliation processing off the request thread.~~ Moved to **M5.0**: ADR 0003 made processing asynchronous from v1. This task now hardens the queue built there (fencing, graceful shutdown, queue metrics).
 - [ ] **M9.3** Add retry with backoff for transient DB failures, and keep it away from validation failures.
 - [ ] **M9.4** Failure-injection tests: kill processing at several points, then reprocess and assert the final state is identical to a clean run.
 
 ### Performance
-- [ ] **M9.5** Generate a 50k-row synthetic dataset (and 500k for stress testing) with a script under `scripts/`.
-- [ ] **M9.6** Benchmark import throughput and reconciliation time. Record the results in `docs/benchmarks.md`.
+- [ ] **M9.5** Generate a 50k-row synthetic dataset (and 500k for stress testing, plus the 6-month preload for load tests) with a script under `scripts/`.
+- [ ] **M9.6** Benchmark import throughput and reconciliation time, and run load scenarios S1–S6 from docs/scalability.md §7 with k6. Record the results in `docs/benchmarks.md`.
 - [ ] **M9.7** Tune batch sizes, indexes and fetch strategies, and add checks for N+1 queries.
 - [ ] **M9.8** Make sure every list endpoint paginates and has a maximum page size.
 
@@ -269,6 +275,10 @@ Built early so later milestones emit events as they go, instead of retrofitting 
 - [ ] **M9.13** Use the transactional outbox pattern to publish `ImportCompleted` and `ReconciliationRequested` events.
 - [ ] **M9.14** Make consumers idempotent, with a dead-letter topic.
 - [ ] **M9.15** Testcontainers Kafka integration tests.
+
+### Data lifecycle
+- [ ] **M9.16** Archival job: after 13 months, export a `transaction_record` partition (and the matches and exception links that reference it) to Parquet in object storage, verify counts and checksums, then detach and drop the partition (docs/scalability.md §5.3).
+- [ ] **M9.17** Quarterly restore drill: restore a backup to a fresh instance, check row counts and a sample run's totals, and record the time taken against the RTO (≤ 1 h).
 
 **Exit criteria:** the 50k-row benchmark is documented, crash and reprocess tests pass, and metrics are visible.
 

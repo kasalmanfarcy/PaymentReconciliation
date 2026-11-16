@@ -167,12 +167,12 @@ class JobQueueIT extends AbstractIntegrationTest {
         runner.runAllQueued(List.of(org));
         Duration first = delay(id);
         assertThat(status(id)).isEqualTo("QUEUED");
-        assertThat(first).isBetween(Duration.ofSeconds(7), Duration.ofSeconds(13)); // 10 s ± 20 %
+        assertThat(first).isBetween(Duration.ofSeconds(15), Duration.ofSeconds(25)); // 2^1 × 10 s ± 20 %
 
         jdbc.update("UPDATE job SET run_after = now() WHERE id = ?", id); // skip the wait
         runner.runAllQueued(List.of(org));
         Duration second = delay(id);
-        assertThat(second).isBetween(Duration.ofSeconds(15), Duration.ofSeconds(25)); // 20 s ± 20 %
+        assertThat(second).isBetween(Duration.ofSeconds(31), Duration.ofSeconds(49)); // 2^2 × 10 s ± 20 %
         assertThat(attempts(id)).isEqualTo(2);
         assertThat(lastError(id)).contains("storage 503");
 

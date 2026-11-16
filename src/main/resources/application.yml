@@ -140,8 +140,10 @@ reconflow:
     heartbeat: 30s           # live workers extend their leases this often
     sweep-interval: 30s      # how often expired leases are recovered
     per-org-max-running: 2   # fairness: one tenant can't occupy every worker thread
-    base-backoff: 10s        # first retry delay after a transient failure; doubles per attempt
-    max-backoff: 10m
+    base-backoff: 10s        # retry delay = base × 2^attempts (ADR 0004): 20 s, 40 s, … 320 s
+    max-backoff: 1h          # cap; with max_attempts 5 it never binds, but a raised limit would
+    retention-done: 30d      # DONE jobs are deleted after this (JobRetention); history is in audit_event
+    retention-failed: 180d   # FAILED ones are kept longer, for diagnosis
     worker:
       # The worker profile turns this on. Roles switch beans through this property,
       # not @Profile annotations, so profile names live only in YAML.

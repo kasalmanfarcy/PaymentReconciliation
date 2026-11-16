@@ -13,7 +13,9 @@ import org.springframework.validation.annotation.Validated;
  * @param lease how long a claim is valid without a heartbeat or a fence
  * @param heartbeat how often a live worker extends its leases; well under {@code lease}
  * @param perOrgMaxRunning the fairness cap: one tenant's 30 files can't occupy every worker
- * @param baseBackoff the first retry delay; doubles per attempt, up to {@code maxBackoff}
+ * @param baseBackoff the retry delay is {@code baseBackoff × 2^attempts}, up to {@code maxBackoff}
+ * @param retentionDone how long DONE jobs are kept before {@code JobRetention} deletes them
+ * @param retentionFailed how long FAILED jobs are kept (longer: they are what an operator diagnoses)
  */
 @Validated
 @ConfigurationProperties("reconflow.jobs")
@@ -24,4 +26,6 @@ public record JobProperties(
         @DefaultValue("30s") Duration sweepInterval,
         @DefaultValue("2") @Min(1) int perOrgMaxRunning,
         @DefaultValue("10s") Duration baseBackoff,
-        @DefaultValue("10m") Duration maxBackoff) {}
+        @DefaultValue("1h") Duration maxBackoff,
+        @DefaultValue("30d") Duration retentionDone,
+        @DefaultValue("180d") Duration retentionFailed) {}

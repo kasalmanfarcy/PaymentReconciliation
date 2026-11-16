@@ -34,6 +34,7 @@ We will use a **`job` table in PostgreSQL** (V1), owned by `shared.jobs`, as the
 - We own the queue's code: claiming, leases, the sweeper, backoff, metrics. It's a few hundred lines and a well-known pattern, but it has to be tested properly (M9.1, M9.4).
 - Polling adds a small constant load (one indexed query per worker per second).
 - As built (M5.0): the per-organization cap is **soft**. `SKIP LOCKED` locks rows, not predicates, so two workers claiming at the same instant can both count one running job and both claim, briefly giving three. That's acceptable for fairness; a hard cap would take `pg_advisory_xact_lock(hashtext(organization_id::text))` in the claim. Every lease, backoff and expiry uses the database's `now()`, so nodes agree whatever their clock skew.
+- As built (M9.2): the backoff is exactly `2^attempts × 10 s` (M5 had built `2^(attempts−1)`), ±20 % jitter, capped at 1 h. Finished jobs are deleted by a daily retention job (`DONE` after 30 days, `FAILED` after 180). The soft cap was kept after measuring it under four racing claimers (`JobQueueHardeningIT`); the claim's plan uses `job_claim_idx` with 100,000 finished jobs in the table.
 
 ## Alternatives considered
 

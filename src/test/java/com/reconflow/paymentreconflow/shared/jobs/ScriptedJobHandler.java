@@ -56,6 +56,13 @@ class ScriptedJobHandler implements JobHandler {
                         "UPDATE organization SET name = 'guarded write by " + job.workerId() + "' WHERE id = ?",
                         job.organizationId());
             }
+            case "slow" -> {
+                try {
+                    Thread.sleep(30); // long enough for claimers to overlap
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
             case "transient" -> throw new TransientJobFailure("storage 503", new RuntimeException("503"));
             case "permanent" -> throw new PermanentJobFailure("bad-file");
             case "bug" -> throw new NullPointerException("a bug");

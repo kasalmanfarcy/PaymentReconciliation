@@ -40,7 +40,7 @@ class JobStore {
     // The per-organization count is a soft cap: two claimers at the same instant can both see 1
     // running and both claim (SKIP LOCKED locks rows, not predicates). Fine for fairness; a hard cap
     // would take pg_advisory_xact_lock(hashtext(organization_id::text)) in the claim.
-    private static final String CLAIM = """
+    static final String CLAIM = """
             UPDATE job
                SET status = 'RUNNING', locked_by = ?, lease_until = now() + make_interval(secs => ?),
                    attempts = attempts + 1, updated_at = now()
@@ -244,6 +244,20 @@ class JobStore {
                         + " WHERE id = ? AND status = 'RUNNING'",
                 truncate(error),
                 jobId);
+    }
+
+    /**
+     * Retention: deletes up to {@code limit} jobs in {@code status} last updated before
+     * {@code olderThan} ago. Bounded per statement so a first run on a big table doesn't hold one
+     * huge delete (and its WAL) in a single transaction; the caller loops.
+     */
+    int deleteFinishedBefore(String status, Duration olderThan, int limit) {
+        return jdbc.update(
+                "DELETE FROM job WHERE id IN (SELECT id FROM job WHERE status = ?"
+                        + " AND updated_at < now() - make_interval(secs => ?) LIMIT ?)",
+                status,
+                seconds(olderThan),
+                limit);
     }
 
     private Job map(ResultSet rs, String workerId) throws SQLException {

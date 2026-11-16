@@ -717,7 +717,7 @@ A run's cases (as in §8.21) as CSV (M8.4): one row per case with `case_id, type
 
 ### 8.25 `GET /api/v1/reports/exports/{id}` and `…/{id}/file`
 
-A background export: `{ "id", "runId", "status": "QUEUED|RUNNING|DONE|FAILED", "createdAt", "updatedAt", "fileUrl" }`, with `Retry-After: 2` until `DONE` or `FAILED`; `fileUrl` is set once `DONE`. `…/file` streams the CSV (byte for byte what the synchronous path gives) from object storage. Another tenant's export, an unknown id or a job that isn't an export: `404`. Downloading before `DONE`: `409 export-not-ready` (`currentStatus`).
+A background export: `{ "id", "runId", "status": "QUEUED|RUNNING|DONE|FAILED", "createdAt", "updatedAt", "fileUrl" }`, with `Retry-After: 2` until `DONE` or `FAILED`; `fileUrl` is set once `DONE`. `…/file` streams the CSV (byte for byte what the synchronous path gives) from object storage. Another tenant's export, an unknown id or a job that isn't an export: `404`. Downloading before `DONE`: `409 export-not-ready` (`currentStatus`). The status is the export's job, which job retention deletes 30 days after it finished (M9.2); from then on the export is `404` like an unknown id.
 
 ---
 

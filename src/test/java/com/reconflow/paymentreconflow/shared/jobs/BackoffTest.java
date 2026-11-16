@@ -9,15 +9,17 @@ import org.junit.jupiter.api.Test;
 class BackoffTest {
 
     static final Duration BASE = Duration.ofSeconds(10);
-    static final Duration MAX = Duration.ofMinutes(10);
+    static final Duration MAX = Duration.ofHours(1);
 
+    /** ADR 0004: {@code 2^attempts × 10 s}. */
     @Test
-    void doublesPerAttemptFromTheBase() {
+    void isTwoToTheAttemptsTimesTheBase() {
         RandomGenerator middle = new FixedDouble(0.5);
-        assertThat(Backoff.delay(1, BASE, MAX, middle)).isEqualTo(Duration.ofSeconds(10));
-        assertThat(Backoff.delay(2, BASE, MAX, middle)).isEqualTo(Duration.ofSeconds(20));
-        assertThat(Backoff.delay(3, BASE, MAX, middle)).isEqualTo(Duration.ofSeconds(40));
-        assertThat(Backoff.delay(4, BASE, MAX, middle)).isEqualTo(Duration.ofSeconds(80));
+        assertThat(Backoff.delay(1, BASE, MAX, middle)).isEqualTo(Duration.ofSeconds(20));
+        assertThat(Backoff.delay(2, BASE, MAX, middle)).isEqualTo(Duration.ofSeconds(40));
+        assertThat(Backoff.delay(3, BASE, MAX, middle)).isEqualTo(Duration.ofSeconds(80));
+        assertThat(Backoff.delay(5, BASE, MAX, middle)).isEqualTo(Duration.ofSeconds(320));
+        assertThat(Backoff.delay(8, BASE, MAX, middle)).isEqualTo(Duration.ofSeconds(2560));
     }
 
     @Test
@@ -29,9 +31,10 @@ class BackoffTest {
 
     @Test
     void jitterStaysWithinTwentyPercent() {
-        assertThat(Backoff.delay(1, BASE, MAX, new FixedDouble(0.0))).isEqualTo(Duration.ofSeconds(8));
+        assertThat(Backoff.delay(1, BASE, MAX, new FixedDouble(0.0))).isEqualTo(Duration.ofSeconds(16));
         assertThat(Backoff.delay(1, BASE, MAX, new FixedDouble(0.999999)))
-                .isBetween(Duration.ofMillis(11_999), Duration.ofSeconds(12));
+                .isBetween(Duration.ofMillis(23_999), Duration.ofSeconds(24));
+        assertThat(Backoff.delay(5, BASE, MAX, new FixedDouble(0.0))).isEqualTo(Duration.ofSeconds(256));
     }
 
     private record FixedDouble(double value) implements RandomGenerator {

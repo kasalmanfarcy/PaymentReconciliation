@@ -34,6 +34,20 @@ class ReportingCrossTenantCases implements CrossTenantCases {
                         "/api/v1/reports/reconciliation?from=2026-10-01&to=2026-10-31&currency=AED",
                         f -> Map.of(),
                         null,
+                        LIST_EXCLUDES_B),
+                new CrossTenantCase(
+                        "import quality of org B's batch",
+                        HttpMethod.GET,
+                        "/api/v1/reports/import-quality?batchId={id}",
+                        f -> Map.of("id", f.orgBBatch()),
+                        null,
+                        NOT_FOUND),
+                new CrossTenantCase(
+                        "import quality over time",
+                        HttpMethod.GET,
+                        "/api/v1/reports/import-quality?from=2026-01-01&to=2026-12-31",
+                        f -> Map.of(),
+                        null,
                         LIST_EXCLUDES_B));
     }
 }

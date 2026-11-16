@@ -1,9 +1,12 @@
 package com.reconflow.paymentreconflow.reporting.api;
 
+import com.reconflow.paymentreconflow.reporting.importquality.ImportQualityReport;
+import com.reconflow.paymentreconflow.reporting.importquality.ImportQualityReports;
 import com.reconflow.paymentreconflow.reporting.reconciliation.ReconciliationReport;
 import com.reconflow.paymentreconflow.reporting.reconciliation.ReconciliationReports;
 import com.reconflow.paymentreconflow.shared.context.Permission;
 import com.reconflow.paymentreconflow.shared.context.RequiresBothPermissions;
+import com.reconflow.paymentreconflow.shared.context.RequiresPermission;
 import java.time.LocalDate;
 import java.util.UUID;
 import org.jspecify.annotations.Nullable;
@@ -21,9 +24,11 @@ import org.springframework.web.bind.annotation.RestController;
 class ReportController {
 
     private final ReconciliationReports reconciliation;
+    private final ImportQualityReports importQuality;
 
-    ReportController(ReconciliationReports reconciliation) {
+    ReportController(ReconciliationReports reconciliation, ImportQualityReports importQuality) {
         this.reconciliation = reconciliation;
+        this.importQuality = importQuality;
     }
 
     /**
@@ -38,5 +43,20 @@ class ReportController {
             @RequestParam(required = false) @Nullable LocalDate to,
             @RequestParam(required = false) @Nullable String currency) {
         return reconciliation.report(runId, from, to, currency);
+    }
+
+    /**
+     * {@code ?batchId=}, or {@code ?from=&to=} (UTC days) with optional {@code granularity}
+     * ({@code day} by default, {@code week}, {@code month}) and {@code sourceType}.
+     */
+    @GetMapping("/import-quality")
+    @RequiresPermission(Permission.REPORT_READ)
+    ImportQualityReport importQuality(
+            @RequestParam(required = false) @Nullable UUID batchId,
+            @RequestParam(required = false) @Nullable LocalDate from,
+            @RequestParam(required = false) @Nullable LocalDate to,
+            @RequestParam(required = false) @Nullable String granularity,
+            @RequestParam(required = false) @Nullable String sourceType) {
+        return importQuality.report(batchId, from, to, granularity, sourceType);
     }
 }

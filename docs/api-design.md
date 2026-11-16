@@ -264,7 +264,7 @@ Permissions are from [authentication.plan §5](../plans/authentication.plan), pl
 | `POST /exceptions/{id}/reopen` | `EXCEPTION_REOPEN` | 200 + `ETag` | 400, 404, 409 `active-case-exists`, 428 | M7.11 |
 | `GET /audit-events?entityType=&entityId=` | `AUDIT_READ` | 200 page | 400 | M7.13 |
 | `GET /reports/reconciliation?runId= (or ?from=&to=&currency=)` | `REPORT_READ` + `EXCEPTION_READ` | 200 | 400, 404, 409 `run-not-completed` | M8.1 |
-| `GET /reports/import-quality` | `REPORT_READ` | 200 | 400 | M8.2 |
+| `GET /reports/import-quality?batchId= (or ?from=&to=)` | `REPORT_READ` | 200 | 400, 404 | M8.2 |
 | `GET /reports/exception-ageing` | `REPORT_READ` | 200 | 400 | M8.3 |
 | `GET /reports/exceptions/export?runId=` | `REPORT_READ` + `EXCEPTION_READ` | 200 `text/csv` | 404 | M8.4 |
 

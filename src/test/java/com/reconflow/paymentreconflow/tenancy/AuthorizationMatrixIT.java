@@ -163,6 +163,10 @@ class AuthorizationMatrixIT extends AbstractIntegrationTest {
                 "GET /reports/reconciliation",
                 Set.of(Permission.REPORT_READ, Permission.EXCEPTION_READ),
                 target -> get("/api/v1/reports/reconciliation?from=2026-10-01&to=2026-10-31&currency=AED")),
+        new Endpoint(
+                "GET /reports/import-quality",
+                Permission.REPORT_READ,
+                target -> get("/api/v1/reports/import-quality?batchId=" + target.batchId())),
     };
 
     static Stream<Arguments> endpointByRole() {

@@ -1,6 +1,7 @@
 package com.reconflow.paymentreconflow.security.auth;
 
 import com.reconflow.paymentreconflow.security.token.AccessTokenService;
+import com.reconflow.paymentreconflow.security.token.RefreshTokenService;
 import com.reconflow.paymentreconflow.security.user.AppUser;
 import com.reconflow.paymentreconflow.security.user.AppUserRepository;
 import com.reconflow.paymentreconflow.security.user.MembershipQueries;
@@ -35,6 +36,7 @@ public class AuthService {
     private final PasswordEncoder encoder;
     private final LoginAttemptService attempts;
     private final AccessTokenService accessTokens;
+    private final RefreshTokenService refreshTokens;
     private final TransactionTemplate tx;
     private final Clock clock;
 
@@ -50,6 +52,7 @@ public class AuthService {
             PasswordEncoder encoder,
             LoginAttemptService attempts,
             AccessTokenService accessTokens,
+            RefreshTokenService refreshTokens,
             TransactionTemplate tx,
             Clock clock) {
         this.users = users;
@@ -57,6 +60,7 @@ public class AuthService {
         this.encoder = encoder;
         this.attempts = attempts;
         this.accessTokens = accessTokens;
+        this.refreshTokens = refreshTokens;
         this.tx = tx;
         this.clock = clock;
         byte[] random = new byte[16];
@@ -98,8 +102,13 @@ public class AuthService {
                 // The cost factor (or algorithm) was raised since this hash was written.
                 user.upgradePasswordHash(encoder.encode(password));
             }
+            // A new token family per login; it exists only if this transaction commits.
+            String refreshToken = refreshTokens.issue(user.getId());
             return new LoginResult.Success(
-                    user.getId(), accessTokens.issue(user), null, memberships.activeMembershipsOf(user.getId()));
+                    user.getId(),
+                    accessTokens.issue(user),
+                    refreshToken,
+                    memberships.activeMembershipsOf(user.getId()));
         });
     }
 

@@ -1,11 +1,13 @@
 package com.reconflow.paymentreconflow.security.auth;
 
+import com.reconflow.paymentreconflow.security.token.RefreshCookies;
 import com.reconflow.paymentreconflow.security.user.MembershipQueries.MembershipSummary;
 import com.reconflow.paymentreconflow.shared.error.ProblemCodes;
 import com.reconflow.paymentreconflow.shared.error.ProblemDetails;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import java.util.List;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ProblemDetail;
@@ -34,17 +36,23 @@ class AuthController {
     record LoginResponse(String accessToken, long expiresIn, List<MembershipSummary> memberships) {}
 
     private final AuthService auth;
+    private final RefreshCookies cookies;
 
-    AuthController(AuthService auth) {
+    AuthController(AuthService auth, RefreshCookies cookies) {
         this.auth = auth;
+        this.cookies = cookies;
     }
 
     @PostMapping(path = "/login", consumes = MediaType.APPLICATION_JSON_VALUE)
     ResponseEntity<?> login(@Valid @RequestBody LoginRequest request) {
         return switch (auth.login(request.email(), request.password())) {
             case LoginResult.Success s ->
-                ResponseEntity.ok(new LoginResponse(
-                        s.accessToken().value(), s.accessToken().expiresIn(), s.memberships()));
+                ResponseEntity.ok()
+                        .header(
+                                HttpHeaders.SET_COOKIE,
+                                cookies.issue(s.refreshToken()).toString())
+                        .body(new LoginResponse(
+                                s.accessToken().value(), s.accessToken().expiresIn(), s.memberships()));
             case LoginResult.Failure f -> invalidCredentials();
         };
     }

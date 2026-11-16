@@ -53,6 +53,27 @@ class LoginIT extends AbstractIntegrationTest {
     }
 
     @Test
+    void loginSetsTheRefreshCookieWithItsSecurityAttributes() throws Exception {
+        var user = data().newUser();
+        String setCookie = login(user.email(), TestData.PASSWORD)
+                .andExpect(status().isOk())
+                .andReturn()
+                .getResponse()
+                .getHeader("Set-Cookie");
+
+        assertThat(setCookie)
+                .startsWith("refresh_token=")
+                .contains("Path=/api/v1/auth", "Max-Age=604800", "HttpOnly", "Secure", "SameSite=Strict");
+        String raw = setCookie.substring("refresh_token=".length(), setCookie.indexOf(';'));
+        assertThat(jdbc.queryForObject(
+                        "select count(*) from refresh_token where user_id = ? and token_hash = encode(sha256(?::bytea), 'hex')",
+                        Integer.class,
+                        user.id(),
+                        raw))
+                .isEqualTo(1);
+    }
+
+    @Test
     void aPendingPasswordChangeIsAClaim() throws Exception {
         var user = data().newUser();
         data().requirePasswordChange(user.id());

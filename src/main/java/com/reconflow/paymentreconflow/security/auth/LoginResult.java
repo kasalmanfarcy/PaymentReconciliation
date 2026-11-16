@@ -4,7 +4,6 @@ import com.reconflow.paymentreconflow.security.token.AccessTokenService.AccessTo
 import com.reconflow.paymentreconflow.security.user.MembershipQueries.MembershipSummary;
 import java.util.List;
 import java.util.UUID;
-import org.jspecify.annotations.Nullable;
 
 /**
  * The outcome of a login, returned rather than thrown. A failed login must <em>commit</em> its
@@ -14,8 +13,7 @@ import org.jspecify.annotations.Nullable;
  */
 public sealed interface LoginResult {
 
-    record Success(
-            UUID userId, AccessToken accessToken, @Nullable String refreshToken, List<MembershipSummary> memberships)
+    record Success(UUID userId, AccessToken accessToken, String refreshToken, List<MembershipSummary> memberships)
             implements LoginResult {}
 
     /** Deliberately carries no reason: every failure must look the same to the client. */

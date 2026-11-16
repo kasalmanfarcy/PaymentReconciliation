@@ -22,7 +22,8 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * M5.3: rows land in their monthly partitions (missing ones are created first) and never in the
- * default; M5.5: the row-level guard absorbs a repeated insert of the same source rows.
+ * default; M5.5: the row-level guard absorbs a repeated insert of the same source rows; M5.13:
+ * within-file duplicates (rule D1) are flagged in SQL, every copy, none dropped.
  */
 class TransactionRecordWriterIT extends AbstractIntegrationTest {
 
@@ -88,6 +89,32 @@ class TransactionRecordWriterIT extends AbstractIntegrationTest {
         tx.executeWithoutResult(s -> writer.insert(org, again));
 
         assertThat((long) tx.execute(s -> writer.countBatch(org, batch))).isEqualTo(3);
+    }
+
+    @Test
+    void withinFileDuplicatesAreAllFlaggedAndNoneDropped() {
+        UUID org = data().newOrganization();
+        UUID batch = batch(org);
+        LocalDate day = LocalDate.of(2026, 10, 4);
+        List<NewTransactionRecord> rows = List.of(
+                record(batch, 1, "PAY-301", "90.0000", day),
+                record(batch, 2, "PAY-301", "90.0000", day),
+                record(batch, 3, "PAY-301", "90.0000", day),
+                record(batch, 4, "PAY-302", "60.0000", day),
+                record(batch, 5, "PAY-302", "65.0000", day), // same reference, different amount: not D1
+                record(batch, 6, "PAY-303", "45.0000", day));
+        tx.executeWithoutResult(s -> writer.insert(org, rows));
+
+        int flagged = tx.execute(s -> writer.markDuplicatesInBatch(org, batch));
+
+        assertThat(flagged).isEqualTo(3);
+        assertThat(jdbc.queryForList(
+                        "SELECT source_row_number FROM transaction_record WHERE batch_id = ? AND is_duplicate_in_source"
+                                + " ORDER BY 1",
+                        Integer.class,
+                        batch))
+                .containsExactly(1, 2, 3);
+        assertThat((long) tx.execute(s -> writer.countBatch(org, batch))).isEqualTo(6);
     }
 
     @Test

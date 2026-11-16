@@ -118,6 +118,8 @@ The missing types are named by **source**, not by side: a ledger-only group is `
 | D1 | **At import**, every row of a batch that shares `(normalized_reference, transaction_type, amount, currency)` with another row of the same batch gets `is_duplicate_in_source = true`. All copies are flagged; none is dropped; none is a row error. Amounts are compared by value |
 | D2 | **In a run**, the engine counts the candidates on each side of a group itself (O1). This catches what D1 can't: the same reference with different amounts in one file, and the same settlement imported twice in two different files (one extra row changes the content hash, so both files are accepted, and every reference then has two records) |
 
+**How D1 is computed (M5.13).** Not in Java: a full-file check would have to remember every row of a streamed file. Once every chunk of a batch is committed, one set-based `UPDATE … WHERE (normalized_reference, transaction_type, amount, currency) IN (SELECT … GROUP BY … HAVING count(*) > 1)` runs in the batch's finishing transaction; PostgreSQL spills the grouping to disk if it must, and the JVM holds nothing. `amount` is `NUMERIC`, so `250.0000 = 250.0000` by value.
+
 A D1 flag travels with the record: if one copy falls inside a run's period and the other outside it, the in-period copy still makes its group a duplicate. The flag says "this file contained this payment more than once", which is worth a human's attention whichever run sees it.
 
 ### Tie-breaking

@@ -46,7 +46,7 @@ jobs:
         run: '[[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "not a full commit SHA: $COMMIT"; exit 1; }'
 
       - name: Check out (for the smoke test)
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           ref: ${{ env.COMMIT }}
 

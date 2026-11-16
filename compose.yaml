@@ -13,6 +13,10 @@ services:
     # Pinned to the same tag as TestcontainersConfiguration, so local runs and tests use one engine.
     # A floating tag ("postgres:16") can change underneath you between two runs.
     image: postgres:16.4-alpine
+    # pg_stat_statements (M9.6/M9.7): per-statement totals, the evidence behind every tuning change
+    # and the Kafka decision (is the job claim among the top statements?). Enable once per database
+    # with CREATE EXTENSION pg_stat_statements; preloading it costs a few hundred KB of shared memory.
+    command: ["postgres", "-c", "shared_preload_libraries=pg_stat_statements", "-c", "pg_stat_statements.track=all"]
     environment:
       POSTGRES_DB: paymentreconflow
       POSTGRES_USER: ${DB_USER:?set DB_USER in .env}

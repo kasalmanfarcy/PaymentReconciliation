@@ -23,6 +23,18 @@ public interface ReconciliationRunRepository extends Repository<ReconciliationRu
 
     Optional<ReconciliationRun> findByIdAndOrganizationId(UUID id, UUID organizationId);
 
+    /**
+     * Runs still PENDING or RUNNING that haven't changed for {@code minAgeSeconds}: candidates for
+     * M9.1's consistency check. A live run touches {@code updated_at} with every day's checkpoint.
+     */
+    @Query(value = """
+                    SELECT id FROM reconciliation_run
+                     WHERE organization_id = :organizationId AND status IN ('PENDING', 'RUNNING')
+                       AND updated_at < now() - make_interval(secs => :minAgeSeconds)
+                    """, nativeQuery = true)
+    List<UUID> findStaleInFlight(
+            @Param("organizationId") UUID organizationId, @Param("minAgeSeconds") double minAgeSeconds);
+
     List<ReconciliationRun> findByOrganizationIdAndIdIn(UUID organizationId, Collection<UUID> ids);
 
     Optional<ReconciliationRun> findByOrganizationIdAndIdempotencyKey(UUID organizationId, String idempotencyKey);

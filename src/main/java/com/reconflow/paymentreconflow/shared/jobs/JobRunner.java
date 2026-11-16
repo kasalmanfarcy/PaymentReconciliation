@@ -9,7 +9,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.jspecify.annotations.Nullable;
@@ -46,6 +48,9 @@ public class JobRunner {
     private final TransactionTemplate tx;
     private final Map<String, JobHandler> handlers = new HashMap<>();
     private final AtomicBoolean stopping = new AtomicBoolean();
+    /** Jobs whose heartbeat found the lease gone; their handlers stop at the next check. */
+    private final Set<UUID> lostLeases = ConcurrentHashMap.newKeySet();
+
     private final String node;
 
     JobRunner(
@@ -119,6 +124,7 @@ public class JobRunner {
             // app.org_id for row-level security, exactly as a request would.
             tenantScope.run(job.organizationId(), () -> runBound(job, handler));
         } finally {
+            lostLeases.remove(job.id());
             MDC.remove("jobId");
             MDC.remove("orgId");
         }
@@ -183,9 +189,17 @@ public class JobRunner {
                 || e instanceof CannotCreateTransactionException;
     }
 
-    /** Extends the lease of a job this worker is running (the heartbeat). */
+    /**
+     * Extends the lease of a job this worker is running (the heartbeat). If the lease is gone (this
+     * worker paused past it and the sweeper gave the job away), the job's handler is told to stop
+     * at its next {@link JobContext#ensureLeaseHeld()}.
+     */
     boolean heartbeat(UUID jobId, String workerId) {
-        return store.extendLease(jobId, workerId, props.lease());
+        boolean held = store.extendLease(jobId, workerId, props.lease());
+        if (!held) {
+            lostLeases.add(jobId);
+        }
+        return held;
     }
 
     /**
@@ -262,6 +276,13 @@ public class JobRunner {
         public void complete() {
             requireTransaction();
             if (!store.markDone(job.id(), job.workerId())) {
+                throw new LeaseLostException(job.id(), job.workerId());
+            }
+        }
+
+        @Override
+        public void ensureLeaseHeld() {
+            if (lostLeases.contains(job.id())) {
                 throw new LeaseLostException(job.id(), job.workerId());
             }
         }

@@ -96,6 +96,23 @@ class JobStore {
     }
 
     /**
+     * Is there a QUEUED or RUNNING job of this type whose payload names {@code subjectId} under
+     * {@code payloadKey}? For M9.1's consistency check; runs for a handful of stale rows only, so
+     * the JSONB lookup needs no index.
+     */
+    boolean hasLiveJob(UUID organizationId, String type, String payloadKey, UUID subjectId) {
+        Boolean live = jdbc.queryForObject(
+                "SELECT EXISTS (SELECT 1 FROM job WHERE organization_id = ? AND type = ?"
+                        + " AND payload ->> ? = ? AND status IN ('QUEUED', 'RUNNING'))",
+                Boolean.class,
+                organizationId,
+                type,
+                payloadKey,
+                subjectId.toString());
+        return Boolean.TRUE.equals(live);
+    }
+
+    /**
      * Claims the oldest runnable job, if any. {@code onlyOrganizations} narrows the claim to some
      * organizations; production passes null. It exists for tests, which share one database and
      * must not run each other's jobs.

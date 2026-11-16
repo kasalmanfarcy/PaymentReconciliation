@@ -39,4 +39,13 @@ public class JobQueue {
     public Optional<JobStatus> find(UUID organizationId, UUID jobId) {
         return store.find(organizationId, jobId);
     }
+
+    /**
+     * Does this business row (a batch, a run) still have a job that will process it? False means
+     * it is orphaned: in flight with nothing to move it on (M9.1's consistency check).
+     */
+    @Transactional(readOnly = true)
+    public boolean hasLiveJob(UUID organizationId, String type, String payloadKey, UUID subjectId) {
+        return store.hasLiveJob(organizationId, type, payloadKey, subjectId);
+    }
 }

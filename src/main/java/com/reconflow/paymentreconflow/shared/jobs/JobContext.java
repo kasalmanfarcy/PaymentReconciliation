@@ -19,6 +19,14 @@ public interface JobContext {
     void complete();
 
     /**
+     * Cheap, in-memory: throws {@link LeaseLostException} if the background heartbeat has found
+     * that this worker no longer holds the job. Call it between rows or statements, so a worker
+     * that lost its lease stops at once instead of building a whole chunk it could never commit
+     * (the chunk's {@link #fence()} would refuse it anyway; this only saves the wasted work).
+     */
+    void ensureLeaseHeld();
+
+    /**
      * True once this worker is shutting down. Check it between chunks and throw
      * {@link JobStoppedException}; the queue then hands the job back without spending an attempt.
      */

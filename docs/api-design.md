@@ -488,7 +488,7 @@ A run's status, progress and, once `COMPLETED`, its summary (M6.15). Cheap to po
 - `unmatchedLeft` / `unmatchedRight` follow the run's sources: with the defaults, left is the ledger, so `unmatchedLeft` is `MISSING_IN_GATEWAY`. Their `amount` is the sum of the cases' `amount`.
 - `amountMismatch.netDifference` is the sum of `gateway − ledger` over the run's amount-mismatch cases.
 - `progress.lastCompletedDate` is the resume checkpoint: the last day whose matches and cases are committed.
-- `failureReason` is a short code (`internal-error`, `retries-exhausted`, `engine-invariant-violated: …`), never a stack trace.
+- `failureReason` is a short code (`internal-error`, `retries-exhausted`, `orphaned`, `engine-invariant-violated: …`), never a stack trace.
 
 **Errors:** `404 not-found`.
 

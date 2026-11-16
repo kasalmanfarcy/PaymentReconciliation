@@ -124,6 +124,42 @@ class JobQueueIT extends AbstractIntegrationTest {
     }
 
     @Test
+    void aHeartbeatThatFindsTheLeaseGoneStopsTheHandlerBeforeItWritesAnything() {
+        UUID org = data().newOrganization();
+        String originalName = jdbc.queryForObject("SELECT name FROM organization WHERE id = ?", String.class, org);
+        UUID id = enqueue(org, "guarded");
+        Job paused = runner.claim(runner.workerId("paused"), List.of(org)).orElseThrow();
+        expireLease(id);
+        runner.sweepExpiredLeases();
+        runner.claim(runner.workerId("successor"), List.of(org)).orElseThrow();
+
+        // The paused worker's heartbeat thread runs first and finds the lease gone.
+        assertThat(runner.heartbeat(paused.id(), paused.workerId())).isFalse();
+        runner.execute(paused);
+
+        assertThat(jdbc.queryForObject("SELECT name FROM organization WHERE id = ?", String.class, org))
+                .isEqualTo(originalName);
+        assertThat(status(id)).isEqualTo("RUNNING");
+    }
+
+    @Test
+    void theStartupSweepRecoversOnlyExpiredLeases() {
+        UUID org = data().newOrganization();
+        UUID dead = enqueue(org, "succeed");
+        UUID alive = enqueue(org, "succeed");
+        runner.claim(runner.workerId("crashed-predecessor"), List.of(org)).orElseThrow();
+        runner.claim(runner.workerId("live-neighbour"), List.of(org)).orElseThrow();
+        expireLease(dead);
+
+        new JobWorker(runner, new JobWorkerProperties(true, 1)).sweepOnStartup();
+
+        assertThat(status(dead)).isEqualTo("QUEUED");
+        assertThat(status(alive))
+                .as("another worker's valid lease is left alone")
+                .isEqualTo("RUNNING");
+    }
+
+    @Test
     void transientFailuresBackOffWithIncreasingDelaysThenFail() {
         UUID org = data().newOrganization();
         UUID id = enqueue(org, "transient");

@@ -12,7 +12,9 @@ import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBooleanProperty;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.SmartLifecycle;
+import org.springframework.context.event.EventListener;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
@@ -103,6 +105,18 @@ public class JobWorker implements SmartLifecycle {
                 log.warn("Heartbeat: job {} is no longer leased to {}", jobId, workerId);
             }
         });
+    }
+
+    /**
+     * Startup sweep (M9.1): recover what a crashed predecessor left behind at once, instead of
+     * after the first scheduled tick. Only <em>expired</em> leases, never "jobs locked by my
+     * hostname": a restarted container keeps its hostname, and other workers are alive and holding
+     * valid leases. The worker id also carries the pid, so this process never owns an old job.
+     */
+    @EventListener(ApplicationReadyEvent.class)
+    void sweepOnStartup() {
+        int recovered = runner.sweepExpiredLeases();
+        log.info("Startup sweep recovered {} job(s) with expired leases", recovered);
     }
 
     @Scheduled(fixedDelayString = "${reconflow.jobs.sweep-interval:30s}")

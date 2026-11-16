@@ -78,6 +78,7 @@ public class RunExecutor {
     private void runDays(RunContext run, LocalDate firstDay, JobContext context) {
         for (LocalDate day = firstDay; !day.isAfter(run.periodEnd()); day = day.plusDays(1)) {
             LocalDate d = day;
+            context.ensureLeaseHeld();
             DayResult result = tx.execute(s -> {
                 lifecycle.lockForChunk(run, d); // fence 1: the checkpoint is where we expect
                 context.fence(); // fence 2: we still hold the job's lease (and extend it)

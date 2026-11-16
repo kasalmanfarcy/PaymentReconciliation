@@ -3,6 +3,7 @@ package com.reconflow.paymentreconflow.ingestion.domain;
 import com.reconflow.paymentreconflow.ledger.SourceType;
 import jakarta.persistence.LockModeType;
 import java.util.Collection;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import org.springframework.data.jpa.repository.Lock;
@@ -53,6 +54,19 @@ public interface ImportBatchRepository extends Repository<ImportBatch, UUID> {
             @Param("lastRow") int lastRow,
             @Param("validRows") int validRows,
             @Param("errorRows") int errorRows);
+
+    /**
+     * Batches still RECEIVED or PROCESSING that haven't changed for {@code minAgeSeconds}: the
+     * candidates of M9.1's consistency check (each is then checked for a live job). A live import
+     * touches {@code updated_at} with every chunk, so only stuck ones are this old.
+     */
+    @Query(value = """
+                    SELECT id FROM import_batch
+                     WHERE organization_id = :organizationId AND status IN ('RECEIVED', 'PROCESSING')
+                       AND updated_at < now() - make_interval(secs => :minAgeSeconds)
+                    """, nativeQuery = true)
+    List<UUID> findStaleInFlight(
+            @Param("organizationId") UUID organizationId, @Param("minAgeSeconds") double minAgeSeconds);
 
     /** Is any batch of the organization in one of these statuses? (ImportActivity) */
     boolean existsByOrganizationIdAndStatusIn(UUID organizationId, Collection<ImportBatchStatus> statuses);

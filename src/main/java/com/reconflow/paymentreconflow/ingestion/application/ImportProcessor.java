@@ -160,6 +160,7 @@ public class ImportProcessor {
                 if (number <= start.lastCommittedRow()) {
                     continue; // committed by an earlier run, together with the checkpoint
                 }
+                context.ensureLeaseHeld(); // the heartbeat may have found the lease gone: stop now
                 RowValidation result = validator.validate(row, start.sourceType());
                 if (result.isValid()) {
                     chunk.addValid(normalizer.normalize(result.valid(), batchId, start.sourceType()));

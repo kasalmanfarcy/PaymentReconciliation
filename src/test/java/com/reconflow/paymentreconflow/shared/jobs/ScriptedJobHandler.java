@@ -49,6 +49,13 @@ class ScriptedJobHandler implements JobHandler {
                     context.fence();
                     context.complete();
                 });
+            // A handler that checks the heartbeat's verdict before building its chunk (M9.1).
+            case "guarded" -> {
+                context.ensureLeaseHeld();
+                jdbc.update(
+                        "UPDATE organization SET name = 'guarded write by " + job.workerId() + "' WHERE id = ?",
+                        job.organizationId());
+            }
             case "transient" -> throw new TransientJobFailure("storage 503", new RuntimeException("503"));
             case "permanent" -> throw new PermanentJobFailure("bad-file");
             case "bug" -> throw new NullPointerException("a bug");

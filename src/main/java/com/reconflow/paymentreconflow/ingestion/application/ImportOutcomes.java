@@ -29,6 +29,9 @@ public class ImportOutcomes {
     /** {@code failure_reason} when no row of the file was valid. */
     public static final String NO_VALID_ROWS = "no-valid-rows";
 
+    /** {@code failure_reason} when a batch was in flight with no job to move it on (M9.1). */
+    public static final String ORPHANED = "orphaned";
+
     private final AuditService audit;
     private final Clock clock;
 
@@ -74,5 +77,21 @@ public class ImportOutcomes {
                 .with("attempts", job.attempts())
                 .with("lastCommittedRow", batch.getLastCommittedRow())
                 .with("jobId", job.id()));
+    }
+
+    /**
+     * M9.1's consistency check found the batch in flight with no live job: a bug in the enqueue
+     * path, never expected. Failed (not re-enqueued) so a person looks at it; a user can then
+     * retry it explicitly (M5.20), which resumes from the checkpoint.
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void orphaned(ImportBatch batch) {
+        if (batch.getStatus().isTerminal()) {
+            return;
+        }
+        batch.fail(ORPHANED, clock.instant());
+        audit.record(AuditEntry.of(AuditAction.IMPORT_FAILED, AuditEntityType.IMPORT_BATCH, batch.getId())
+                .with("failureReason", ORPHANED)
+                .with("lastCommittedRow", batch.getLastCommittedRow()));
     }
 }

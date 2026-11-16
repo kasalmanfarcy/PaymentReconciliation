@@ -273,7 +273,8 @@ Amount checks run in the order of the table and stop at the first failure, so on
 | `invalid-encoding at row N` | Invalid UTF-8 in data row N (the header is checked at upload) |
 | `too-many-rows` | More than 500,000 data rows; rows already committed stay until a retry deletes them, and are never visible (rule P3) |
 | `file-missing` | The stored original is gone from object storage |
-| `retries-exhausted` | Every attempt failed transiently (storage or database unavailable) |
+| `retries-exhausted` | Every attempt failed transiently (storage or database unavailable), or every worker that claimed it died |
+| `orphaned` | The batch was in flight with no job left to process it (found by the M9.1 consistency check; a bug in the enqueue path). Retry it once the cause is understood |
 | `internal-error` | A bug; details are in the job's `last_error` for operators. Retry once fixed |
 
 **Raw rows.** `import_row_error.raw_row` is the row's values re-serialized as CSV (the parser doesn't keep the original bytes); for an unterminated quote it is the physical line where the quote opens.

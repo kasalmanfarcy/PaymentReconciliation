@@ -118,8 +118,8 @@ class ReconciliationTenantIsolationIT extends AbstractIntegrationTest {
      * predicate replaced by {@code true}. Nothing but RLS stands between it and other tenants.
      */
     static String withoutTenantFilter(String classify) {
-        String select = classify.substring(classify.indexOf("WITH day_keys"));
-        String unscoped = select.replaceAll("t\\.organization_id\\s*=\\s*:org", "true");
+        String select = classify.substring(classify.indexOf("WITH accepted"));
+        String unscoped = select.replaceAll("[tb]\\.organization_id\\s*=\\s*:org", "true");
         assertThat(unscoped).doesNotContain(":org").contains("anchor_date = :day");
         return unscoped;
     }

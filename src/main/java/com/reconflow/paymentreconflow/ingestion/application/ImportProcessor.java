@@ -113,8 +113,12 @@ public class ImportProcessor {
     /** What the first transaction found: the batch to work on, and where it stopped last time. */
     private record Start(SourceType sourceType, String storageKey, int lastCommittedRow, long storedErrors) {}
 
-    /** Below this many new rows an import barely moves the statistics; autovacuum is soon enough. */
-    static final int ANALYZE_AFTER_ROWS = 10_000;
+    /**
+     * Below this many new rows a stale estimate can't cost much: a bad plan for an organization the
+     * statistics don't know yet costs about (its groups × its rows per month), quadratic in its
+     * size. At 1,000 rows that is noise; at 8,500 it was ~50 s per run (docs/benchmarks.md §2.4).
+     */
+    static final int ANALYZE_AFTER_ROWS = 1_000;
 
     public void process(Job job, JobContext context) {
         UUID organizationId = job.organizationId();

@@ -14,7 +14,8 @@
 # server's own started_at -> completed_at, which excludes queue wait and polling.
 #
 # Environment: BASE (http://localhost:8080), EMAIL (admin@acme.test), RECONFLOW_SEED_PASSWORD,
-# PSQL (how to reach the database; default: psql inside the compose postgres container).
+# PSQL (how to reach the database; default: psql inside the compose postgres container), ORG (reuse
+# this organization instead of creating one per repetition; scripts/preload.sh uses it).
 # Local only: it talks to the URL in BASE and to the compose database, nothing else.
 set -euo pipefail
 
@@ -74,9 +75,13 @@ check() { # name, got, want
 
 FAILED=0
 echo "rep,ledger_rows,ledger_wall_s,ledger_db_s,ledger_rows_per_s,gateway_rows,gateway_wall_s,gateway_db_s,run_wall_s,run_db_s,records_per_s"
+FIXED_ORG=${ORG:-}
+# A caller running many imports passes its token (GIVEN_TOKEN): two logins per call would trip the
+# per-IP login rate limit (M3.3f).
+GIVEN_TOKEN=${TOKEN:-}
 for rep in $(seq 1 "$REPS"); do
-  ORG=$(new_org)
-  TOKEN=$(token)
+  ORG=${FIXED_ORG:-$(new_org)}
+  TOKEN=${GIVEN_TOKEN:-$(token)}
 
   t0=$(now); batch=$(upload "$DATASET/ledger.csv" INTERNAL_LEDGER)
   st=$(wait_for "$BASE/api/v1/imports/$batch"); t1=$(now)
@@ -92,10 +97,10 @@ for rep in $(seq 1 "$REPS"); do
   check "gateway counts" "$(sql "SELECT total_rows||'/'||valid_rows||'/'||error_rows FROM import_batch WHERE id = '$gbatch'")" \
     "$(jq -r '"\(.gateway.totalRows)/\(.gateway.validRows)/\(.gateway.errorRows)"' "$expected")"
 
-  TOKEN=$(token) # an access token lives 15 minutes
+  TOKEN=${GIVEN_TOKEN:-$(token)} # an access token lives 15 minutes
   t4=$(now)
   run=$(curl -sf -X POST "$BASE/api/v1/reconciliation-runs" -H "Authorization: Bearer $TOKEN" \
-    -H "X-Organization-Id: $ORG" -H 'Content-Type: application/json' -H "Idempotency-Key: bench-$ORG" \
+    -H "X-Organization-Id: $ORG" -H 'Content-Type: application/json' -H "Idempotency-Key: bench-$ORG-$period_start" \
     -d "{\"periodStart\":\"$period_start\",\"periodEnd\":\"$period_end\",\"currency\":\"$currency\"}" | jq -r .id)
   st=$(wait_for "$BASE/api/v1/reconciliation-runs/$run"); t5=$(now)
   check "run status" "$st" "COMPLETED"

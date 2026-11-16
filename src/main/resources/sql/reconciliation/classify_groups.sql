@@ -12,56 +12,66 @@
 -- :day. Every group therefore has exactly one anchor and is processed
 -- exactly once, in full: cross-day matches, duplicates spread over several
 -- days and gateway-only groups need no special cases.
+--
+-- Shape (M9.7): each group's records are fetched and aggregated in a
+-- LATERAL subquery, one index range of transaction_record_reference_idx
+-- (organization_id, normalized_reference, transaction_type,
+-- transaction_date) per group. An aggregating LATERAL can't be flattened
+-- into a plain join, so this plan doesn't depend on the planner's row
+-- estimates. The earlier plain join did: for an organization whose rows
+-- autovacuum hadn't analyzed yet, the planner estimated one row and
+-- chose an unparameterized inner scan of the whole month, read once per
+-- group (17,066 rows x 293 groups for one day; docs/benchmarks.md §2.2).
+-- The accepted batches (rule P3) are computed once, not joined per row.
 INSERT INTO recon_group (normalized_reference, transaction_type, currencies, ledger_n, gateway_n,
                          ledger_ids, ledger_dates, gateway_ids, gateway_dates,
                          ledger_amount, gateway_amount, same_amount, outcome)
-WITH day_keys AS (
+WITH accepted AS MATERIALIZED (
+    SELECT b.id FROM import_batch b
+     WHERE b.organization_id = :org
+       AND b.status IN ('COMPLETED', 'COMPLETED_WITH_ERRORS')
+),
+day_keys AS (
     -- Groups with at least one participating record on :day (any currency).
     SELECT DISTINCT t.normalized_reference, t.transaction_type
       FROM transaction_record t
-      JOIN import_batch b ON b.id = t.batch_id AND b.organization_id = t.organization_id
      WHERE t.organization_id  = :org
        AND t.transaction_date = :day
        AND t.source_type IN (:leftSource, :rightSource)
        AND t.status           = 'SUCCESS'
-       AND b.status IN ('COMPLETED', 'COMPLETED_WITH_ERRORS')
-),
-candidates AS (
-    -- Every participating record of those groups, both sides, any currency, the whole period.
-    -- Served by transaction_record_reference_idx (organization_id, normalized_reference,
-    -- transaction_type, transaction_date), pruned to the months of the period.
-    SELECT t.id, t.transaction_date, t.source_type, t.normalized_reference, t.transaction_type,
-           t.currency::text AS currency,   -- CHAR(3) is bpchar: compare and aggregate it as text
-           t.amount, t.is_duplicate_in_source
-      FROM day_keys k
-      JOIN transaction_record t
-        ON t.organization_id      = :org
-       AND t.normalized_reference = k.normalized_reference
-       AND t.transaction_type     = k.transaction_type
-      JOIN import_batch b ON b.id = t.batch_id AND b.organization_id = t.organization_id
-     WHERE t.transaction_date BETWEEN :periodStart AND :periodEnd
-       AND t.source_type IN (:leftSource, :rightSource)
-       AND t.status = 'SUCCESS'
-       AND b.status IN ('COMPLETED', 'COMPLETED_WITH_ERRORS')
+       AND t.batch_id IN (SELECT id FROM accepted)
 ),
 groups AS (
-    SELECT normalized_reference,
-           transaction_type,
-           min(transaction_date)                                                              AS anchor_date,
-           array_agg(DISTINCT currency ORDER BY currency)                                     AS currencies,
-           count(*) FILTER (WHERE source_type = 'INTERNAL_LEDGER')                            AS ledger_n,
-           count(*) FILTER (WHERE source_type = 'GATEWAY')                                    AS gateway_n,
-           bool_or(is_duplicate_in_source)                                                    AS flagged_dup,
-           -- ORDER BY id: deterministic arrays, so reruns link records in the same order.
-           array_agg(id               ORDER BY id) FILTER (WHERE source_type = 'INTERNAL_LEDGER') AS ledger_ids,
-           array_agg(transaction_date ORDER BY id) FILTER (WHERE source_type = 'INTERNAL_LEDGER') AS ledger_dates,
-           array_agg(id               ORDER BY id) FILTER (WHERE source_type = 'GATEWAY')         AS gateway_ids,
-           array_agg(transaction_date ORDER BY id) FILTER (WHERE source_type = 'GATEWAY')         AS gateway_dates,
-           min(amount) FILTER (WHERE source_type = 'INTERNAL_LEDGER')                         AS ledger_amount,
-           min(amount) FILTER (WHERE source_type = 'GATEWAY')                                 AS gateway_amount,
-           min(amount) = max(amount)                                                          AS same_amount
-      FROM candidates
-     GROUP BY normalized_reference, transaction_type
+    -- Every participating record of each of those groups, both sides, any currency, the whole
+    -- period, aggregated per group.
+    SELECT k.normalized_reference,
+           k.transaction_type,
+           g.*
+      FROM day_keys k
+     CROSS JOIN LATERAL (
+        SELECT min(t.transaction_date)                                                           AS anchor_date,
+               -- CHAR(3) is bpchar: compare and aggregate it as text
+               array_agg(DISTINCT t.currency::text ORDER BY t.currency::text)                    AS currencies,
+               count(*) FILTER (WHERE t.source_type = 'INTERNAL_LEDGER')                         AS ledger_n,
+               count(*) FILTER (WHERE t.source_type = 'GATEWAY')                                 AS gateway_n,
+               bool_or(t.is_duplicate_in_source)                                                 AS flagged_dup,
+               -- ORDER BY id: deterministic arrays, so reruns link records in the same order.
+               array_agg(t.id               ORDER BY t.id) FILTER (WHERE t.source_type = 'INTERNAL_LEDGER') AS ledger_ids,
+               array_agg(t.transaction_date ORDER BY t.id) FILTER (WHERE t.source_type = 'INTERNAL_LEDGER') AS ledger_dates,
+               array_agg(t.id               ORDER BY t.id) FILTER (WHERE t.source_type = 'GATEWAY')         AS gateway_ids,
+               array_agg(t.transaction_date ORDER BY t.id) FILTER (WHERE t.source_type = 'GATEWAY')         AS gateway_dates,
+               min(t.amount) FILTER (WHERE t.source_type = 'INTERNAL_LEDGER')                    AS ledger_amount,
+               min(t.amount) FILTER (WHERE t.source_type = 'GATEWAY')                            AS gateway_amount,
+               min(t.amount) = max(t.amount)                                                     AS same_amount
+          FROM transaction_record t
+         WHERE t.organization_id      = :org
+           AND t.normalized_reference = k.normalized_reference
+           AND t.transaction_type     = k.transaction_type
+           AND t.transaction_date BETWEEN :periodStart AND :periodEnd
+           AND t.source_type IN (:leftSource, :rightSource)
+           AND t.status = 'SUCCESS'
+           AND t.batch_id IN (SELECT id FROM accepted)
+     ) g
 )
 SELECT normalized_reference, transaction_type, currencies,
        ledger_n, gateway_n, ledger_ids, ledger_dates, gateway_ids, gateway_dates,

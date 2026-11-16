@@ -17,7 +17,7 @@ class ImportStatisticsIT extends AbstractImportIT {
     void aLargeImportAnalyzesTheMonthsItWrote() throws Exception {
         Timestamp before = lastAnalyze();
         StringBuilder csv = new StringBuilder("reference,amount,currency,status,transaction_date\n");
-        for (int i = 0; i < 10_000; i++) {
+        for (int i = 0; i < 1_000; i++) {
             csv.append("ST-").append(UUID.randomUUID()).append(",10.00,AED,SUCCESS,2026-10-15\n");
         }
         Tenant t = newTenant();

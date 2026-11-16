@@ -61,7 +61,8 @@ Browser / API client
    PostgreSQL
    durable records · constraints · transactional consistency
 
-  Later (only when justified): Kafka · background workers
+  Background jobs: PostgreSQL job table + worker processes (ADR 0004)
+  Later, only if measured: Kafka
 ```
 
 ### Processing pipeline
@@ -101,7 +102,7 @@ Monetary values are `BigDecimal` in Java and `NUMERIC` in PostgreSQL — never `
 | Reconciliation run | `PENDING → RUNNING → COMPLETED` (or `FAILED`) |
 | Exception case | `OPEN → IN_REVIEW → RESOLVED` (reopen retains prior resolution history) |
 
-Valid transitions, required reasons, and authorization rules are defined in `docs/reconciliation-rules.md` (planned).
+Valid transitions, required reasons, and authorization rules are defined in [reconciliation-rules.md §7](docs/reconciliation-rules.md#7-state-machines).
 
 ---
 
@@ -130,7 +131,7 @@ Explicitly **out of scope for v1**: one-to-many matching for aggregated settleme
 | Migrations | Flyway | V1–V3 applied on startup; applied migrations are never edited |
 | Build | Maven (wrapper) | `./mvnw`, no system Maven required |
 | Testing | JUnit + Testcontainers | Tests start their own PostgreSQL 16 in Docker |
-| Async | Kafka | Deliberately deferred |
+| Async | PostgreSQL job table | Worker processes claim jobs with `SKIP LOCKED` ([ADR 0004](docs/adr/0004-postgresql-job-queue.md)); Kafka deliberately deferred |
 | Cache | Redis | Deliberately deferred; only if a concrete need appears |
 | Local infra | Docker Compose | Planned |
 
@@ -243,16 +244,18 @@ Build order is ingestion → reconciliation → exceptions. Not every endpoint i
 - **No speculative infrastructure.** Kafka, Redis, and microservices are added only when a measured need justifies them.
 - **Failures are first-class.** Partial imports expose per-row errors; crashed jobs resume or reprocess safely; concurrent edits return a conflict rather than silently overwriting.
 
-## Open design questions
+## Design decisions
 
-These must be resolved before the persistence layer is written:
+| Question | Decision |
+|---|---|
+| Duplicate imports | [ADR 0005](docs/adr/0005-duplicate-import-policy.md) |
+| Reconciliation-run idempotency | [ADR 0006](docs/adr/0006-reconciliation-run-idempotency.md) |
+| Sync vs async processing | [ADR 0003](docs/adr/0003-asynchronous-imports-and-runs.md) |
+| Concurrency on exceptions | [ADR 0007](docs/adr/0007-optimistic-locking-on-exceptions.md) |
+| Tenant enforcement | [ADR 0008](docs/adr/0008-tenant-isolation.md) |
+| Currencies per run | [ADR 0009](docs/adr/0009-run-pinned-to-one-currency.md) |
 
-- Duplicate-import policy: content hash, natural key, or both? What does a deliberate re-import look like?
-- Idempotency key for reconciliation runs — what makes two runs "the same run"?
-- Sync vs. async imports in v1, and whether the API returns `201 Created` or `202 Accepted`.
-- Concurrency control on exception resolution: optimistic locking (`@Version` + `409`) is the working assumption.
-- Mechanism for tenant enforcement — request-scoped context plus repository methods that always take `organizationId`.
-- Whether a run may span currencies, or is pinned to one.
+All decisions: [docs/adr/](docs/adr/).
 
 ---
 
@@ -280,14 +283,15 @@ paymentreconflow/
 
 ## Documentation
 
-Planned under `docs/`:
-
 | Document | Contents |
 | -------- | -------- |
-| `requirements.md` | Problem statement, users, functional and non-functional requirements, scope |
-| `architecture.md` | Module boundaries, request flows, ERD, deferred async design |
-| `database-design.md` | Tables, constraints, indexes, indexes that enforce correctness |
-| `api-design.md` | Contracts, error model, pagination, idempotency and concurrency semantics |
-| `reconciliation-rules.md` | Normative matching rules, tie-breaking, state transitions, reason codes |
+| [requirements.md](docs/requirements.md) | Problem statement, personas, functional and non-functional requirements, scope, assumptions, CSV contracts |
+| [reconciliation-rules.md](docs/reconciliation-rules.md) | Normalization, participation, match key, ordered outcomes, exception types and codes, discrepancy keys, state machines, money handling |
+| [architecture.md](docs/architecture.md) | Context and containers, modules and table ownership, allowed dependencies, request flows, background processing |
+| [database-design.md](docs/database-design.md) | Conventions, ERD, tables, the constraints that enforce correctness, partitioning, tenancy, migration policy |
+| [api-design.md](docs/api-design.md) | Conventions, error model and catalogue, pagination, idempotency, concurrency, status codes, endpoint reference |
+| [scalability.md](docs/scalability.md) | Capacity plan for 1,000 users, SLOs, load-test scenarios |
+| [samples/](docs/samples/README.md) | Sample CSVs and the expected outcome of every row |
+| [adr/](docs/adr/) | Architecture Decision Records |
 
 `projectoverview.md` holds the original design brief and remains the source of intent.

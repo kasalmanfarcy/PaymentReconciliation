@@ -1,11 +1,14 @@
 package com.reconflow.paymentreconflow.exceptions.internal.api;
 
 import com.reconflow.paymentreconflow.exceptions.ExceptionType;
+import com.reconflow.paymentreconflow.exceptions.internal.application.ExceptionCommands;
 import com.reconflow.paymentreconflow.exceptions.internal.application.ExceptionDetailView;
 import com.reconflow.paymentreconflow.exceptions.internal.application.ExceptionFilter;
 import com.reconflow.paymentreconflow.exceptions.internal.application.ExceptionList;
+import com.reconflow.paymentreconflow.exceptions.internal.application.ExceptionPatch;
 import com.reconflow.paymentreconflow.exceptions.internal.application.ExceptionQueries;
 import com.reconflow.paymentreconflow.exceptions.internal.application.ExceptionSummaryView;
+import com.reconflow.paymentreconflow.exceptions.internal.application.IfMatch;
 import com.reconflow.paymentreconflow.exceptions.internal.domain.ExceptionStatus;
 import com.reconflow.paymentreconflow.shared.context.Permission;
 import com.reconflow.paymentreconflow.shared.context.RequiresPermission;
@@ -15,12 +18,17 @@ import java.util.List;
 import java.util.UUID;
 import org.jspecify.annotations.Nullable;
 import org.springframework.data.web.PagedModel;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import tools.jackson.databind.JsonNode;
 
 /**
  * {@code /api/v1/exceptions} (api-design.md §8.13–§8.18). The organization comes from
@@ -31,12 +39,16 @@ import org.springframework.web.bind.annotation.RestController;
 @RequestMapping("/api/v1/exceptions")
 class ExceptionController {
 
+    static final String MERGE_PATCH_JSON = "application/merge-patch+json";
+
     private final ExceptionQueries queries;
     private final ExceptionList list;
+    private final ExceptionCommands commands;
 
-    ExceptionController(ExceptionQueries queries, ExceptionList list) {
+    ExceptionController(ExceptionQueries queries, ExceptionList list, ExceptionCommands commands) {
         this.queries = queries;
         this.list = list;
+        this.commands = commands;
     }
 
     /**
@@ -71,6 +83,25 @@ class ExceptionController {
     @GetMapping("/{id}")
     @RequiresPermission(Permission.EXCEPTION_READ)
     ResponseEntity<ExceptionDetailView> get(@PathVariable UUID id) {
+        return withETag(queries.detail(id));
+    }
+
+    /**
+     * Assign ({@code assignedTo}: a user id, or null to unassign) and/or move between OPEN and
+     * IN_REVIEW ({@code status}, with {@code reason} for IN_REVIEW → OPEN). JSON Merge Patch only:
+     * {@code consumes} makes a plain {@code application/json} PATCH a 415 rather than silently
+     * accepting a body whose null-means-clear semantics the client may not intend.
+     *
+     * <p>If-Match is parsed before the body is applied: missing is 428, malformed 400.
+     */
+    @PatchMapping(path = "/{id}", consumes = MERGE_PATCH_JSON)
+    @RequiresPermission(Permission.EXCEPTION_UPDATE)
+    ResponseEntity<ExceptionDetailView> patch(
+            @PathVariable UUID id,
+            @RequestHeader(name = HttpHeaders.IF_MATCH, required = false) @Nullable String ifMatch,
+            @RequestBody JsonNode body) {
+        long expected = IfMatch.parseRequired(ifMatch);
+        commands.patch(id, expected, ExceptionPatch.from(body));
         return withETag(queries.detail(id));
     }
 

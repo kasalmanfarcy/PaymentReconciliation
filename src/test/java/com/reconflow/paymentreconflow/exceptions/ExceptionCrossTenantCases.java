@@ -20,6 +20,12 @@ import org.springframework.stereotype.Component;
 @Component
 class ExceptionCrossTenantCases implements CrossTenantCases {
 
+    /** The case's real current version, so the only thing that can stop the write is the tenant check. */
+    static final Map<String, String> IF_MATCH_0 = Map.of("If-Match", "\"0\"");
+
+    static final Map<String, String> VERSIONED_MERGE_PATCH =
+            Map.of("If-Match", "\"0\"", "Content-Type", "application/merge-patch+json");
+
     @Override
     public List<CrossTenantCase> cases() {
         List<CrossTenantCase> cases = new ArrayList<>();
@@ -55,6 +61,14 @@ class ExceptionCrossTenantCases implements CrossTenantCases {
                 f -> Map.of("id", f.orgBCase()),
                 null,
                 NOT_FOUND));
+        cases.add(new CrossTenantCase(
+                "patch org B's exception",
+                HttpMethod.PATCH,
+                "/api/v1/exceptions/{id}",
+                f -> Map.of("id", f.orgBCase()),
+                f -> Map.of("status", "IN_REVIEW"),
+                NOT_FOUND,
+                VERSIONED_MERGE_PATCH));
         return cases;
     }
 }

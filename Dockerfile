@@ -9,7 +9,7 @@
 # Dependabot's docker ecosystem proposes the bumps (.github/dependabot.yml).
 
 # ---- build stage ------------------------------------------------------------------------------
-FROM eclipse-temurin:25.0.5_8-jdk-alpine@sha256:c7c3d0bdf7f2bbc5a05a6712ed334d198360105634ea9adf76fca94f381b1e3f AS build
+FROM eclipse-temurin:27.0.1.0-jdk-alpine@sha256:a63e42ef2a577cdb0802b73bb6f8fa2c3b0ebf1b4f00f29eb22e7f4d83b234f7 AS build
 WORKDIR /workspace
 
 # Dependencies first: this layer is reused until pom.xml (or the wrapper) changes, so a code change
@@ -32,7 +32,7 @@ RUN java -Djarmode=tools -jar app.jar extract --layers --launcher --destination 
 # ---- runtime stage ----------------------------------------------------------------------------
 # JRE only, on Alpine: no compiler, no Maven, no source, and a much smaller OS than Ubuntu (fewer
 # packages to patch). Busybox's wget serves the HEALTHCHECK, so no curl is installed.
-FROM eclipse-temurin:25.0.5_8-jre-alpine@sha256:e1898fd6a11fc965a994d8ace186fd3585aeb636cf8f05f47a723fcfee0b0918 AS runtime
+FROM eclipse-temurin:27.0.1.0-jre-alpine@sha256:a0f3b523fd89e242ce302715ce367f68e9073c59274e65746d0791c750f38de3 AS runtime
 
 LABEL org.opencontainers.image.title="reconflow" \
       org.opencontainers.image.description="ReconFlow payment reconciliation (api, worker and migrate roles)" \

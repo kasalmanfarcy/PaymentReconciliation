@@ -5,6 +5,7 @@ import jakarta.persistence.LockModeType;
 import java.util.Optional;
 import java.util.UUID;
 import org.springframework.data.jpa.repository.Lock;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.Repository;
 import org.springframework.data.repository.query.Param;
@@ -30,6 +31,27 @@ public interface ImportBatchRepository extends Repository<ImportBatch, UUID> {
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("select b from ImportBatch b where b.id = :id and b.organizationId = :organizationId")
     Optional<ImportBatch> lockByIdAndOrganizationId(@Param("id") UUID id, @Param("organizationId") UUID organizationId);
+
+    /**
+     * Advances the checkpoint and the counters in the chunk's own transaction, together with the
+     * chunk's rows: one SQL statement, so a stale copy of the entity can never overwrite them, and
+     * after any crash they are exactly right. Zero rows updated means the batch isn't PROCESSING
+     * any more; the caller must roll the chunk back.
+     */
+    @Modifying(flushAutomatically = true, clearAutomatically = true)
+    @Query(value = """
+                    UPDATE import_batch
+                       SET last_committed_row = :lastRow, total_rows = :lastRow,
+                           valid_rows = valid_rows + :validRows, error_rows = error_rows + :errorRows,
+                           updated_at = now()
+                     WHERE id = :id AND organization_id = :organizationId AND status = 'PROCESSING'
+                    """, nativeQuery = true)
+    int recordChunk(
+            @Param("id") UUID id,
+            @Param("organizationId") UUID organizationId,
+            @Param("lastRow") int lastRow,
+            @Param("validRows") int validRows,
+            @Param("errorRows") int errorRows);
 
     /** For the orphan sweeper: is any batch of this organization still pointing at the object? */
     boolean existsByOrganizationIdAndStorageKey(UUID organizationId, String storageKey);

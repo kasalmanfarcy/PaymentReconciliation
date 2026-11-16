@@ -127,6 +127,26 @@ public class ImportBatch implements Persistable<UUID> {
         return b;
     }
 
+    /**
+     * Moves the batch to {@code next}, stamping the start or end time. Callers hold the row lock
+     * ({@link ImportBatchRepository#lockByIdAndOrganizationId}).
+     */
+    public void transitionTo(ImportBatchStatus next, Instant now) {
+        switch (next) {
+            case PROCESSING -> startedAt = now;
+            case COMPLETED, COMPLETED_WITH_ERRORS, FAILED -> completedAt = now;
+            case RECEIVED -> {}
+        }
+        status = next;
+        updatedAt = now;
+    }
+
+    /** {@code FAILED} with the reason users see: a short code, never a stack trace. */
+    public void fail(String reason, Instant now) {
+        transitionTo(ImportBatchStatus.FAILED, now);
+        failureReason = reason;
+    }
+
     @Override
     public UUID getId() {
         return id;

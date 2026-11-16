@@ -142,7 +142,18 @@ One sentence each; the details belong to the phase that builds them.
 
 ## 6. Assumptions
 
-_Added in M1.2._
+Things v1 treats as true without proof. Writing them down means we notice when one stops being true, and the right-hand column says what breaks if it does.
+
+| ID | Assumption | Consequence if false |
+|---|---|---|
+| A1 | Matching is one-to-one: one ledger record corresponds to at most one gateway record | Aggregated settlements (one gateway row paying several orders) show up as MISSING and DUPLICATE cases until v2 adds one-to-many matching |
+| A2 | Each transaction has a single currency; there is no FX conversion | Cross-currency settlement needs FX rates and a tolerance (v2+). Today it surfaces as `CURRENCY_MISMATCH` |
+| A3 | A reconciliation run covers one currency, so its totals can be summed | Multi-currency totals would be meaningless without FX. See [ADR 0009](adr/0009-run-pinned-to-one-currency.md) |
+| A4 | Both sources carry the same business reference for a payment (the merchant's order or payment reference) | Otherwise matching needs fuzzy rules or a mapping table, which v1 deliberately doesn't have |
+| A5 | Both sources report the **payment** timestamp, not the settlement date, as the transaction time | A gateway that only reports settlement dates shifts records by a day or more; settlement-date windows are v2 |
+| A6 | Input is CSV in the format in §7, uploaded through the API; all data in this project is synthetic | Real customer data adds PII handling (M10.6) and per-customer formats (v2 column mappings) |
+| A7 | A reference identifies one payment within an organization and source; a repeat is a duplicate, not a new payment | If a source reuses references (e.g. daily counters), every reuse looks like a duplicate; the key would need a date component |
+| A8 | Amounts are positive; the transaction type (`PAYMENT`, `REFUND`, `CHARGEBACK`, `FEE`) says the direction | A source with signed amounts (refunds as `-50.00`) would be rejected row by row; it would need a per-source sign convention |
 
 ---
 

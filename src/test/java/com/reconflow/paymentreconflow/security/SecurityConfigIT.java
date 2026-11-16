@@ -14,7 +14,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MvcResult;
 
-/** The temporary M2.2 chain: health is public, everything else is a ProblemDetail 401. */
+/** Health is public; without a bearer token everything else is a ProblemDetail 401 (M2.2, M3.3e). */
 class SecurityConfigIT extends AbstractIntegrationTest {
 
     @Test

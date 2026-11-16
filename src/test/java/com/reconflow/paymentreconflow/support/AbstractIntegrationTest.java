@@ -6,11 +6,13 @@ import com.reconflow.paymentreconflow.TestcontainersConfiguration;
 import java.util.Map;
 import java.util.concurrent.ThreadLocalRandom;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.security.oauth2.jwt.JwtEncoder;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
@@ -43,6 +45,20 @@ public abstract class AbstractIntegrationTest {
 
     @Autowired
     protected JsonMapper jsonMapper;
+
+    @Autowired
+    private JwtEncoder jwtEncoder;
+
+    @Value("${reconflow.auth.jwt.issuer}")
+    private String issuer;
+
+    @Value("${reconflow.auth.jwt.audience}")
+    private String audience;
+
+    /** Access tokens minted with the app's own key (or deliberately not). */
+    protected TestTokens tokens() {
+        return new TestTokens(jwtEncoder, issuer, audience);
+    }
 
     /** Fresh organizations and users, written with plain SQL. */
     protected TestData data() {

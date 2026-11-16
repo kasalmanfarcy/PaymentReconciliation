@@ -1,5 +1,6 @@
 package com.reconflow.paymentreconflow.security.config;
 
+import com.reconflow.paymentreconflow.security.auth.PasswordChangeRequiredFilter;
 import com.reconflow.paymentreconflow.shared.error.ProblemCodes;
 import com.reconflow.paymentreconflow.shared.error.ProblemDetailWriter;
 import com.reconflow.paymentreconflow.shared.error.ProblemDetails;
@@ -15,6 +16,7 @@ import org.springframework.security.config.annotation.web.configurers.AbstractHt
 import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.core.userdetails.UserDetailsService;
 import org.springframework.security.core.userdetails.UsernameNotFoundException;
+import org.springframework.security.oauth2.server.resource.web.authentication.BearerTokenAuthenticationFilter;
 import org.springframework.security.web.AuthenticationEntryPoint;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.access.AccessDeniedHandler;
@@ -34,7 +36,10 @@ class SecurityConfig {
 
     @Bean
     SecurityFilterChain securityFilterChain(
-            HttpSecurity http, AuthenticationEntryPoint problemEntryPoint, AccessDeniedHandler problemDeniedHandler) {
+            HttpSecurity http,
+            AuthenticationEntryPoint problemEntryPoint,
+            AccessDeniedHandler problemDeniedHandler,
+            ProblemDetailWriter problemWriter) {
         http.sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 // Bearer tokens aren't sent automatically by browsers, so CSRF can't use them. The
                 // refresh cookie is: SameSite=Strict plus Path=/api/v1/auth confine it to
@@ -62,7 +67,8 @@ class SecurityConfig {
                 // 401 and 403 happen in filters, before GlobalExceptionHandler can see them, so
                 // they are written here in the same ProblemDetail shape.
                 .exceptionHandling(errors ->
-                        errors.authenticationEntryPoint(problemEntryPoint).accessDeniedHandler(problemDeniedHandler));
+                        errors.authenticationEntryPoint(problemEntryPoint).accessDeniedHandler(problemDeniedHandler))
+                .addFilterAfter(new PasswordChangeRequiredFilter(problemWriter), BearerTokenAuthenticationFilter.class);
         return http.build();
     }
 

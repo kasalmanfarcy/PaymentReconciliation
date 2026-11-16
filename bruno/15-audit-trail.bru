@@ -1,0 +1,23 @@
+meta {
+  name: 15 The case's audit trail (org admin)
+  type: http
+  seq: 15
+}
+
+get {
+  url: {{baseUrl}}/api/v1/audit-events?entityType=EXCEPTION_CASE&entityId={{exceptionId}}
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{adminToken}}
+}
+
+tests {
+  test("created by the engine, resolved by a person", () => {
+    expect(res.status).to.equal(200);
+    const actions = res.body.content.map((e) => e.action);
+    expect(actions).to.include("EXCEPTION_CREATED");
+    expect(actions).to.include("EXCEPTION_RESOLVED");
+  });
+}

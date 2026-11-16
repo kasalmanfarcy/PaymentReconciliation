@@ -1,0 +1,22 @@
+meta {
+  name: 14 Reconciliation report
+  type: http
+  seq: 14
+}
+
+get {
+  url: {{baseUrl}}/api/v1/reports/reconciliation?runId={{runId}}
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{investigatorToken}}
+}
+
+tests {
+  test("one resolved, by the investigator", () => {
+    expect(res.status).to.equal(200);
+    expect(res.body.matched.count).to.equal(13);
+    expect(res.body.resolution.resolved).to.equal(1);
+  });
+}

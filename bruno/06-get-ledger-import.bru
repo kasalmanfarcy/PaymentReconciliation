@@ -1,0 +1,29 @@
+meta {
+  name: 06 Ledger import: COMPLETED, 19 rows
+  type: http
+  seq: 6
+}
+
+get {
+  url: {{baseUrl}}/api/v1/imports/{{ledgerImportId}}
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{uploaderToken}}
+}
+
+script:pre-request {
+  // The worker imports in the background; give it a moment (the API sends Retry-After meanwhile).
+  await new Promise((resolve) => setTimeout(resolve, 3000));
+}
+
+tests {
+  test("imported as docs/samples/demo/expected.json says", () => {
+    expect(res.status).to.equal(200);
+    expect(res.body.status).to.equal("COMPLETED");
+    expect(res.body.totalRows).to.equal(19);
+    expect(res.body.validRows).to.equal(19);
+    expect(res.body.errorRows).to.equal(0);
+  });
+}

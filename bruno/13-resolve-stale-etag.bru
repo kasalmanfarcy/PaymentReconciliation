@@ -1,0 +1,33 @@
+meta {
+  name: 13 The same resolve with the old ETag (409)
+  type: http
+  seq: 13
+}
+
+post {
+  url: {{baseUrl}}/api/v1/exceptions/{{exceptionId}}/resolve
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{investigatorToken}}
+}
+
+headers {
+  If-Match: {{etag}}
+}
+
+body:json {
+  {
+    "resolutionCode": "OTHER",
+    "note": "A second, stale attempt."
+  }
+}
+
+tests {
+  test("a stale version never wins silently", () => {
+    expect(res.status).to.equal(409);
+    expect(res.body.code).to.equal("stale-version");
+  });
+}

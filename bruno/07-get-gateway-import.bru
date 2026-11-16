@@ -1,0 +1,29 @@
+meta {
+  name: 07 Gateway import: COMPLETED_WITH_ERRORS, 2 bad rows
+  type: http
+  seq: 7
+}
+
+get {
+  url: {{baseUrl}}/api/v1/imports/{{gatewayImportId}}
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{uploaderToken}}
+}
+
+script:pre-request {
+  // The worker imports in the background; give it a moment (the API sends Retry-After meanwhile).
+  await new Promise((resolve) => setTimeout(resolve, 3000));
+}
+
+tests {
+  test("imported as docs/samples/demo/expected.json says", () => {
+    expect(res.status).to.equal(200);
+    expect(res.body.status).to.equal("COMPLETED_WITH_ERRORS");
+    expect(res.body.totalRows).to.equal(22);
+    expect(res.body.validRows).to.equal(20);
+    expect(res.body.errorRows).to.equal(2);
+  });
+}

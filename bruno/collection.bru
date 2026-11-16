@@ -1,0 +1,15 @@
+docs {
+  # ReconFlow demo walkthrough (M11.8)
+
+  The steps of `scripts/demo.sh`, as requests you can read, send one at a time and diff in a PR:
+  log in, upload the ledger and the gateway file, wait for both imports, reconcile, open the work
+  queue, resolve a case with `If-Match`, watch a stale `If-Match` lose with `409`, read the report
+  and the audit trail. Data: `docs/samples/demo` (expected numbers in `expected.json`).
+
+  **Against the local stack only** (`docker compose --profile full up -d`, or `./mvnw spring-boot:run`
+  with the `local` profile): it logs in with the local realm's password grant (`reconflow-demo`),
+  which a deployed realm doesn't have. Set the secret `demoPassword` to `reconflow-local-demo`.
+
+  Headless: `npx @usebruno/cli@4.2.1 run --env local --env-var demoPassword=reconflow-local-demo`
+  from this folder. Safe to repeat: re-uploads answer `409 duplicate-file` and reuse the batch.
+}

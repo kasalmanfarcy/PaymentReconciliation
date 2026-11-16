@@ -1,0 +1,32 @@
+meta {
+  name: 04 Upload the ledger (202 Accepted)
+  type: http
+  seq: 4
+}
+
+post {
+  url: {{baseUrl}}/api/v1/imports
+  body: multipartForm
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{uploaderToken}}
+}
+
+body:multipart-form {
+  sourceType: INTERNAL_LEDGER
+  file: @file(../docs/samples/demo/ledger.csv)
+}
+
+script:post-response {
+  // 202: a new batch. 409 duplicate-file: imported before (a second demo); carry on with that one.
+  bru.setVar("ledgerImportId", res.status === 202 ? res.body.id : res.body.existingBatchId);
+}
+
+tests {
+  test("accepted, or already imported", () => {
+    expect(res.status).to.be.oneOf([202, 409]);
+    if (res.status === 409) expect(res.body.code).to.equal("duplicate-file");
+  });
+}

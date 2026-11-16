@@ -1,0 +1,32 @@
+meta {
+  name: 09 The run's summary
+  type: http
+  seq: 9
+}
+
+get {
+  url: {{baseUrl}}/api/v1/reconciliation-runs/{{runId}}
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{investigatorToken}}
+}
+
+script:pre-request {
+  await new Promise((resolve) => setTimeout(resolve, 4000));
+}
+
+tests {
+  test("completed with the expected summary", () => {
+    expect(res.status).to.equal(200);
+    expect(res.body.status).to.equal("COMPLETED");
+    const s = res.body.summary;
+    expect(s.matched).to.deep.equal({ count: 13, amount: "13410.1400" });
+    expect(s.amountMismatch).to.deep.equal({ count: 2, netDifference: "-500.0300" });
+    expect(s.unmatchedLeft.count).to.equal(2);
+    expect(s.unmatchedRight.count).to.equal(2);
+    expect(s.duplicates.count).to.equal(1);
+    expect(s.currencyMismatches.count).to.equal(1);
+  });
+}

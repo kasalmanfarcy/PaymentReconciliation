@@ -1,0 +1,40 @@
+meta {
+  name: 08 Start a reconciliation run (202)
+  type: http
+  seq: 8
+}
+
+post {
+  url: {{baseUrl}}/api/v1/reconciliation-runs
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{investigatorToken}}
+}
+
+headers {
+  Idempotency-Key: {{runKey}}
+}
+
+body:json {
+  {
+    "periodStart": "{{periodStart}}",
+    "periodEnd": "{{periodEnd}}",
+    "currency": "{{currency}}"
+  }
+}
+
+script:pre-request {
+  // A fresh key per walkthrough: the same key returns the earlier run (ADR 0006).
+  bru.setVar("runKey", "bruno-" + Date.now());
+}
+
+script:post-response {
+  bru.setVar("runId", res.body.id);
+}
+
+tests {
+  test("queued", () => expect(res.status).to.equal(202));
+}

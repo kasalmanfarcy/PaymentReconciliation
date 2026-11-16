@@ -1,0 +1,25 @@
+meta {
+  name: 11 One case, with its ETag
+  type: http
+  seq: 11
+}
+
+get {
+  url: {{baseUrl}}/api/v1/exceptions/{{exceptionId}}
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{investigatorToken}}
+}
+
+script:post-response {
+  bru.setVar("etag", res.headers["etag"]);
+}
+
+tests {
+  test("both sides and an ETag", () => {
+    expect(res.status).to.equal(200);
+    expect(res.headers["etag"]).to.match(/^"\d+"$/);
+  });
+}

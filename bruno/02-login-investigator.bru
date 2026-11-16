@@ -1,0 +1,29 @@
+meta {
+  name: 02 Log in as the investigator
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{keycloakUrl}}/realms/reconflow/protocol/openid-connect/token
+  body: formUrlEncoded
+  auth: none
+}
+
+body:form-urlencoded {
+  grant_type: password
+  client_id: reconflow-demo
+  username: {{investigatorUser}}
+  password: {{demoPassword}}
+}
+
+script:post-response {
+  bru.setVar("investigatorToken", res.body.access_token);
+}
+
+tests {
+  test("token issued", () => {
+    expect(res.status).to.equal(200);
+    expect(res.body.access_token).to.be.a("string");
+  });
+}

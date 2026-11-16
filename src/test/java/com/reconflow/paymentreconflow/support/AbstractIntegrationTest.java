@@ -4,6 +4,7 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 
 import com.reconflow.paymentreconflow.TestcontainersConfiguration;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -58,6 +59,23 @@ public abstract class AbstractIntegrationTest {
     /** Access tokens minted with the app's own key (or deliberately not). */
     protected TestTokens tokens() {
         return new TestTokens(jwtEncoder, issuer, audience);
+    }
+
+    /** Authenticates a MockMvc request as the user, with a freshly minted access token. */
+    protected RequestPostProcessor as(UUID userId) {
+        String header = TestTokens.bearer(tokens().forUser(userId));
+        return request -> {
+            request.addHeader("Authorization", header);
+            return request;
+        };
+    }
+
+    /** Selects the organization for an org-scoped request. */
+    protected static RequestPostProcessor org(UUID organizationId) {
+        return request -> {
+            request.addHeader("X-Organization-Id", organizationId.toString());
+            return request;
+        };
     }
 
     /** Fresh organizations and users, written with plain SQL. */

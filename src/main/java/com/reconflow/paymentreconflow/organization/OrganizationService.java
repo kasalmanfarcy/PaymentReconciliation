@@ -1,6 +1,7 @@
 package com.reconflow.paymentreconflow.organization;
 
 import com.reconflow.paymentreconflow.shared.error.NotFoundException;
+import jakarta.persistence.EntityManager;
 import java.util.UUID;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
@@ -13,9 +14,11 @@ import org.springframework.transaction.annotation.Transactional;
 public class OrganizationService {
 
     private final OrganizationRepository organizations;
+    private final EntityManager em;
 
-    OrganizationService(OrganizationRepository organizations) {
+    OrganizationService(OrganizationRepository organizations, EntityManager em) {
         this.organizations = organizations;
+        this.em = em;
     }
 
     /**
@@ -24,7 +27,11 @@ public class OrganizationService {
      */
     @Transactional(propagation = Propagation.MANDATORY)
     public Organization create(UUID id, String name) {
-        return organizations.save(Organization.createWithId(id, name));
+        Organization org = organizations.save(Organization.createWithId(id, name));
+        // Insert now and read back the database defaults (created_at) for the response.
+        em.flush();
+        em.refresh(org);
+        return org;
     }
 
     @Transactional

@@ -74,6 +74,9 @@ reconflow:
       # unless generate-ephemeral-key is on, which only the local and test profiles set.
       private-key: ${JWT_PRIVATE_KEY:}
       public-key: ${JWT_PUBLIC_KEY:}
+  bootstrap:
+    # One-time: creates the first platform admin in a fresh environment (security.bootstrap).
+    admin-email: ${RECONFLOW_BOOTSTRAP_ADMIN_EMAIL:}
   storage:
     endpoint: ${S3_ENDPOINT:}
     region: ${S3_REGION:us-east-1}

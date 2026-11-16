@@ -47,6 +47,9 @@ class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
     @ExceptionHandler(ApiException.class)
     ProblemDetail handleApi(ApiException ex) {
         ProblemDetail problem = ProblemDetails.of(ex.status(), ex.code(), ex.getMessage());
+        if (ProblemCodes.VALIDATION_FAILED.equals(ex.code())) {
+            problem.setTitle(INVALID_REQUEST);
+        }
         ex.properties().forEach(problem::setProperty);
         return problem;
     }

@@ -42,6 +42,7 @@
     </scm>
     <properties>
         <java.version>25</java.version>
+        <uuid-creator.version>6.1.1</uuid-creator.version>
     </properties>
     <dependencies>
         <dependency>
@@ -74,6 +75,13 @@
         <dependency>
             <groupId>org.flywaydb</groupId>
             <artifactId>flyway-database-postgresql</artifactId>
+        </dependency>
+
+        <!-- UUIDv7 generator (ADR 0010): the JDK only generates v4 (random) UUIDs. -->
+        <dependency>
+            <groupId>com.github.f4b6a3</groupId>
+            <artifactId>uuid-creator</artifactId>
+            <version>${uuid-creator.version}</version>
         </dependency>
 
         <dependency>

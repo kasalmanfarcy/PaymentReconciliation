@@ -121,7 +121,8 @@ class GlobalExceptionHandlerTest {
     @Test
     void beanValidationListsEachField() throws Exception {
         assertProblem(
-                        mockMvc.perform(post("/test/body").with(csrf())
+                        mockMvc.perform(post("/test/body")
+                                .with(csrf())
                                 .contentType(MediaType.APPLICATION_JSON)
                                 .content("{\"reference\": \" \", \"count\": 0}")),
                         400,
@@ -135,7 +136,8 @@ class GlobalExceptionHandlerTest {
     @Test
     void malformedJsonIsAValidationFailure() throws Exception {
         assertProblem(
-                        mockMvc.perform(post("/test/body").with(csrf())
+                        mockMvc.perform(post("/test/body")
+                                .with(csrf())
                                 .contentType(MediaType.APPLICATION_JSON)
                                 .content("{\"reference\": ")),
                         400,
@@ -146,7 +148,8 @@ class GlobalExceptionHandlerTest {
     @Test
     void wrongValueTypeNamesTheField() throws Exception {
         assertProblem(
-                        mockMvc.perform(post("/test/body").with(csrf())
+                        mockMvc.perform(post("/test/body")
+                                .with(csrf())
                                 .contentType(MediaType.APPLICATION_JSON)
                                 .content("{\"reference\": \"x\", \"count\": \"many\"}")),
                         400,
@@ -173,7 +176,10 @@ class GlobalExceptionHandlerTest {
     void wrongMethodAndMediaTypeGetCatalogueCodes() throws Exception {
         assertProblem(mockMvc.perform(post("/test/not-found").with(csrf())), 405, "method-not-allowed");
         assertProblem(
-                mockMvc.perform(post("/test/body").with(csrf()).contentType(MediaType.TEXT_PLAIN).content("x")),
+                mockMvc.perform(post("/test/body")
+                        .with(csrf())
+                        .contentType(MediaType.TEXT_PLAIN)
+                        .content("x")),
                 415,
                 "unsupported-media-type");
     }

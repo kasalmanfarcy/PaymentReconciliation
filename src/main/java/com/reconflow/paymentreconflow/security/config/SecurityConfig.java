@@ -49,8 +49,8 @@ class SecurityConfig {
                         .authenticated())
                 // 401 and 403 happen in filters, before GlobalExceptionHandler can see them, so
                 // they are written here in the same ProblemDetail shape.
-                .exceptionHandling(errors -> errors.authenticationEntryPoint((request, response, ex) ->
-                                problemWriter.write(
+                .exceptionHandling(errors -> errors.authenticationEntryPoint(
+                                (request, response, ex) -> problemWriter.write(
                                         request,
                                         response,
                                         ProblemDetails.of(

@@ -6,7 +6,9 @@
  */
 // Allowed dependencies: docs/architecture.md §4. A dependency not listed here fails ModularityTest,
 // even if it would not create a cycle.
-@ApplicationModule(displayName = "Ingestion", allowedDependencies = {"ledger", "audit", "shared"})
+@ApplicationModule(
+        displayName = "Ingestion",
+        allowedDependencies = {"ledger", "audit", "shared"})
 package com.reconflow.paymentreconflow.ingestion;
 
 import org.springframework.modulith.ApplicationModule;

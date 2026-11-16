@@ -12,7 +12,8 @@ class RequestIdIT extends AbstractIntegrationTest {
     @Test
     void everyResponseCarriesARequestId() throws Exception {
         mockMvc.perform(get("/actuator/health"))
-                .andExpect(header().string(RequestIdFilter.HEADER, org.hamcrest.Matchers.matchesPattern("[0-9a-f]{16}")));
+                .andExpect(
+                        header().string(RequestIdFilter.HEADER, org.hamcrest.Matchers.matchesPattern("[0-9a-f]{16}")));
     }
 
     @Test
@@ -24,6 +25,7 @@ class RequestIdIT extends AbstractIntegrationTest {
     @Test
     void anUnsafeIncomingIdIsReplaced() throws Exception {
         mockMvc.perform(get("/actuator/health").header(RequestIdFilter.HEADER, "bad\nvalue"))
-                .andExpect(header().string(RequestIdFilter.HEADER, org.hamcrest.Matchers.matchesPattern("[0-9a-f]{16}")));
+                .andExpect(
+                        header().string(RequestIdFilter.HEADER, org.hamcrest.Matchers.matchesPattern("[0-9a-f]{16}")));
     }
 }

@@ -11,4 +11,5 @@ import org.springframework.validation.annotation.Validated;
  */
 @Validated
 @ConfigurationProperties("reconflow.jobs.worker")
-public record JobWorkerProperties(boolean enabled, @DefaultValue("4") @Min(1) int threads) {}
+public record JobWorkerProperties(
+        boolean enabled, @DefaultValue("4") @Min(1) int threads) {}

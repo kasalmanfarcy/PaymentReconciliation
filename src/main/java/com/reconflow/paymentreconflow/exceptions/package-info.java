@@ -7,7 +7,9 @@
  */
 // Allowed dependencies: docs/architecture.md §4. A dependency not listed here fails ModularityTest,
 // even if it would not create a cycle.
-@ApplicationModule(displayName = "Exceptions", allowedDependencies = {"audit", "shared", "security :: directory"})
+@ApplicationModule(
+        displayName = "Exceptions",
+        allowedDependencies = {"audit", "shared", "security :: directory"})
 package com.reconflow.paymentreconflow.exceptions;
 
 import org.springframework.modulith.ApplicationModule;

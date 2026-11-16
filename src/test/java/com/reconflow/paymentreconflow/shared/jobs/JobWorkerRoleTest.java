@@ -30,7 +30,8 @@ class JobWorkerRoleTest {
         runner.withPropertyValues("reconflow.jobs.worker.enabled=true", "reconflow.jobs.worker.threads=2")
                 .run(context -> {
                     assertThat(context).hasSingleBean(JobWorker.class);
-                    assertThat(context.getBean(JobWorkerProperties.class).threads()).isEqualTo(2);
+                    assertThat(context.getBean(JobWorkerProperties.class).threads())
+                            .isEqualTo(2);
                 });
     }
 }

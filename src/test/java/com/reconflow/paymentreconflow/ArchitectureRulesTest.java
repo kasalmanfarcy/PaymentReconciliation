@@ -17,8 +17,9 @@ class ArchitectureRulesTest {
 
     static final String ROOT = "com.reconflow.paymentreconflow";
 
-    static final JavaClasses classes =
-            new ClassFileImporter().withImportOption(ImportOption.Predefined.DO_NOT_INCLUDE_TESTS).importPackages(ROOT);
+    static final JavaClasses classes = new ClassFileImporter()
+            .withImportOption(ImportOption.Predefined.DO_NOT_INCLUDE_TESTS)
+            .importPackages(ROOT);
 
     @Test
     void sharedDependsOnNoOtherModule() {

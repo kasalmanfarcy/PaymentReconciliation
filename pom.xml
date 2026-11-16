@@ -1,22 +1,20 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-    xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
     <parent>
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-starter-parent</artifactId>
         <version>4.1.2</version>
-        <relativePath/> <!-- lookup parent from repository -->
+        <relativePath/>
+        <!-- lookup parent from repository -->
     </parent>
     <groupId>com.reconflow</groupId>
     <artifactId>paymentreconflow</artifactId>
     <version>0.0.1-SNAPSHOT</version>
     <name>ReconFlow</name>
-    <description>
-        Multi-tenant payment reconciliation service: imports internal-ledger and
+    <description>Multi-tenant payment reconciliation service: imports internal-ledger and
         payment-gateway settlement files, matches them, and manages the resulting
-        exceptions through to an audited resolution.
-    </description>
+        exceptions through to an audited resolution.</description>
     <url>https://github.com/kasalmanfarcy/PaymentReconciliation</url>
 
     <licenses>
@@ -37,14 +35,16 @@
     <scm>
         <connection>scm:git:https://github.com/kasalmanfarcy/PaymentReconciliation.git</connection>
         <developerConnection>scm:git:git@github.com:kasalmanfarcy/PaymentReconciliation.git</developerConnection>
-        <url>https://github.com/kasalmanfarcy/PaymentReconciliation</url>
         <tag>HEAD</tag>
+        <url>https://github.com/kasalmanfarcy/PaymentReconciliation</url>
     </scm>
     <properties>
         <java.version>25</java.version>
         <uuid-creator.version>6.1.1</uuid-creator.version>
         <!-- Spring Modulith 2.1.x is the line built for Spring Boot 4.1. Boot does not manage it. -->
         <spring-modulith.version>2.1.2</spring-modulith.version>
+        <spotless-maven-plugin.version>3.11.0</spotless-maven-plugin.version>
+        <palantir-java-format.version>2.103.0</palantir-java-format.version>
     </properties>
     <dependencyManagement>
         <dependencies>
@@ -173,6 +173,42 @@
                             <goal>integration-test</goal>
                             <goal>verify</goal>
                         </goals>
+                    </execution>
+                </executions>
+            </plugin>
+            <!-- Formatting is checked, not discussed (M2.13). `./mvnw spotless:apply` formats;
+                 `./mvnw verify` fails with a diff if anything is unformatted. Palantir Java Format
+                 matches .editorconfig (4-space indent, 120 columns). Only Java and the POM are
+                 formatted: SQL migrations are never touched, because changing an applied
+                 migration's bytes changes its checksum and Flyway refuses to start. -->
+            <plugin>
+                <groupId>com.diffplug.spotless</groupId>
+                <artifactId>spotless-maven-plugin</artifactId>
+                <version>${spotless-maven-plugin.version}</version>
+                <configuration>
+                    <java>
+                        <palantirJavaFormat>
+                            <version>${palantir-java-format.version}</version>
+                        </palantirJavaFormat>
+                        <removeUnusedImports/>
+                        <importOrder/>
+                        <trimTrailingWhitespace/>
+                        <endWithNewline/>
+                    </java>
+                    <pom>
+                        <sortPom>
+                            <expandEmptyElements>false</expandEmptyElements>
+                            <!-- .editorconfig: 4-space indent for XML -->
+                            <nrOfIndentSpace>4</nrOfIndentSpace>
+                        </sortPom>
+                    </pom>
+                </configuration>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>check</goal>
+                        </goals>
+                        <phase>verify</phase>
                     </execution>
                 </executions>
             </plugin>

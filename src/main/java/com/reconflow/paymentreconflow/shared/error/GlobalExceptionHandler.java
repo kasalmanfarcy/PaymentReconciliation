@@ -116,7 +116,8 @@ class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
     protected ResponseEntity<Object> handleHttpMessageNotReadable(
             HttpMessageNotReadableException ex, HttpHeaders headers, HttpStatusCode status, WebRequest request) {
         List<Map<String, String>> errors = List.of();
-        if (ex.getCause() instanceof JacksonException jackson && !jackson.getPath().isEmpty()) {
+        if (ex.getCause() instanceof JacksonException jackson
+                && !jackson.getPath().isEmpty()) {
             errors = List.of(error(jsonPath(jackson), "unreadable", "The value could not be read."));
         }
         return validationFailed("The request body is not valid JSON, or a value has the wrong type.", errors, headers);

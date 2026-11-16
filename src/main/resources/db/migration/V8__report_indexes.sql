@@ -1,0 +1,26 @@
+-- =====================================================================
+-- ReconFlow — an index found by the report plan check (M8.5)
+--
+-- The date-range reconciliation report attributes cases to the
+-- authoritative (run, day) pairs: exception_case_run rows with
+-- run_id = ? AND day = ?. The primary key (run_id, exception_id)
+-- narrows to the run but then reads every case the run observed to
+-- filter on day, and with up to 366 authoritative days the planner
+-- preferred a sequential scan of the whole table with a hash join
+-- (ReportQueryPlanIT, 120,000 links over eight organizations). With
+-- (run_id, day) each pair is one index range.
+--
+-- exception_case_run grows by about 2% of the transactions reconciled,
+-- so the extra index is cheap next to the transaction_record indexes,
+-- and it is only written in the engine's day chunks.
+--
+-- Not added: M8.3's suggested partial index on active cases
+-- (WHERE status <> 'RESOLVED'). The ageing report's plans use
+-- exception_case_list_idx (organization_id, status, created_at) as a
+-- bitmap scan, at 2-3 ms for 4,500 active cases of 15,000; recorded in
+-- docs/benchmarks.md, revisited by M9.7 on the full generated dataset.
+--
+-- No data change, so row-level security is not involved.
+-- =====================================================================
+
+CREATE INDEX exception_case_run_day_idx ON exception_case_run (run_id, day);

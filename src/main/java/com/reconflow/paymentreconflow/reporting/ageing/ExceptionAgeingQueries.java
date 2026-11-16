@@ -79,7 +79,8 @@ public class ExceptionAgeingQueries {
         return jdbc.sql("SELECT now()").query(java.sql.Timestamp.class).single().toInstant();
     }
 
-    public List<Row> ageing(UUID orgId, Filter filter) {
+    /** The statement for a filter's shape: fixed fragments only, every value bound. */
+    public static String sql(Filter filter) {
         StringBuilder sql = new StringBuilder(SELECT_ACTIVE);
         if (!filter.types().isEmpty()) {
             sql.append(TYPE_FILTER);
@@ -92,8 +93,11 @@ public class ExceptionAgeingQueries {
         if (filter.currency() != null) {
             sql.append(CURRENCY_FILTER);
         }
-        sql.append(AGGREGATE);
-        JdbcClient.StatementSpec spec = jdbc.sql(sql.toString()).param("orgId", orgId);
+        return sql.append(AGGREGATE).toString();
+    }
+
+    public List<Row> ageing(UUID orgId, Filter filter) {
+        JdbcClient.StatementSpec spec = jdbc.sql(sql(filter)).param("orgId", orgId);
         if (!filter.types().isEmpty()) {
             spec = spec.param("types", filter.types());
         }

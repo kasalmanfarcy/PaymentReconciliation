@@ -6,6 +6,7 @@ import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import org.jspecify.annotations.Nullable;
@@ -63,25 +64,33 @@ public class ImportQualityQueries {
 
     private static final String BUCKET = "date_trunc(:granularity, b.created_at AT TIME ZONE 'UTC')::date";
 
-    // level: 0 = bucket and code, 1 = the bucket's total over every code.
+    /*
+     * Errors per bucket and code, and per bucket over every code (level 1). Counted per batch in a
+     * LATERAL subquery, then summed per bucket: the subquery aggregates, so PostgreSQL can't flatten
+     * it into a join, and each batch's errors are one range of the batch_id-led unique index. As a
+     * plain join, a month of one tenant's errors made the planner hash-join a sequential scan of
+     * the whole import_row_error table (M8.5, docs/benchmarks.md). Summing per-batch distinct row
+     * counts is exact: a row belongs to exactly one batch.
+     */
     private static final String ERRORS_OVER_TIME_SELECT = """
-            WITH errs AS (
-                SELECT %s AS bucket, e.error_code, e.batch_id, e.row_number
+            SELECT bucket, error_code, level, sum(errors) AS errors, sum(error_rows) AS error_rows
+              FROM (
+                SELECT %s AS bucket, pb.error_code, pb.level, pb.errors, pb.error_rows
+                  FROM import_batch b
+                 CROSS JOIN LATERAL (
+                       SELECT e.error_code,
+                              GROUPING(e.error_code)       AS level,
+                              count(*)                     AS errors,
+                              count(DISTINCT e.row_number) AS error_rows
+                         FROM import_row_error e
+                        WHERE e.batch_id = b.id AND e.organization_id = b.organization_id
+                        GROUP BY GROUPING SETS ((e.error_code), ())
+                 ) pb
             """.formatted(BUCKET);
 
-    private static final String ERRORS_OVER_TIME_FROM = """
-              FROM import_batch b
-              JOIN import_row_error e ON e.batch_id = b.id AND e.organization_id = b.organization_id
-            """;
-
     private static final String ERRORS_OVER_TIME_GROUP = """
-            )
-            SELECT bucket, error_code,
-                   GROUPING(error_code)                    AS level,
-                   count(*)                                AS errors,
-                   count(DISTINCT (batch_id, row_number))  AS error_rows
-              FROM errs
-             GROUP BY GROUPING SETS ((bucket, error_code), (bucket))
+              ) per_batch
+             GROUP BY bucket, level, error_code
              ORDER BY bucket, level DESC, errors DESC, error_code
             """;
 
@@ -93,6 +102,15 @@ public class ImportQualityQueries {
             """.formatted(BUCKET);
 
     private static final String DENOMINATOR_GROUP = " GROUP BY 1 ORDER BY 1\n";
+
+    /** Every statement this class runs, by name, for M8.5's plan check (see ReconciliationReportQueries). */
+    public static final Map<String, String> STATEMENTS = Map.of(
+            "importQuality.batch", BATCH,
+            "importQuality.batch.errors", BATCH_ERRORS,
+            "importQuality.overTime.errors", errorsOverTimeSql(false),
+            "importQuality.overTime.errors.bySource", errorsOverTimeSql(true),
+            "importQuality.overTime.denominators", denominatorsSql(false),
+            "importQuality.overTime.denominators.bySource", denominatorsSql(true));
 
     private final JdbcClient jdbc;
 
@@ -153,12 +171,7 @@ public class ImportQualityQueries {
 
     public List<ErrorRow> errorsOverTime(
             UUID orgId, LocalDate from, LocalDate to, Granularity granularity, @Nullable String sourceType) {
-        String sql = ERRORS_OVER_TIME_SELECT
-                + ERRORS_OVER_TIME_FROM
-                + IN_RANGE
-                + (sourceType == null ? "" : SOURCE_FILTER)
-                + ERRORS_OVER_TIME_GROUP;
-        return overTime(sql, orgId, from, to, granularity, sourceType)
+        return overTime(errorsOverTimeSql(sourceType != null), orgId, from, to, granularity, sourceType)
                 .query((rs, n) -> new ErrorRow(
                         rs.getObject("bucket", LocalDate.class),
                         rs.getString("error_code"),
@@ -179,6 +192,14 @@ public class ImportQualityQueries {
                         rs.getLong("total_rows"),
                         rs.getLong("error_rows")))
                 .list();
+    }
+
+    private static String errorsOverTimeSql(boolean bySource) {
+        return ERRORS_OVER_TIME_SELECT + IN_RANGE + (bySource ? SOURCE_FILTER : "") + ERRORS_OVER_TIME_GROUP;
+    }
+
+    private static String denominatorsSql(boolean bySource) {
+        return DENOMINATOR_SELECT + IN_RANGE + (bySource ? SOURCE_FILTER : "") + DENOMINATOR_GROUP;
     }
 
     private JdbcClient.StatementSpec overTime(

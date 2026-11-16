@@ -77,7 +77,7 @@ public class ExceptionCsvExporter {
      * UUIDv7 ids sort by creation time, and exception_case_run's primary key (run_id, exception_id)
      * already returns them in that order, so there is no sort to wait for before the first row.
      */
-    private static final String EXPORT = """
+    public static final String EXPORT = """
             SELECT e.id, e.type, e.reason_code, e.status, e.discrepancy_key, e.currency::text AS currency,
                    e.amount, e.amount_difference,
                    rec.ledger_references, rec.ledger_amounts, rec.ledger_dates,

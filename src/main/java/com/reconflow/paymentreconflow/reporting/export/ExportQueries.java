@@ -10,6 +10,12 @@ import org.springframework.transaction.annotation.Transactional;
 @Transactional(readOnly = true)
 public class ExportQueries {
 
+    public static final String RUN_EXISTS =
+            "SELECT EXISTS (SELECT 1 FROM reconciliation_run WHERE organization_id = :orgId AND id = :runId)";
+
+    public static final String COUNT_FOR_RUN =
+            "SELECT count(*) FROM exception_case_run WHERE organization_id = :orgId AND run_id = :runId";
+
     private final JdbcClient jdbc;
 
     ExportQueries(JdbcClient jdbc) {
@@ -28,7 +34,7 @@ public class ExportQueries {
 
     /** How many rows the export will have: an index-only count on exception_case_run's key. */
     public long countForRun(UUID orgId, UUID runId) {
-        return jdbc.sql("SELECT count(*) FROM exception_case_run WHERE organization_id = :orgId AND run_id = :runId")
+        return jdbc.sql(COUNT_FOR_RUN)
                 .param("orgId", orgId)
                 .param("runId", runId)
                 .query(Long.class)

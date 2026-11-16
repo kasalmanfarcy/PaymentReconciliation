@@ -9,6 +9,7 @@ import java.sql.Timestamp;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import org.jspecify.annotations.Nullable;
@@ -36,7 +37,7 @@ import org.springframework.transaction.annotation.Transactional;
 public class ReconciliationReportQueries {
 
     /** A run row: a primary-key lookup, scoped by organization (another tenant's run: no row). */
-    private static final String RUN = """
+    static final String RUN = """
             SELECT r.id, r.status, r.currency::text AS currency, r.period_start, r.period_end, r.completed_at,
                    r.matched_count, r.matched_amount,
                    CASE WHEN r.left_source = 'INTERNAL_LEDGER' THEN r.unmatched_left_count
@@ -60,7 +61,7 @@ public class ReconciliationReportQueries {
      * run id breaks ties so the choice is deterministic. Served by
      * {@code reconciliation_run_day_lookup_idx (organization_id, currency, day)}.
      */
-    private static final String AUTHORITATIVE = """
+    static final String AUTHORITATIVE = """
             WITH authoritative AS (
                 SELECT DISTINCT ON (d.day)
                        d.day, d.run_id, r.completed_at, r.left_source,
@@ -78,7 +79,7 @@ public class ReconciliationReportQueries {
             )
             """;
 
-    private static final String RANGE_TOTALS = AUTHORITATIVE + """
+    static final String RANGE_TOTALS = AUTHORITATIVE + """
             SELECT coalesce(sum(matched_count), 0)            AS matched_count,
                    coalesce(sum(matched_amount), 0.0000)           AS matched_amount,
                    coalesce(sum(CASE WHEN left_source = 'INTERNAL_LEDGER' THEN unmatched_left_count
@@ -96,12 +97,12 @@ public class ReconciliationReportQueries {
               FROM authoritative
             """;
 
-    private static final String RANGE_DAYS = AUTHORITATIVE + """
+    static final String RANGE_DAYS = AUTHORITATIVE + """
             SELECT day, run_id, completed_at FROM authoritative ORDER BY day
             """;
 
     /** The cases one run observed (exception_case_run's key leads with run_id). */
-    private static final String RUN_CASES = """
+    static final String RUN_CASES = """
             WITH cases AS (
                 SELECT cr.exception_id
                   FROM exception_case_run cr
@@ -114,7 +115,7 @@ public class ReconciliationReportQueries {
      * (run, day) pairs whose day rows the totals add up, so the breakdown agrees with the totals.
      * DISTINCT because a case spanning days can be observed by two authoritative runs.
      */
-    private static final String RANGE_CASES = AUTHORITATIVE + """
+    static final String RANGE_CASES = AUTHORITATIVE + """
             , cases AS (
                 SELECT DISTINCT cr.exception_id
                   FROM authoritative a
@@ -124,7 +125,7 @@ public class ReconciliationReportQueries {
             """;
 
     /** One pass over the cases: FILTER computes every status count in the same scan. */
-    private static final String BY_REASON = """
+    static final String BY_REASON = """
             SELECT e.type,
                    e.reason_code,
                    count(*)                                       AS total,
@@ -139,7 +140,7 @@ public class ReconciliationReportQueries {
              ORDER BY total DESC, e.type, e.reason_code NULLS FIRST
             """;
 
-    private static final String RESOLVERS = """
+    static final String RESOLVERS = """
             SELECT e.resolved_by AS user_id, u.display_name, count(*) AS resolved
               FROM cases c
               JOIN exception_case e ON e.id = c.exception_id AND e.organization_id = :orgId
@@ -148,6 +149,19 @@ public class ReconciliationReportQueries {
              GROUP BY e.resolved_by, u.display_name
              ORDER BY resolved DESC, u.display_name, e.resolved_by
             """;
+
+    /**
+     * Every statement this class runs, by name, exactly as it runs them: M8.5's plan check
+     * ({@code ReportQueryPlanIT}) EXPLAINs these strings, so it can never check a stale copy.
+     */
+    public static final Map<String, String> STATEMENTS = Map.of(
+            "reconciliation.run", RUN,
+            "reconciliation.run.reasons", RUN_CASES + BY_REASON,
+            "reconciliation.run.resolvers", RUN_CASES + RESOLVERS,
+            "reconciliation.range.totals", RANGE_TOTALS,
+            "reconciliation.range.days", RANGE_DAYS,
+            "reconciliation.range.reasons", RANGE_CASES + BY_REASON,
+            "reconciliation.range.resolvers", RANGE_CASES + RESOLVERS);
 
     private final JdbcClient jdbc;
 

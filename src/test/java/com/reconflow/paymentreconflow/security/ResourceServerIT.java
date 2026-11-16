@@ -8,6 +8,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import com.reconflow.paymentreconflow.shared.context.Role;
 import com.reconflow.paymentreconflow.support.AbstractIntegrationTest;
 import java.time.Instant;
 import java.util.List;
@@ -40,10 +41,12 @@ class ResourceServerIT extends AbstractIntegrationTest {
 
     @Test
     void aValidTokenIsAccepted() throws Exception {
-        var user = data().newUser();
+        var user = data().newMember(data().newOrganization(), Role.VIEWER);
 
-        // Past security: the path simply doesn't exist.
-        probe(tokens().forUser(user.id())).andExpect(status().isNotFound());
+        // Past security and tenant resolution: the path simply doesn't exist.
+        probe(tokens().forUser(user.id()))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.code").value("not-found"));
     }
 
     @Test

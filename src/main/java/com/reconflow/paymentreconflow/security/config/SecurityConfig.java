@@ -1,6 +1,9 @@
 package com.reconflow.paymentreconflow.security.config;
 
 import com.reconflow.paymentreconflow.security.auth.PasswordChangeRequiredFilter;
+import com.reconflow.paymentreconflow.security.tenant.TenantContextFilter;
+import com.reconflow.paymentreconflow.security.tenant.TenantLookup;
+import com.reconflow.paymentreconflow.shared.context.Permission;
 import com.reconflow.paymentreconflow.shared.error.ProblemCodes;
 import com.reconflow.paymentreconflow.shared.error.ProblemDetailWriter;
 import com.reconflow.paymentreconflow.shared.error.ProblemDetails;
@@ -39,7 +42,8 @@ class SecurityConfig {
             HttpSecurity http,
             AuthenticationEntryPoint problemEntryPoint,
             AccessDeniedHandler problemDeniedHandler,
-            ProblemDetailWriter problemWriter) {
+            ProblemDetailWriter problemWriter,
+            TenantLookup tenantLookup) {
         http.sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 // Bearer tokens aren't sent automatically by browsers, so CSRF can't use them. The
                 // refresh cookie is: SameSite=Strict plus Path=/api/v1/auth confine it to
@@ -58,6 +62,9 @@ class SecurityConfig {
                         .requestMatchers(
                                 HttpMethod.POST, "/api/v1/auth/login", "/api/v1/auth/refresh", "/api/v1/auth/logout")
                         .permitAll()
+                        // Granted only by TenantContextFilter in platform mode, from the database.
+                        .requestMatchers("/api/v1/platform/**")
+                        .hasAuthority(Permission.PLATFORM_ORG_MANAGE.name())
                         .anyRequest()
                         .authenticated())
                 // Invalid tokens fail inside BearerTokenAuthenticationFilter, which uses this
@@ -68,7 +75,11 @@ class SecurityConfig {
                 // they are written here in the same ProblemDetail shape.
                 .exceptionHandling(errors ->
                         errors.authenticationEntryPoint(problemEntryPoint).accessDeniedHandler(problemDeniedHandler))
-                .addFilterAfter(new PasswordChangeRequiredFilter(problemWriter), BearerTokenAuthenticationFilter.class);
+                // Bearer authentication, then the pending-password gate, then tenant resolution,
+                // then authorization (which sees the authentication the tenant filter installed).
+                .addFilterAfter(new PasswordChangeRequiredFilter(problemWriter), BearerTokenAuthenticationFilter.class)
+                .addFilterAfter(
+                        new TenantContextFilter(tenantLookup, problemWriter), PasswordChangeRequiredFilter.class);
         return http.build();
     }
 

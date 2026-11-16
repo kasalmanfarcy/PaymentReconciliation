@@ -128,10 +128,17 @@ public class ImportBatch implements Persistable<UUID> {
     }
 
     /**
-     * Moves the batch to {@code next}, stamping the start or end time. Callers hold the row lock
-     * ({@link ImportBatchRepository#lockByIdAndOrganizationId}).
+     * The only way the status changes (M5.15): checked against {@link ImportBatchStatus}'s table,
+     * stamping the start or end time. Callers hold the row lock
+     * ({@link ImportBatchRepository#lockByIdAndOrganizationId}) and write the audit event in the
+     * same transaction.
+     *
+     * @throws InvalidTransitionException if the state machine doesn't allow it
      */
     public void transitionTo(ImportBatchStatus next, Instant now) {
+        if (!status.canTransitionTo(next)) {
+            throw new InvalidTransitionException(id, status, next);
+        }
         switch (next) {
             case PROCESSING -> startedAt = now;
             case COMPLETED, COMPLETED_WITH_ERRORS, FAILED -> completedAt = now;

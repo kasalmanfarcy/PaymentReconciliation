@@ -239,6 +239,7 @@ stateDiagram-v2
     PROCESSING --> COMPLETED : no row errors
     PROCESSING --> COMPLETED_WITH_ERRORS : some rows invalid
     PROCESSING --> FAILED : unreadable, too many rows, all invalid, retries exhausted
+    RECEIVED --> FAILED : retries exhausted before processing started
     FAILED --> RECEIVED : retry (reason)
     COMPLETED --> [*]
     COMPLETED_WITH_ERRORS --> [*]
@@ -251,6 +252,7 @@ stateDiagram-v2
 | `PROCESSING` | `COMPLETED` | System: every row valid | No | `IMPORT_COMPLETED` |
 | `PROCESSING` | `COMPLETED_WITH_ERRORS` | System: ≥ 1 row error and ≥ 1 valid row | No | `IMPORT_COMPLETED` (payload carries the status and counts) |
 | `PROCESSING` | `FAILED` | System: unreadable file (encoding), more than 500,000 rows, every row invalid, file missing from storage, or job attempts exhausted | `failure_reason` | `IMPORT_FAILED` |
+| `RECEIVED` | `FAILED` | System: the job ran out of attempts before processing ever started (every claim failed transiently, or each worker died before its first transaction committed) | `failure_reason` | `IMPORT_FAILED` |
 | `PROCESSING` | `PROCESSING` | System: the sweeper re-queues the job after an expired lease; the next worker resumes after `last_committed_row` | No | — |
 | `FAILED` | `RECEIVED` | `IMPORT_CREATE` (`POST /imports/{id}/retry`) | Yes | `IMPORT_RETRY_REQUESTED` |
 

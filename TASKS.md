@@ -131,42 +131,42 @@ Built early so later milestones emit events as they go, instead of retrofitting 
 ## M5 — Transaction ingestion
 
 ### Job queue
-- [ ] **M5.0** DB-backed job queue in `shared.jobs` (moved forward from M9.2, see docs/scalability.md §4): claim with `FOR UPDATE SKIP LOCKED`, leases with heartbeats, a sweeper for expired leases, at most 2 running jobs per organization, exponential backoff, and a `JobHandler` per job type. Enqueue in the same transaction as the business row.
+- [x] **M5.0** DB-backed job queue in `shared.jobs` (moved forward from M9.2, see docs/scalability.md §4): claim with `FOR UPDATE SKIP LOCKED`, leases with heartbeats, a sweeper for expired leases, at most 2 running jobs per organization, exponential backoff, and a `JobHandler` per job type. Enqueue in the same transaction as the business row.
 
 ### Data model
-- [ ] **M5.1** Write a migration and entity for `import_batch`: source type, status, file name, content hash (SHA-256), stored file reference, total/valid/error row counts, timestamps and `uploaded_by`.
-- [ ] **M5.2** Write a migration and entity for `import_row_error`: batch, row number, column, error code, message, raw row.
-- [ ] **M5.3** Write a migration and entity for `transaction_record`: org, batch, source type, raw reference, normalized reference, `amount NUMERIC`, currency, transaction type, status, transaction date, raw values (JSONB) and the source row number. *Note: V1 already creates the table, partitioned by month on `transaction_date`; this task maps the entity and the writer.*
-- [ ] **M5.4** Add a unique constraint on `(organization_id, source_type, content_hash)` for duplicate-file detection.
-- [ ] **M5.5** Add a unique constraint that prevents the same source record being inserted twice by a retried batch, e.g. `(batch_id, source_row_number)`.
-- [ ] **M5.6** Add indexes for the match query: `(organization_id, source_type, normalized_reference)` and `(organization_id, transaction_date)`.
+- [x] **M5.1** Write a migration and entity for `import_batch`: source type, status, file name, content hash (SHA-256), stored file reference, total/valid/error row counts, timestamps and `uploaded_by`.
+- [x] **M5.2** Write a migration and entity for `import_row_error`: batch, row number, column, error code, message, raw row.
+- [x] **M5.3** Write a migration and entity for `transaction_record`: org, batch, source type, raw reference, normalized reference, `amount NUMERIC`, currency, transaction type, status, transaction date, raw values (JSONB) and the source row number. *Note: V1 already creates the table, partitioned by month on `transaction_date`; this task maps the entity and the writer.*
+- [x] **M5.4** Add a unique constraint on `(organization_id, source_type, content_hash)` for duplicate-file detection.
+- [x] **M5.5** Add a unique constraint that prevents the same source record being inserted twice by a retried batch, e.g. `(batch_id, source_row_number)`.
+- [x] **M5.6** Add indexes for the match query: `(organization_id, source_type, normalized_reference)` and `(organization_id, transaction_date)`.
 
 ### Upload and processing
-- [ ] **M5.7** `POST /api/v1/imports` (multipart): check file size, content type, org access and required headers, then create the batch as `RECEIVED`.
-- [ ] **M5.8** File storage: write the original file to a `FileStorage` abstraction implemented on S3-compatible storage (MinIO locally), so any worker can read a file uploaded through any API instance.
-- [ ] **M5.9** Duplicate-file policy: implement ADR 0005: reject with `409 duplicate-file` and the existing batch ID; a failed batch is retried in place (M5.20), never re-uploaded.
-- [ ] **M5.10** CSV parser (Apache Commons CSV or similar) that streams rows instead of loading the whole file into memory. Rows are processed and committed in chunks of 5,000 with a `last_committed_row` resume checkpoint (M5.14).
-- [ ] **M5.11** Row validator: required fields, amount format and scale, ISO currency, date parsing and enum values. Collect errors for each row and keep going.
-- [ ] **M5.12** Normalizer: produce normalized fields while keeping the raw values intact.
-- [ ] **M5.13** Within-file duplicate detection: flag repeated rows without dropping either one.
-- [ ] **M5.14** Batch inserts: JDBC batching in chunks of 5,000 rows, one transaction per chunk that also advances `last_committed_row`, so a crashed import resumes where it stopped. IDs are application-generated UUIDv7 (ADR 0010).
-- [ ] **M5.15** Status transitions `RECEIVED → PROCESSING → COMPLETED | COMPLETED_WITH_ERRORS | FAILED`, enforced in a single place.
-- [ ] **M5.16** Emit audit events for import received, completed and failed.
-- [ ] **M5.17** `GET /api/v1/imports/{id}` for status, counts and paginated row errors.
-- [ ] **M5.18** `GET /api/v1/imports` to list batches for the organization, paginated.
-- [ ] **M5.19** `GET /api/v1/transactions` with filters for source, date range, reference, currency and batch, paginated and sorted.
-- [ ] **M5.20** `POST /api/v1/imports/{id}/retry`, an explicit and audited reprocess of a `FAILED` batch.
+- [x] **M5.7** `POST /api/v1/imports` (multipart): check file size, content type, org access and required headers, then create the batch as `RECEIVED`.
+- [x] **M5.8** File storage: write the original file to a `FileStorage` abstraction implemented on S3-compatible storage (MinIO locally), so any worker can read a file uploaded through any API instance.
+- [x] **M5.9** Duplicate-file policy: implement ADR 0005: reject with `409 duplicate-file` and the existing batch ID; a failed batch is retried in place (M5.20), never re-uploaded.
+- [x] **M5.10** CSV parser (Apache Commons CSV or similar) that streams rows instead of loading the whole file into memory. Rows are processed and committed in chunks of 5,000 with a `last_committed_row` resume checkpoint (M5.14).
+- [x] **M5.11** Row validator: required fields, amount format and scale, ISO currency, date parsing and enum values. Collect errors for each row and keep going.
+- [x] **M5.12** Normalizer: produce normalized fields while keeping the raw values intact.
+- [x] **M5.13** Within-file duplicate detection: flag repeated rows without dropping either one.
+- [x] **M5.14** Batch inserts: JDBC batching in chunks of 5,000 rows, one transaction per chunk that also advances `last_committed_row`, so a crashed import resumes where it stopped. IDs are application-generated UUIDv7 (ADR 0010).
+- [x] **M5.15** Status transitions `RECEIVED → PROCESSING → COMPLETED | COMPLETED_WITH_ERRORS | FAILED`, enforced in a single place.
+- [x] **M5.16** Emit audit events for import received, completed and failed.
+- [x] **M5.17** `GET /api/v1/imports/{id}` for status, counts and paginated row errors.
+- [x] **M5.18** `GET /api/v1/imports` to list batches for the organization, paginated.
+- [x] **M5.19** `GET /api/v1/transactions` with filters for source, date range, reference, currency and batch, paginated and sorted.
+- [x] **M5.20** `POST /api/v1/imports/{id}/retry`, an explicit and audited reprocess of a `FAILED` batch.
 
 ### Tests
-- [ ] **M5.21** Unit tests for the validator and normalizer, one per rule in `reconciliation-rules.md`.
-- [ ] **M5.22** Integration test: the sample CSVs from M1.4 produce the expected counts and errors.
-- [ ] **M5.23** Uploading the same file twice follows the documented policy.
-- [ ] **M5.24** A file with malformed rows ends in `COMPLETED_WITH_ERRORS`, with valid rows persisted and every bad row reported.
-- [ ] **M5.25** A crash in the middle of processing, simulated by an exception after N rows, followed by a retry, produces no duplicate `transaction_record` rows.
-- [ ] **M5.26** Wrong headers, an empty file or an oversized file are rejected with a clear `ProblemDetail`.
+- [x] **M5.21** Unit tests for the validator and normalizer, one per rule in `reconciliation-rules.md`.
+- [x] **M5.22** Integration test: the sample CSVs from M1.4 produce the expected counts and errors.
+- [x] **M5.23** Uploading the same file twice follows the documented policy.
+- [x] **M5.24** A file with malformed rows ends in `COMPLETED_WITH_ERRORS`, with valid rows persisted and every bad row reported.
+- [x] **M5.25** A crash in the middle of processing, simulated by an exception after N rows, followed by a retry, produces no duplicate `transaction_record` rows.
+- [x] **M5.26** Wrong headers, an empty file or an oversized file are rejected with a clear `ProblemDetail`.
 
 ### Partitions
-- [ ] **M5.27** Partition-maintenance job: keep `transaction_record` monthly partitions created 3 months ahead (idempotent, daily, on the worker), and alert when `transaction_record_default` is non-empty. Must exist before real data arrives (plans/README.md, ordering exception 3).
+- [x] **M5.27** Partition-maintenance job: keep `transaction_record` monthly partitions created 3 months ahead (idempotent, daily, on the worker), and alert when `transaction_record_default` is non-empty. Must exist before real data arrives (plans/README.md, ordering exception 3).
 
 **Exit criteria:** both sample files can be uploaded and the normalized transactions inspected through the API, and every failure case in projectoverview.md §6 that relates to imports has a passing test.
 

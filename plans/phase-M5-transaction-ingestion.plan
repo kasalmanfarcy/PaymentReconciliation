@@ -1,6 +1,6 @@
 # Phase M5 — Transaction ingestion
 
-**Status:** Not started · **Tasks:** TASKS.md M5.1–M5.26 (+ job queue moved from M9.2) · **Depends on:** M2, M3, M4 · **Date:** 2026-11-01
+**Status:** Done (2026-11-16; as-built notes in §9) · **Tasks:** TASKS.md M5.1–M5.26 (+ job queue moved from M9.2) · **Depends on:** M2, M3, M4 · **Date:** 2026-11-01
 
 This phase takes a CSV file from an upload request to rows in `transaction_record` that reconciliation can trust. It is the largest phase because it is where most of the failure cases in projectoverview.md §6 live: duplicate uploads, crashes in the middle of a file, malformed rows, and retries.
 
@@ -1288,19 +1288,19 @@ Variants: crash right after a commit (row 300 exactly); crash in `finish` after 
 
 From TASKS.md: *both sample files can be uploaded and the normalized transactions inspected through the API, and every failure case in projectoverview.md §6 that relates to imports has a passing test.*
 
-- [ ] Entities for `import_batch`, `import_row_error`, `transaction_record` validate against the schema (`ddl-auto: validate`)
-- [ ] `FileStorage` on MinIO works locally (`docker compose up`) and in tests
-- [ ] Job queue: claim with `SKIP LOCKED`, per-org cap, lease, heartbeat, fencing, sweeper, backoff, graceful shutdown
-- [ ] `POST /imports` returns `202` + `Location`; batch, job and audit event created in one transaction
-- [ ] Duplicate file → `409` with `existingBatchId`, including under concurrency (§6 "same file uploaded twice")
-- [ ] Streaming parser, validator, normalizer, duplicate flagging, each with unit tests per rule
-- [ ] Chunked commits with checkpoint; crash and resume produce no duplicates (§6 "crashes halfway through an import")
-- [ ] Malformed rows → `COMPLETED_WITH_ERRORS`, valid rows persisted, every bad row reported (§6 "invalid rows")
-- [ ] Status transitions only through `ImportBatchStatus`/`transitionTo`; every transition audited
-- [ ] `GET /imports/{id}`, `/errors`, `GET /imports`, `GET /transactions`, `POST /imports/{id}/retry` implemented, paginated, authorized, cross-tenant tested
-- [ ] Partition maintenance job running; default partition empty
-- [ ] Demo: upload `docs/samples/ledger.csv` and `docs/samples/gateway.csv`, see both batches complete, search the records via `GET /transactions`
-- [ ] `api-design.md` and `reconciliation-rules.md` updated for anything this phase decided (CSV columns, error codes, slice pagination on `/transactions`)
+- [x] Entities for `import_batch`, `import_row_error`, `transaction_record` validate against the schema (`ddl-auto: validate`)
+- [x] `FileStorage` on MinIO works locally (`docker compose up`) and in tests
+- [x] Job queue: claim with `SKIP LOCKED`, per-org cap, lease, heartbeat, fencing, sweeper, backoff, graceful shutdown
+- [x] `POST /imports` returns `202` + `Location`; batch, job and audit event created in one transaction
+- [x] Duplicate file → `409` with `existingBatchId`, including under concurrency (§6 "same file uploaded twice")
+- [x] Streaming parser, validator, normalizer, duplicate flagging, each with unit tests per rule
+- [x] Chunked commits with checkpoint; crash and resume produce no duplicates (§6 "crashes halfway through an import")
+- [x] Malformed rows → `COMPLETED_WITH_ERRORS`, valid rows persisted, every bad row reported (§6 "invalid rows")
+- [x] Status transitions only through `ImportBatchStatus`/`transitionTo`; every transition audited
+- [x] `GET /imports/{id}`, `/errors`, `GET /imports`, `GET /transactions`, `POST /imports/{id}/retry` implemented, paginated, authorized, cross-tenant tested
+- [x] Partition maintenance job running; default partition empty
+- [x] Demo: upload `docs/samples/ledger.csv` and `docs/samples/gateway.csv`, see both batches complete, search the records via `GET /transactions`
+- [x] `api-design.md` and `reconciliation-rules.md` updated for anything this phase decided (CSV columns, error codes, slice pagination on `/transactions`)
 
 ---
 
@@ -1364,3 +1364,33 @@ Offset is simple and supports "jump to page N", but `OFFSET 100000` still reads 
 16. **Queries on `transaction_record` without a date range.** No partition pruning; every partition is scanned.
 17. **Trusting `Content-Type` or the original file name.** Both are client-controlled. Check content; never use the name in a path.
 18. **Returning entities from controllers.** Leaks internal fields and couples the API to the schema.
+
+---
+
+## 9. As built: where the code differs from this plan, and why
+
+docs/ win over this plan wherever they disagree (requirements.md §7, api-design.md, reconciliation-rules.md). Choices made while building M5:
+
+| Plan said | Built | Why |
+|---|---|---|
+| Gateway columns `gross_amount`, `settlement_status`, `payment_date`, `created_at`, `txn_type` | `merchant_reference`, `amount`, `currency`, `status`, `transaction_at` (required), `transaction_type` | requirements.md §7.3 |
+| Ledger requires `transaction_date` | Either `transaction_at` or `transaction_date` (header must have one; row must fill one; `transaction_at` wins) | requirements.md §7.2, rule N8 |
+| `400` `unsupported-file-type`, `no-data-rows`; `409 duplicate-import`; `DUPLICATE_IMPORT` | `415 unsupported-media-type`; header-only is `400 empty-file`; `409 duplicate-file`; kebab-case codes | requirements.md §7.4, api-design.md §3.1 |
+| Row codes `COLUMN_COUNT_MISMATCH`, `AMOUNT_TOO_MANY_DECIMALS` | `MALFORMED_ROW` (wrong field count or broken quoting), `AMOUNT_SCALE_EXCEEDED` | requirements.md §7.5 |
+| Amount `^\d{1,15}(\.\d{1,4})?$` | Optional sign accepted by the format check so `-5.00` is `AMOUNT_NOT_POSITIVE`; then scale, then range; first failure only | requirements.md §7.5 |
+| Every row invalid → `COMPLETED_WITH_ERRORS` | `FAILED`, `failure_reason = no-valid-rows` | requirements.md §7.5 |
+| Retry → `409 import-not-retryable`; reason optional | `409 invalid-transition` with `currentStatus`; reason required | api-design.md §3.1, §8.6 |
+| Upload response `{batchId, status}` | The full batch shape with `id` | api-design.md §1, §8.2 |
+| `dateFrom` / `dateTo` | `transactionDateFrom` / `transactionDateTo` | api-design.md §4 filter naming |
+| `IMPORT_RETRIED` audit action | `IMPORT_RETRY_REQUESTED` (the old constant kept, deprecated) | reconciliation-rules.md §7.1 |
+| `RECEIVED → FAILED` allowed | Kept, and added to reconciliation-rules.md §7.1 | A job can exhaust its attempts before processing starts |
+| `SourceType` in ingestion | In `ledger`'s public API | Records carry it and ledger may not depend on ingestion |
+| `ImportTestHook` throws a RuntimeException | The crash hook throws an `Error` | The queue handles exceptions (retry/fail); an Error escapes like a killed JVM, leaving the job RUNNING with its lease |
+| JVM clock for leases ("mutable test clock") | The database's `now()` for every lease, backoff and expiry | Nodes agree whatever their clock skew; tests expire leases with one `UPDATE` |
+| — | `server.tomcat.max-swallow-size: 100MB` | Found by `UploadSizeLimitIT`: without it a 60 MB upload got a connection reset, not `413` |
+| — | `spring.modulith.moments.enabled: false` | Modulith Moments carried its own `@EnableScheduling`, so API nodes were scheduling too |
+| — | Strict UTF-8 decoding one line at a time (`LineBoundedInputStream`) | With chunked decoding, the error named a row ~8 KB too early |
+| `expected.yaml` | `docs/samples/expected-imports.yaml`, checked by `ImportSamplesIT` | — |
+
+Not built, deliberately: a heap measurement with `-Xmx256m` (M9.6 benchmarks memory and throughput); a `503` for storage outages at upload (it is a `500` today; adding a code needs a catalogue row first).
+

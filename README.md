@@ -2,7 +2,7 @@
 
 A payment reconciliation and exception resolution platform. ReconFlow compares a business's internal payment ledger against payment gateway settlements, surfaces the discrepancies, and tracks how each one was investigated and resolved.
 
-> **Project status: tenancy, authentication and audit done (M3, M4).** On top of the M2 foundation: in-house JWT authentication (RS256 access tokens, rotating refresh tokens with reuse detection, lockout, rate limiting), per-request tenant resolution, PostgreSQL row-level security as a second isolation layer, a permission matrix, member and organization management, and an append-only, transactional audit log. No financial endpoints yet: ingestion starts in M5. See [Roadmap](#roadmap).
+> **Project status: transaction ingestion done (M5).** On top of M2–M4 (profiles, error model, in-house JWT authentication, tenant resolution with PostgreSQL row-level security, a permission matrix, an append-only audit log): CSV uploads to S3-compatible storage with duplicate-file detection, a PostgreSQL job queue (`FOR UPDATE SKIP LOCKED`, leases, heartbeats, fencing, per-tenant fairness), a streaming importer that validates and normalizes every row and commits in checkpointed chunks, crash-safe resume and explicit retry, partition maintenance, and APIs to follow imports and search the normalized transactions. Reconciliation starts in M6. See [Roadmap](#roadmap).
 
 ---
 
@@ -193,7 +193,7 @@ S3 API on `localhost:9000` and its console on `http://localhost:9001` (log in wi
 SPRING_PROFILES_ACTIVE=local,api,worker ./mvnw spring-boot:run
 ```
 
-Flyway applies `V1`–`V4` on first startup. Hibernate runs in `validate` mode, so a mismatch between
+Flyway applies `V1`–`V4` on first startup (M5 needed no schema change: V1 already had the ingestion tables). Hibernate runs in `validate` mode, so a mismatch between
 the entities and the schema fails the boot rather than silently altering it.
 
 | Profile | Kind | Effect |
@@ -202,7 +202,7 @@ the entities and the schema fails the boot rather than silently altering it.
 | `prod` | Environment | Secrets from environment variables only, JSON (ECS) logs |
 | `test` | Environment | Used by the tests (Testcontainers); lives in `src/test/resources` |
 | `api` | Role | Serves HTTP traffic |
-| `worker` | Role | Turns on the job worker (`reconflow.jobs.worker.enabled`) |
+| `worker` | Role | Turns on the job worker (`reconflow.jobs.worker.enabled`) and scheduled jobs (lease sweeper, partition maintenance at startup and 02:15 UTC, orphan-file sweeper) |
 
 There is deliberately no default profile. Locally one process runs both roles.
 
@@ -233,6 +233,27 @@ TOKEN=$(curl -s -c cookies.txt localhost:8080/api/v1/auth/login -H 'Content-Type
 curl -s localhost:8080/api/v1/members -H "Authorization: Bearer $TOKEN" | jq
 curl -s -b cookies.txt -X POST localhost:8080/api/v1/auth/refresh | jq      # rotates the refresh cookie
 ```
+
+### Import a file (local)
+
+Uploads are asynchronous: `202 Accepted` with the batch and a `Location` to poll; the worker (the
+`worker` role, on in this local setup) processes the file in the background.
+
+```bash
+TOKEN=$(curl -s localhost:8080/api/v1/auth/login -H 'Content-Type: application/json' \
+  -d '{"email":"uploader@acme.test","password":"reconflow-local-demo"}' | jq -r .accessToken)
+curl -s localhost:8080/api/v1/imports -H "Authorization: Bearer $TOKEN" \
+  -F file=@docs/samples/ledger-basic.csv --form-string sourceType=INTERNAL_LEDGER | jq
+curl -s localhost:8080/api/v1/imports -H "Authorization: Bearer $TOKEN" \
+  -F file=@docs/samples/gateway-basic.csv --form-string sourceType=GATEWAY | jq
+curl -s localhost:8080/api/v1/imports -H "Authorization: Bearer $TOKEN" | jq '.content[] | {fileName, status, totalRows, validRows, errorRows}'
+curl -s "localhost:8080/api/v1/transactions?transactionDateFrom=2026-10-01&transactionDateTo=2026-10-31&reference=pay-104" \
+  -H "Authorization: Bearer $TOKEN" | jq
+```
+
+Uploading the same file again is `409 duplicate-file` with `existingBatchId`; `ledger-malformed.csv`
+shows row errors at `GET /api/v1/imports/{id}/errors`. [docs/samples/README.md](docs/samples/README.md)
+says what every sample produces.
 
 Access tokens last 15 minutes; the refresh token is an `HttpOnly` cookie scoped to `/api/v1/auth`.
 Users never sign up: an org admin creates them with a temporary password (`POST /api/v1/members`),
@@ -265,7 +286,10 @@ Compose.
 ```
 
 Integration tests need Docker but no local database and no `.env`: they start
-`postgres:16.4-alpine`, share one container per run, and Flyway applies the migrations to it.
+`postgres:16.4-alpine` and MinIO (`pgsty/minio`, the compose image), share one set of containers
+per run, and Flyway applies the migrations. The job queue runs synchronously in tests
+(`JobRunner.runAllQueued`), with 100-row chunks so small files span several commits.
+`UploadSizeLimitIT` is the one IT that starts its own context (a real Tomcat port).
 Coverage reports land in `target/site/jacoco/` (unit) and `target/site/jacoco-it/` (integration).
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `./mvnw verify` on every pull
 request.
@@ -281,7 +305,7 @@ request.
 | M2 | Project foundation: profiles, error model, logging, CI | Done |
 | M3 | Organizations, users, authentication, tenant isolation | Done |
 | M4 | Append-only audit | Done |
-| M5 | Transaction ingestion: CSV upload, job queue, validation | Not started |
+| M5 | Transaction ingestion: CSV upload, job queue, validation | Done |
 | M6 | Reconciliation engine: matching, idempotent runs | Not started |
 | M7 | Exception management: workflow, optimistic locking | Not started |
 | M8 | Reporting and export | Not started |
@@ -298,6 +322,11 @@ request.
 | `POST /api/v1/auth/login`, `/refresh`, `/logout`, `/change-password` | Session lifecycle |
 | `GET/POST /api/v1/members`, `PATCH /api/v1/members/{userId}`, `POST …/reset-password`, `POST …/disable` | Member management (`MEMBER_MANAGE`) |
 | `GET/POST /api/v1/platform/organizations` | Organizations (platform admins only) |
+| `POST /api/v1/imports` | Upload a ledger or gateway CSV (multipart); `202` with the batch (`IMPORT_CREATE`) |
+| `GET /api/v1/imports`, `GET /api/v1/imports/{id}` | List imports; one import's status and counts, `Retry-After` while running (`IMPORT_READ`) |
+| `GET /api/v1/imports/{id}/errors` | Row errors with row, column, code and raw row, paginated (`IMPORT_READ`) |
+| `POST /api/v1/imports/{id}/retry` | Reprocess a `FAILED` import from scratch, with a reason (`IMPORT_CREATE`) |
+| `GET /api/v1/transactions` | Search normalized records by date range, source, reference, currency, batch; a slice (`TRANSACTION_READ`) |
 
 Permissions per endpoint: [api-design.md §8.1](docs/api-design.md#81-index) and §9.
 
@@ -305,9 +334,6 @@ Permissions per endpoint: [api-design.md §8.1](docs/api-design.md#81-index) and
 
 | Endpoint | Purpose |
 | -------- | ------- |
-| `POST /api/v1/imports` | Upload a transaction file |
-| `GET /api/v1/imports/{id}` | Import status and row-level errors |
-| `GET /api/v1/transactions` | Search and filter transaction records |
 | `POST /api/v1/reconciliation-runs` | Start a reconciliation run |
 | `GET /api/v1/reconciliation-runs/{id}` | Run results and status |
 | `GET /api/v1/exceptions` | List and filter exceptions |

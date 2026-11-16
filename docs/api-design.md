@@ -48,7 +48,7 @@ Every error is an RFC 9457 `ProblemDetail` with `Content-Type: application/probl
 - **`type`**: `https://reconflow.dev/problems/<code>`.
 - **`requestId`**: the same value as the `X-Request-Id` header, so a user can quote it and support can find the logs.
 
-Some errors add extension members (`existingBatchId`, `missingColumns`, `currentVersion`, `currentStatus`, `errors`).
+Some errors add extension members (`existingBatchId`, `missingColumns`, `duplicateColumns`, `currentVersion`, `currentStatus`, `errors`).
 
 ```http
 HTTP/1.1 409 Conflict
@@ -317,7 +317,9 @@ Retry-After: 2
 }
 ```
 
-**Errors:** `400 empty-file`, `400 missing-columns` (`missingColumns`), `400 duplicate-columns`, `400 invalid-encoding`, `409 duplicate-file` (`existingBatchId`), `413 file-too-large`, `415 unsupported-media-type`. On any of these, no batch, job, stored file or audit event is created.
+**Errors:** `400 empty-file`, `400 missing-columns` (`missingColumns`), `400 duplicate-columns` (`duplicateColumns`), `400 invalid-encoding`, `400 validation-failed` (missing or unknown `sourceType`), `409 duplicate-file` (`existingBatchId`), `413 file-too-large`, `415 unsupported-media-type` (also for a request that isn't `multipart/form-data`). On any of these, no batch, job, stored file or audit event is created.
+
+`413` is checked in code as well as by the container; Tomcat's `max-swallow-size` (100 MB) is set so a client sending up to twice the limit reads the `413` instead of seeing a connection reset.
 
 The original filename is stored for display only. It is user input, so it's never used in a storage key or a path.
 
@@ -375,11 +377,42 @@ Reprocess a `FAILED` batch from scratch, with an audited reason. The stored file
 
 **Request:** `{ "reason": "Storage outage during the first attempt" }` (required, non-blank).
 
-**Response `202 Accepted`:** the batch, now `RECEIVED`, with counters reset.
+**Response `202 Accepted`:** the batch, now `RECEIVED`, with counters reset, plus `Location` and `Retry-After: 2`. In the same transaction the batch's records and row errors are deleted and a new job is queued; the old job stays `FAILED` for history. The audit event `IMPORT_RETRY_REQUESTED` carries the reason and the previous failure reason.
 
 **Errors:** `400 validation-failed` (no reason), `404 not-found`, `409 invalid-transition` (the batch isn't `FAILED`; `currentStatus` in the body).
 
-### 8.7 Notes for later sections
+### 8.7 `GET /api/v1/transactions`
+
+Search the organization's normalized records (M5.19). Only records of accepted batches (`COMPLETED`, `COMPLETED_WITH_ERRORS`; rule P3) are returned.
+
+| Parameter | Required | Notes |
+|---|---|---|
+| `transactionDateFrom`, `transactionDateTo` | Yes | `YYYY-MM-DD`, inclusive, `to ≥ from`, at most 366 days: every query prunes to the months in range |
+| `sourceType` | No | `INTERNAL_LEDGER` or `GATEWAY` |
+| `reference` | No | Normalized with rules N1–N3 before comparing, so `pay 103` finds `PAY 103` (but not `PAY-103`, rule N4) |
+| `currency` | No | Case-insensitive |
+| `batchId` | No | Another organization's batch matches nothing |
+| `sort` | No | `transactionDate` (default, ascending), `amount`, `createdAt`; `id` breaks ties. Anything else is `400 validation-failed` |
+| `page`, `size` | No | As §4; `size` is clamped to 200 |
+
+**Response `200 OK`:** a slice (§4), so no total count:
+
+```json
+{
+  "content": [
+    { "id": "…", "batchId": "…", "sourceType": "GATEWAY", "sourceRowNumber": 3,
+      "rawReference": "PAY-104", "normalizedReference": "PAY-104",
+      "amount": "250.0000", "currency": "AED", "transactionType": "PAYMENT", "status": "SUCCESS",
+      "transactionDate": "2026-10-02", "transactionAt": "2026-10-02T05:00:00Z",
+      "duplicateInSource": true, "createdAt": "2026-11-16T09:02:12Z" }
+  ],
+  "page": { "number": 0, "size": 50, "hasNext": false }
+}
+```
+
+`raw_values` is not part of the list (it's the largest column). **Errors:** `400 validation-failed` (missing or reversed range, range over 366 days, unknown sort field, bad enum or UUID).
+
+### 8.8 Notes for later sections
 
 Decisions already made that the later endpoint sections must reflect:
 

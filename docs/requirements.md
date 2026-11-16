@@ -265,6 +265,19 @@ Amount checks run in the order of the table and stop at the first failure, so on
 | At least one valid row and at least one row error | `COMPLETED_WITH_ERRORS` |
 | Every row invalid, or the file couldn't be read to the end for a reason other than an unterminated quote (invalid encoding, too many rows, file missing from storage, retries exhausted) | `FAILED`, with `failure_reason` |
 
+`failure_reason` is a short code users see, never a stack trace (as built in M5):
+
+| `failure_reason` | Meaning |
+|---|---|
+| `no-valid-rows` | Every row had at least one row error (they are all listed at `/imports/{id}/errors`) |
+| `invalid-encoding at row N` | Invalid UTF-8 in data row N (the header is checked at upload) |
+| `too-many-rows` | More than 500,000 data rows; rows already committed stay until a retry deletes them, and are never visible (rule P3) |
+| `file-missing` | The stored original is gone from object storage |
+| `retries-exhausted` | Every attempt failed transiently (storage or database unavailable) |
+| `internal-error` | A bug; details are in the job's `last_error` for operators. Retry once fixed |
+
+**Raw rows.** `import_row_error.raw_row` is the row's values re-serialized as CSV (the parser doesn't keep the original bytes); for an unterminated quote it is the physical line where the quote opens.
+
 ---
 
 ## 8. Glossary

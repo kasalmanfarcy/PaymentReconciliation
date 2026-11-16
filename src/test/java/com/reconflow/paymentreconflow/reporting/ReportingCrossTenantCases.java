@@ -48,6 +48,14 @@ class ReportingCrossTenantCases implements CrossTenantCases {
                         "/api/v1/reports/import-quality?from=2026-01-01&to=2026-12-31",
                         f -> Map.of(),
                         null,
+                        LIST_EXCLUDES_B),
+                // Org B's open case is assigned to its investigator: a leak would show that user's id.
+                new CrossTenantCase(
+                        "exception ageing",
+                        HttpMethod.GET,
+                        "/api/v1/reports/exception-ageing",
+                        f -> Map.of(),
+                        null,
                         LIST_EXCLUDES_B));
     }
 }

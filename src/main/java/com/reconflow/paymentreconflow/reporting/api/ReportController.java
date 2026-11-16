@@ -1,5 +1,7 @@
 package com.reconflow.paymentreconflow.reporting.api;
 
+import com.reconflow.paymentreconflow.reporting.ageing.ExceptionAgeingReport;
+import com.reconflow.paymentreconflow.reporting.ageing.ExceptionAgeingReports;
 import com.reconflow.paymentreconflow.reporting.importquality.ImportQualityReport;
 import com.reconflow.paymentreconflow.reporting.importquality.ImportQualityReports;
 import com.reconflow.paymentreconflow.reporting.reconciliation.ReconciliationReport;
@@ -8,6 +10,7 @@ import com.reconflow.paymentreconflow.shared.context.Permission;
 import com.reconflow.paymentreconflow.shared.context.RequiresBothPermissions;
 import com.reconflow.paymentreconflow.shared.context.RequiresPermission;
 import java.time.LocalDate;
+import java.util.List;
 import java.util.UUID;
 import org.jspecify.annotations.Nullable;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -25,10 +28,13 @@ class ReportController {
 
     private final ReconciliationReports reconciliation;
     private final ImportQualityReports importQuality;
+    private final ExceptionAgeingReports ageing;
 
-    ReportController(ReconciliationReports reconciliation, ImportQualityReports importQuality) {
+    ReportController(
+            ReconciliationReports reconciliation, ImportQualityReports importQuality, ExceptionAgeingReports ageing) {
         this.reconciliation = reconciliation;
         this.importQuality = importQuality;
+        this.ageing = ageing;
     }
 
     /**
@@ -58,5 +64,18 @@ class ReportController {
             @RequestParam(required = false) @Nullable String granularity,
             @RequestParam(required = false) @Nullable String sourceType) {
         return importQuality.report(batchId, from, to, granularity, sourceType);
+    }
+
+    /**
+     * Open and in-review cases by age bucket and assignee. Filters: {@code type} (repeatable),
+     * {@code assignedTo} (a user id, {@code me} or {@code unassigned}), {@code currency}.
+     */
+    @GetMapping("/exception-ageing")
+    @RequiresPermission(Permission.REPORT_READ)
+    ExceptionAgeingReport exceptionAgeing(
+            @RequestParam(required = false) @Nullable List<String> type,
+            @RequestParam(required = false) @Nullable String assignedTo,
+            @RequestParam(required = false) @Nullable String currency) {
+        return ageing.report(type, assignedTo, currency);
     }
 }

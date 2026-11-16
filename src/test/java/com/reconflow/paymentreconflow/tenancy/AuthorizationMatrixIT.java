@@ -167,6 +167,10 @@ class AuthorizationMatrixIT extends AbstractIntegrationTest {
                 "GET /reports/import-quality",
                 Permission.REPORT_READ,
                 target -> get("/api/v1/reports/import-quality?batchId=" + target.batchId())),
+        new Endpoint(
+                "GET /reports/exception-ageing",
+                Permission.REPORT_READ,
+                target -> get("/api/v1/reports/exception-ageing")),
     };
 
     static Stream<Arguments> endpointByRole() {

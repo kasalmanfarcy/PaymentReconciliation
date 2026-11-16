@@ -10,8 +10,6 @@ import org.junit.jupiter.api.Test;
 /**
  * Architecture rules Spring Modulith cannot express. ArchUnit comes in with spring-modulith-core.
  *
- * <p>{@code allowEmptyShould(true)}: the packages are still empty in M2, and ArchUnit otherwise
- * fails a rule that matched no classes. Remove it once the modules have code.
  */
 class ArchitectureRulesTest {
 
@@ -39,7 +37,6 @@ class ArchitectureRulesTest {
                         ROOT + ".exceptions..",
                         ROOT + ".reporting..",
                         ROOT + ".audit..")
-                .allowEmptyShould(true)
                 .check(classes);
     }
 
@@ -53,7 +50,6 @@ class ArchitectureRulesTest {
                 .should()
                 .dependOnClassesThat()
                 .resideInAnyPackage(ROOT + ".security.auth..", ROOT + ".security.token..")
-                .allowEmptyShould(true)
                 .check(classes);
     }
 

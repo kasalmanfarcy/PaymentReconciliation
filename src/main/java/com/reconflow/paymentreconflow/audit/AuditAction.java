@@ -26,7 +26,12 @@ public enum AuditAction {
     IMPORT_RECEIVED,
     IMPORT_COMPLETED,
     IMPORT_FAILED,
+    /**
+     * Deprecated, never written: reconciliation-rules.md §7.1 names the event
+     * {@link #IMPORT_RETRY_REQUESTED}. Kept because constants are never removed.
+     */
     IMPORT_RETRIED,
+    IMPORT_RETRY_REQUESTED,
     // M6: reconciliation
     RUN_STARTED,
     RUN_COMPLETED,

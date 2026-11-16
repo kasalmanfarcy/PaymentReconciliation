@@ -143,13 +143,79 @@ The M6.19 property test checks this with random record sets, and [samples/README
 
 ## 5. Exception types and reason codes
 
-_Added in M1.6._
+### 5.1 Exception types
+
+The closed list. It is exactly the `exception_case.type` CHECK constraint in V1; adding a type means a migration and a change here.
+
+| Type | Raised when | Records linked | `amount` | `amount_difference` |
+|---|---|---|---|---|
+| `MISSING_IN_GATEWAY` | A ledger record with no gateway counterpart (O5) | 1 ledger | Ledger amount | NULL |
+| `MISSING_IN_LEDGER` | A gateway record with no ledger counterpart (O5) | 1 gateway | Gateway amount | NULL |
+| `AMOUNT_MISMATCH` | One record each side, amounts differ (O3) | 1 + 1 | Ledger amount | gateway − ledger |
+| `CURRENCY_MISMATCH` | Same reference and type, different currencies (O2) | 1 + 1 | Ledger amount | NULL |
+| `DUPLICATE_IN_SOURCE` | More than one record for the group on either side, or a D1 flag (O1) | Every record in the group | Smallest ledger amount; if no ledger record, smallest gateway amount | NULL |
+
+`amount` is "the amount at stake": the ledger's figure when there is one, because the ledger is the business's own record of what it expected. It drives amount filters and totals. For a duplicate it is a representative value for filtering, **not** a total of the linked records. (`exception_case.amount` is added by the M6 migration; V1 has only `amount_difference`.)
+
+`amount_difference` sign convention: **gateway − ledger**. Negative means the gateway paid less than the ledger expected. PAY-103: `700.00 − 750.00 = −50.00`.
+
+`exception_case.currency` is the currency of the run that created the case.
+
+### 5.2 Reason codes
+
+`reason_code` is an optional sub-classification set by the engine when it knows more than the type says. It is `NULL` otherwise. There is no CHECK constraint on it; the engine is the only writer.
+
+| Reason code | Used with | Set when |
+|---|---|---|
+| `COUNTERPART_NOT_SUCCESS` | `MISSING_IN_GATEWAY`, `MISSING_IN_LEDGER` | The other source has a record with the same reference and type in the run's period, but its status isn't `SUCCESS` (it was excluded by P4). E.g. the gateway declined a payment the ledger recorded as paid |
+| `SAME_AMOUNT` | `DUPLICATE_IN_SOURCE` | Every record in the group has the same amount. Suggests a repeated export row or a double booking |
+| `DIFFERENT_AMOUNTS` | `DUPLICATE_IN_SOURCE` | The group's records have at least two different amounts. Suggests partial captures, split settlements, or two different payments sharing a reference |
+
+### 5.3 Resolution codes
+
+A resolution code is required to resolve a case and is validated against this list. Some codes also require a note, because the code alone doesn't explain enough for an auditor. The list lives in one Java enum (`ResolutionCode`, M7.1) with a `noteRequired` flag. `exception_case.resolution_code` has no CHECK constraint in v1, so adding a code is a code change and a change to this table; a CHECK could be added later as defense in depth, at the cost of a migration per new code.
+
+| Code | Meaning | Note required? |
+|---|---|---|
+| `TIMING_DIFFERENCE` | The counterpart arrives in a later period (or was outside this run's period) | No |
+| `GATEWAY_FEE` | The difference is a fee deducted by the gateway | No |
+| `DATA_ENTRY_ERROR` | A source record was wrong and has been corrected upstream | Yes |
+| `DUPLICATE_CONFIRMED` | A genuine double charge, refunded or being refunded | Yes |
+| `DUPLICATE_FILE_ARTIFACT` | The duplicate was caused by the provider's export, not a real double charge | No |
+| `WRITTEN_OFF` | An accepted, approved loss | Yes |
+| `FALSE_POSITIVE` | Not a real discrepancy | Yes |
+| `OTHER` | Anything else | Yes |
+
+Who may resolve: anyone with `EXCEPTION_RESOLVE` (investigators and org admins). The resolver doesn't have to be the assignee in v1; "only the assignee or an admin may resolve" is a possible later rule.
 
 ---
 
 ## 6. Discrepancy identity (`discrepancy_key`)
 
-_Added in M1.6._
+Every case carries a deterministic key that identifies the **discrepancy**, not the run that found it:
+
+```
+<TYPE>:<normalized_reference>:<transaction_type>:<sorted currencies joined by '/'>
+
+AMOUNT_MISMATCH:PAY-103:PAYMENT:AED
+CURRENCY_MISMATCH:PAY-201:PAYMENT:AED/USD
+DUPLICATE_IN_SOURCE:PAY-104:PAYMENT:AED
+```
+
+| ID | Rule | Why |
+|---|---|---|
+| K1 | The key is built from the type, the group's normalized reference and transaction type, and the **sorted set** of currencies in the group | The transaction type is in it because a `PAYMENT` and a `REFUND` with the same reference are different groups and can be different discrepancies |
+| K2 | The key contains **no run ID and no period** | Re-running reconciliation, or running an overlapping period ("1–31 Jan" then "15 Jan–15 Feb"), computes the same key for the same problem. Because the currency part is the sorted set, the AED run and the USD run both compute `…:AED/USD` for one currency mismatch |
+| K3 | At most one **active** (`OPEN` or `IN_REVIEW`) case per `(organization_id, discrepancy_key)`. A run that finds an active case with its key doesn't create another; it links the case to itself (`exception_case_run`, added in M6) and links any records not yet linked | Enforced by the partial unique index `exception_case_active_uk … WHERE status <> 'RESOLVED'`, so even two concurrent runs can't both insert one |
+| K4 | If the only case with the key is `RESOLVED`, a run that sees the discrepancy again creates a **new `OPEN` case**. The old case and its resolution stay untouched | A resolution says "we dealt with what we saw then". The discrepancy still being there in a new run means someone should look again |
+
+**Parsing.** A reference may itself contain `:`. The key is still unambiguous: the type, the transaction type and the currency set never contain `:`, so read the first field from the left and the last two from the right. Nothing is escaped.
+
+**When the outcome changes between runs.** Suppose PAY-103 later matches, because the gateway sent a corrected record. The open `AMOUNT_MISMATCH:PAY-103:PAYMENT:AED` case is **not** auto-resolved in v1. The run report lists "open cases whose discrepancy no longer reproduces" (active cases with no link to the latest run that covered their records), and an investigator resolves them, typically with `DATA_ENTRY_ERROR`. Auto-resolution is a v2 candidate: it's convenient, but a system that closes financial exceptions on its own needs its own audit and approval rules.
+
+The same applies when the type changes: if a missing record's counterpart arrives, the old `MISSING_IN_GATEWAY:…` case stays open and the new run raises whatever the group now is (a match, or a new `AMOUNT_MISMATCH:…` with a different key).
+
+If K4 proves noisy (a written-off item re-raised by every overlapping run), the v2 fix is to suppress re-raising when the latest resolution is terminal, such as `WRITTEN_OFF`. Not built in v1.
 
 ---
 

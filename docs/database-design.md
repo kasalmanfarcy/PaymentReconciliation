@@ -195,7 +195,7 @@ erDiagram
     }
 ```
 
-`exception_case_run` (every run that observed a case) is added by the M6 migration and isn't in V1, so it's not drawn here.
+`exception_case_run` (every run that observed a case) is added by the M6 migration (`V5`) and isn't in V1, so it's not drawn here.
 
 ---
 
@@ -260,7 +260,7 @@ Only the October partition is touched (pruning), the match index serves both sha
 
 ### 3.4 Reconciliation
 
-**`reconciliation_run`** (owner: `reconciliation`). One execution of the rules. `idempotency_key` with `UNIQUE (organization_id, idempotency_key)` (§4); `period_start`, `period_end` (inclusive) with `CHECK (period_end >= period_start)`; `left_source`, `right_source` (defaults ledger and gateway) with `CHECK (left_source <> right_source)`; one `currency` ([ADR 0009](adr/0009-run-pinned-to-one-currency.md)); `status` CHECK `PENDING | RUNNING | COMPLETED | FAILED`; `last_completed_date` is the resume checkpoint, since runs commit one day at a time. Summary columns are computed once at completion: `matched_count/amount`, `mismatch_count`, `mismatch_net_difference`, `unmatched_left_count/amount`, `unmatched_right_count/amount`, `duplicate_count`. Counts are **cases**, not records. The M6 migration adds `currency_mismatch_count` and `request_fingerprint` (to detect an `Idempotency-Key` reused with a different body). Index `reconciliation_run_list_idx (organization_id, created_at DESC)`.
+**`reconciliation_run`** (owner: `reconciliation`). One execution of the rules. `idempotency_key` with `UNIQUE (organization_id, idempotency_key)` (§4); `period_start`, `period_end` (inclusive) with `CHECK (period_end >= period_start)`; `left_source`, `right_source` (defaults ledger and gateway) with `CHECK (left_source <> right_source)`; one `currency` ([ADR 0009](adr/0009-run-pinned-to-one-currency.md)); `status` CHECK `PENDING | RUNNING | COMPLETED | FAILED`; `last_completed_date` is the resume checkpoint, since runs commit one day at a time. Summary columns are computed once at completion: `matched_count/amount`, `mismatch_count`, `mismatch_net_difference`, `unmatched_left_count/amount`, `unmatched_right_count/amount`, `duplicate_count`. Counts are **cases**, not records. The M6 migration (`V5__reconciliation_engine.sql`) adds `currency_mismatch_count`, `excluded_count` (records failing rule P4 or P5, so the invariant can be checked from the run alone) and `request_fingerprint` (to detect an `Idempotency-Key` reused with a different body). Indexes: `reconciliation_run_list_idx (organization_id, created_at DESC)`; V5's partial unique `reconciliation_run_active_scope_uk (organization_id, currency, left_source, right_source, period_start, period_end) WHERE status IN ('PENDING', 'RUNNING')`, at most one active run per scope. The checkpoint `last_completed_date` and the summary are written by SQL in the chunk and completing transactions (never through a stale entity), each setting `updated_at = now()` itself.
 
 **`reconciliation_match`** (owner: `reconciliation`). One row per matched pair. Foreign keys to a partitioned table must reference its **full** primary key, so each record id travels with its date: `(ledger_record_id, ledger_txn_date)` and `(gateway_record_id, gateway_txn_date)` both reference `transaction_record (id, transaction_date)`. That also lets every join prune to one partition. `match_type` CHECK `EXACT` only in v1; `amount_difference` is always 0 for `EXACT` and exists for fee-aware matching in v2. Indexes on both record ids, for "is this record matched?".
 
@@ -277,7 +277,9 @@ Only the October partition is touched (pruning), the match index serves both sha
 
 **`exception_case_record`** (owner: `exceptions`). Links a case to every record involved. A link table rather than two FK columns, because a duplicate case can involve three or more records. `PRIMARY KEY (exception_id, transaction_record_id)`; FK `(transaction_record_id, transaction_date)` to the partitioned table.
 
-**`exception_case_run`** (owner: `exceptions`, added in M6). Every run that observed a case, whether it created it or found it already active, with a `created` flag. It answers "which cases did this run see?", which `exception_case.run_id` can't once a second run re-observes a case.
+**`exception_case_run`** (owner: `exceptions`, added in M6). Every run that observed a case, whether it created it or found it already active, with a `created` flag. It answers "which cases did this run see?", which `exception_case.run_id` can't once a second run re-observes a case. `PRIMARY KEY (run_id, exception_id)`, index `exception_case_run_exception_idx (exception_id)`, RLS like every tenant-owned table (in V5). The run summary's exception counts are computed from it.
+
+**`uuid_generate_v7()`** (V5). A SQL function producing UUIDv7 with the same layout as the Java generator (millisecond timestamp in the first 48 bits, version nibble 7), so set-based `INSERT … SELECT` can generate ids inside the database; `ReconciliationRunRepositoryIT` checks the version and timestamp.
 
 **`exception_note`** (owner: `exceptions`). Investigation notes, append-only by convention (no update or delete paths; M7.2 may add a trigger). `CHECK (length(btrim(body)) > 0)` rejects blank notes in the database too.
 
@@ -296,6 +298,7 @@ The interview-relevant part: each constraint below exists because of a specific 
 | `import_row_error UNIQUE NULLS NOT DISTINCT (batch_id, row_number, column_name, error_code)` | A retried batch reporting the same error twice. `NULLS NOT DISTINCT` (PostgreSQL 15+) makes two whole-row errors (NULL column) collide, which plain `UNIQUE` wouldn't | M5.25 |
 | `reconciliation_run UNIQUE (organization_id, idempotency_key)` | Two runs for one request, even when both requests arrive at once | M6.3, [ADR 0006](adr/0006-reconciliation-run-idempotency.md) |
 | `reconciliation_match UNIQUE (run_id, ledger_record_id)` and `UNIQUE (run_id, gateway_record_id)` | A record matched twice in one run | M6.3 |
+| `reconciliation_run_active_scope_uk UNIQUE (organization_id, currency, left_source, right_source, period_start, period_end) WHERE status IN ('PENDING', 'RUNNING')` (V5) | Two active runs over the same scope, even when two requests with different keys race | M6.11 |
 | `exception_case_active_uk UNIQUE (organization_id, discrepancy_key) WHERE status <> 'RESOLVED'` | Two active cases for one discrepancy, even under concurrent runs. Resolved cases are outside the index, so history can hold many | M7.3 |
 | `exception_case CHECK ((status = 'RESOLVED') = (resolution_code, resolved_by, resolved_at all set))` | A resolved case without a resolution, or a stale resolution left on a reopened case | M7.4 |
 | `exception_case.version` | Lost updates (read by `@Version`, exposed as `ETag`) | M7.8, [ADR 0007](adr/0007-optimistic-locking-on-exceptions.md) |
@@ -351,7 +354,7 @@ The interview-relevant part: each constraint below exists because of a specific 
 
 - **Flyway owns the schema.** Migrations live in `src/main/resources/db/migration` as `V<n>__<description>.sql`.
 - **Applied migrations are never edited.** Flyway stores a checksum of each applied script and refuses to start if one changes. V3 is the worked example: it fixes two problems found in V2 after V2 was applied, instead of editing V2.
-- **New changes take the next free version number**, and each phase's plan says which migration adds what (for example, the M6 migration adds `exception_case_run`, `exception_case.amount`, `reconciliation_run.currency_mismatch_count`, `request_fingerprint`, `transaction_record_reference_idx` and a `uuid_generate_v7()` function; M3.5 adds RLS policies; M8 adds `reconciliation_run_day`).
+- **New changes take the next free version number**, and each phase's plan says which migration adds what (for example, the M6 migration, `V5__reconciliation_engine.sql`, adds `exception_case_run`, `exception_case.amount`, `reconciliation_run.currency_mismatch_count`, `excluded_count`, `request_fingerprint`, `reconciliation_run_active_scope_uk`, `transaction_record_reference_idx` and a `uuid_generate_v7()` function; M3.5 adds RLS policies; M8 adds `reconciliation_run_day`).
 - **Every migration has a header comment** saying what it does, why, and whether it needs a backfill. From M11.5, each also carries a rollback note: how to undo it by hand, since Flyway Community has no automatic undo.
 - **Additive by default.** New columns are nullable or have defaults unless the table is known to be empty (V2 relied on `refresh_token` being empty to add a `NOT NULL` column without a backfill, and says so).
 - **Repeatable `R__` scripts** only for seed data in the `local` profile; never for schema.

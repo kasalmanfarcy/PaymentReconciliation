@@ -2,7 +2,7 @@
 
 A payment reconciliation and exception resolution platform. ReconFlow compares a business's internal payment ledger against payment gateway settlements, surfaces the discrepancies, and tracks how each one was investigated and resolved.
 
-> **Project status: transaction ingestion done (M5).** On top of M2–M4 (profiles, error model, in-house JWT authentication, tenant resolution with PostgreSQL row-level security, a permission matrix, an append-only audit log): CSV uploads to S3-compatible storage with duplicate-file detection, a PostgreSQL job queue (`FOR UPDATE SKIP LOCKED`, leases, heartbeats, fencing, per-tenant fairness), a streaming importer that validates and normalizes every row and commits in checkpointed chunks, crash-safe resume and explicit retry, partition maintenance, and APIs to follow imports and search the normalized transactions. Reconciliation starts in M6. See [Roadmap](#roadmap).
+> **Project status: reconciliation engine done (M6).** On top of M2–M5 (profiles, error model, in-house JWT authentication, tenant resolution with PostgreSQL row-level security, a permission matrix, an append-only audit log, CSV ingestion through a PostgreSQL job queue with leases and fencing): a set-based matching engine in SQL that processes a run one anchor day per transaction with a resumable checkpoint, idempotent run requests (`Idempotency-Key` or a derived key, races settled by unique constraints), one active run per scope enforced by the database, exact matches and the five exception types created through the exceptions module in the same transaction, deduplicated across runs by a deterministic discrepancy key, retry of failed runs from their checkpoint, and APIs to request, follow and inspect runs. Exception workflow starts in M7. See [Roadmap](#roadmap).
 
 ---
 
@@ -193,7 +193,7 @@ S3 API on `localhost:9000` and its console on `http://localhost:9001` (log in wi
 SPRING_PROFILES_ACTIVE=local,api,worker ./mvnw spring-boot:run
 ```
 
-Flyway applies `V1`–`V4` on first startup (M5 needed no schema change: V1 already had the ingestion tables). Hibernate runs in `validate` mode, so a mismatch between
+Flyway applies `V1`–`V5` on first startup (`V5` is M6's engine support: summary columns, `exception_case_run`, `uuid_generate_v7()`, the reference index and the one-active-run-per-scope index). Hibernate runs in `validate` mode, so a mismatch between
 the entities and the schema fails the boot rather than silently altering it.
 
 | Profile | Kind | Effect |
@@ -255,6 +255,25 @@ Uploading the same file again is `409 duplicate-file` with `existingBatchId`; `l
 shows row errors at `GET /api/v1/imports/{id}/errors`. [docs/samples/README.md](docs/samples/README.md)
 says what every sample produces.
 
+### Reconcile (local)
+
+With both basic files imported, start a run as a user with `RUN_CREATE` (an investigator, uploader
+or org admin). It is asynchronous too: `202 Accepted`, then poll until `COMPLETED`.
+
+```bash
+TOKEN=$(curl -s localhost:8080/api/v1/auth/login -H 'Content-Type: application/json' \
+  -d '{"email":"investigator@acme.test","password":"reconflow-local-demo"}' | jq -r .accessToken)
+RUN=$(curl -s localhost:8080/api/v1/reconciliation-runs -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: demo-oct-1' \
+  -d '{"periodStart":"2026-10-01","periodEnd":"2026-10-02","currency":"AED"}' | jq -r .id)
+curl -s localhost:8080/api/v1/reconciliation-runs/$RUN -H "Authorization: Bearer $TOKEN" | jq '{status, summary}'
+curl -s localhost:8080/api/v1/reconciliation-runs/$RUN/matches -H "Authorization: Bearer $TOKEN" | jq '.content[] | {ledger: .ledger.reference, gateway: .gateway.reference}'
+```
+
+Repeating the same request returns the same run (`200`); a fresh `Idempotency-Key` re-runs the period
+without duplicating active exception cases. The expected summary is in
+[docs/samples/README.md §1](docs/samples/README.md#1-ledger-basiccsv--gateway-basiccsv).
+
 Access tokens last 15 minutes; the refresh token is an `HttpOnly` cookie scoped to `/api/v1/auth`.
 Users never sign up: an org admin creates them with a temporary password (`POST /api/v1/members`),
 which must be changed at first login. Design: [authentication.plan](plans/authentication.plan),
@@ -306,7 +325,7 @@ request.
 | M3 | Organizations, users, authentication, tenant isolation | Done |
 | M4 | Append-only audit | Done |
 | M5 | Transaction ingestion: CSV upload, job queue, validation | Done |
-| M6 | Reconciliation engine: matching, idempotent runs | Not started |
+| M6 | Reconciliation engine: matching, idempotent runs | Done |
 | M7 | Exception management: workflow, optimistic locking | Not started |
 | M8 | Reporting and export | Not started |
 | M9 | Reliability and performance | Not started |
@@ -327,6 +346,10 @@ request.
 | `GET /api/v1/imports/{id}/errors` | Row errors with row, column, code and raw row, paginated (`IMPORT_READ`) |
 | `POST /api/v1/imports/{id}/retry` | Reprocess a `FAILED` import from scratch, with a reason (`IMPORT_CREATE`) |
 | `GET /api/v1/transactions` | Search normalized records by date range, source, reference, currency, batch; a slice (`TRANSACTION_READ`) |
+| `POST /api/v1/reconciliation-runs` | Request a run for a period, currency and sources; `202` new, `200` repeat, `Idempotency-Key` optional (`RUN_CREATE`) |
+| `GET /api/v1/reconciliation-runs`, `GET /api/v1/reconciliation-runs/{id}` | List runs; one run's status, progress and summary (`RUN_READ`) |
+| `GET /api/v1/reconciliation-runs/{id}/matches` | A run's matches, both records side by side, paginated (`RUN_READ`) |
+| `POST /api/v1/reconciliation-runs/{id}/retry` | Resume a `FAILED` run from its checkpoint, with a reason (`RUN_CREATE`) |
 
 Permissions per endpoint: [api-design.md §8.1](docs/api-design.md#81-index) and §9.
 
@@ -334,8 +357,6 @@ Permissions per endpoint: [api-design.md §8.1](docs/api-design.md#81-index) and
 
 | Endpoint | Purpose |
 | -------- | ------- |
-| `POST /api/v1/reconciliation-runs` | Start a reconciliation run |
-| `GET /api/v1/reconciliation-runs/{id}` | Run results and status |
 | `GET /api/v1/exceptions` | List and filter exceptions |
 | `GET /api/v1/exceptions/{id}` | Exception detail with both source records |
 | `PATCH /api/v1/exceptions/{id}` | Assign or update an exception |

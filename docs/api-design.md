@@ -248,11 +248,11 @@ Permissions are from [authentication.plan §5](../plans/authentication.plan), pl
 | `GET /imports/{id}/errors` | `IMPORT_READ` | 200 page | 404 | M5.17 |
 | `POST /imports/{id}/retry` | `IMPORT_CREATE` | 202 | 404, 409 `invalid-transition` | M5.20 |
 | `GET /transactions` | `TRANSACTION_READ` | 200 slice | 400 | M5.19 |
-| `POST /reconciliation-runs` | `RUN_CREATE` | 202 / 200 | 400, 409 `import-in-progress`, 422 | M6.14 |
+| `POST /reconciliation-runs` | `RUN_CREATE` | 202 / 200 | 400, 409 `import-in-progress` / `run-in-progress`, 422 | M6.14 |
 | `GET /reconciliation-runs` | `RUN_READ` | 200 page | 400 | M6.17 |
 | `GET /reconciliation-runs/{id}` | `RUN_READ` | 200 | 404 | M6.15 |
 | `GET /reconciliation-runs/{id}/matches` | `RUN_READ` | 200 page | 404 | M6.16 |
-| `POST /reconciliation-runs/{id}/retry` | `RUN_CREATE` | 202 | 404, 409 `invalid-transition` | M6.12 |
+| `POST /reconciliation-runs/{id}/retry` | `RUN_CREATE` | 202 | 400, 404, 409 `invalid-transition` / `run-in-progress` | M6.12 |
 | `GET /exceptions` | `EXCEPTION_READ` | 200 page | 400 | M7.6 |
 | `GET /exceptions/{id}` | `EXCEPTION_READ` | 200 + `ETag` | 404 | M7.7 |
 | `PATCH /exceptions/{id}` | `EXCEPTION_UPDATE` | 200 + `ETag` | 400, 404, 409, 422 `invalid-assignee`, 428 | M7.8 |
@@ -265,7 +265,7 @@ Permissions are from [authentication.plan §5](../plans/authentication.plan), pl
 | `GET /reports/exception-ageing` | `REPORT_READ` | 200 | 400 | M8.3 |
 | `GET /reports/exceptions/export?runId=` | `REPORT_READ` + `EXCEPTION_READ` | 200 `text/csv` | 404 | M8.4 |
 
-All paths are under `/api/v1`. The detailed reference below starts with the import endpoints; each later milestone adds its section here as its endpoints land, so this document grows with the API.
+All paths are under `/api/v1`. The detailed reference below covers the import (M5) and reconciliation-run (M6) endpoints; each later milestone adds its section here as its endpoints land, so this document grows with the API.
 
 ### 8.2 `POST /api/v1/imports`
 

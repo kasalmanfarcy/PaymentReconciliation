@@ -64,7 +64,7 @@ The engine works on **groups**: all records that share `(normalized_reference, t
 | P5 | Its **group** contains at least one record (passing P1–P4 and P6) in the run's currency | A run is pinned to one currency ([ADR 0009](adr/0009-run-pinned-to-one-currency.md)). Records in other currencies take part only as the other half of a currency mismatch |
 | P6 | `transaction_date` is within `[period_start, period_end]` | The run's period |
 
-A record that fails P4 or P5 but passes P1–P3 and P6 is **excluded**: counted in the run report, never silently dropped. A record outside the period or in another organization simply isn't part of the run at all.
+A record that fails P4 or P5 but passes P1–P3 and P6 is **excluded**: counted in the run report (`reconciliation_run.excluded_count`, the summary's `excluded`), never silently dropped. A record outside the period or in another organization simply isn't part of the run at all.
 
 P5 is evaluated on the group, not on each record, so that a ledger record in AED and a gateway record in USD with the same reference end up in the same group. Filtering records by currency first would split them into an AED-only and a USD-only group, and the run would report two misleading "missing" cases instead of one currency mismatch.
 
@@ -271,6 +271,7 @@ stateDiagram-v2
     RUNNING --> RUNNING : lease expired, resumed
     RUNNING --> COMPLETED : last day done
     RUNNING --> FAILED : permanent error or attempts exhausted
+    PENDING --> FAILED : attempts exhausted before start
     FAILED --> PENDING : retry (reason)
     COMPLETED --> [*]
 ```
@@ -282,7 +283,12 @@ stateDiagram-v2
 | `RUNNING` | `RUNNING` | System: job re-delivered after a crash or expired lease; resumes after `last_completed_date` | No | — (not a transition) |
 | `RUNNING` | `COMPLETED` | System: the last day of the period is done | No | `RUN_COMPLETED` (payload: summary) |
 | `RUNNING` | `FAILED` | System: a non-retryable error, or the job runner gave up after `max_attempts` | `failure_reason` | `RUN_FAILED` |
+| `PENDING` | `FAILED` | System: the job ran out of attempts before the run ever started (every claim failed transiently); the same reason imports have `RECEIVED → FAILED` | `failure_reason` | `RUN_FAILED` |
 | `FAILED` | `PENDING` | `RUN_CREATE` (`POST /reconciliation-runs/{id}/retry`) | Yes | `RUN_RETRY_REQUESTED` |
+
+**One active run per scope.** At most one run per organization, period, sources and currency can be `PENDING` or `RUNNING` at a time, enforced by the partial unique index `reconciliation_run_active_scope_uk` (M6). A request or a retry that would make a second one active gets `409 run-in-progress` with `existingRunId`. Runs over *overlapping* scopes may run at once: they are safe by construction (K3, and cases are inserted in key order).
+
+**Waiting for imports.** A run isn't requested (`409 import-in-progress`) while an import of the organization is `RECEIVED` or `PROCESSING`, and a `PENDING` run's job doesn't start while one is: it is deferred a minute without spending an attempt.
 
 `COMPLETED` is terminal. To reconcile the same period again (say, after a late gateway file), the client starts a new run with a fresh `Idempotency-Key` ([ADR 0006](adr/0006-reconciliation-run-idempotency.md)). A retried run keeps `last_completed_date` and skips the days it had already committed, so it never duplicates their matches. There is no `CANCELLED` state in v1: every state needs tests, permissions and audit, so it gets added when a user needs it.
 

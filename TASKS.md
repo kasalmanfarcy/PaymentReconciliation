@@ -175,34 +175,34 @@ Built early so later milestones emit events as they go, instead of retrofitting 
 ## M6 — Reconciliation engine
 
 ### Data model
-- [ ] **M6.1** Write a migration and entity for `reconciliation_run`: org, period start and end, source pair, status, idempotency key, summary counts and totals, `started_at`, `completed_at`, failure reason and `triggered_by`.
-- [ ] **M6.2** Write a migration and entity for `reconciliation_match`: run, ledger record, gateway record, match type and amount difference.
-- [ ] **M6.3** Add unique constraints so a record can't be matched twice within a run, and on the run's idempotency key.
+- [x] **M6.1** Write a migration and entity for `reconciliation_run`: org, period start and end, source pair, status, idempotency key, summary counts and totals, `started_at`, `completed_at`, failure reason and `triggered_by`.
+- [x] **M6.2** Write a migration and entity for `reconciliation_match`: run, ledger record, gateway record, match type and amount difference.
+- [x] **M6.3** Add unique constraints so a record can't be matched twice within a run, and on the run's idempotency key.
 
 ### Engine
-- [ ] **M6.4** Define a `MatchingStrategy` interface and implement `ExactReferenceStrategy` (v1) as set-based SQL inside PostgreSQL, processed one anchor day per chunk with a `last_completed_date` checkpoint (ADR 0012).
-- [ ] **M6.5** Exact match: same normalized reference, the same currency and the same transaction type.
-- [ ] **M6.6** Amount comparison: references that match but amounts that differ produce `AMOUNT_MISMATCH` and are never counted as matched.
-- [ ] **M6.7** Unmatched detection on both sides.
-- [ ] **M6.8** Duplicate detection: several candidates for one reference produce a `DUPLICATE` exception, never an arbitrary pick.
-- [ ] **M6.9** Persist matches, exceptions and summary counts atomically, or in documented chunks with a resumable checkpoint.
-- [ ] **M6.10** Run lifecycle `PENDING → RUNNING → COMPLETED | FAILED`, with the failure reason recorded.
-- [ ] **M6.11** Idempotency: re-running the same period and sources returns the existing run, or supersedes it under a documented rule, without duplicating matches or active exceptions.
-- [ ] **M6.12** Retrying a `FAILED` run doesn't duplicate matches it had already committed.
-- [ ] **M6.13** Emit audit events for run started, completed and failed.
+- [x] **M6.4** Define a `MatchingStrategy` interface and implement `ExactReferenceStrategy` (v1) as set-based SQL inside PostgreSQL, processed one anchor day per chunk with a `last_completed_date` checkpoint (ADR 0012).
+- [x] **M6.5** Exact match: same normalized reference, the same currency and the same transaction type.
+- [x] **M6.6** Amount comparison: references that match but amounts that differ produce `AMOUNT_MISMATCH` and are never counted as matched.
+- [x] **M6.7** Unmatched detection on both sides.
+- [x] **M6.8** Duplicate detection: several candidates for one reference produce a `DUPLICATE` exception, never an arbitrary pick.
+- [x] **M6.9** Persist matches, exceptions and summary counts atomically, or in documented chunks with a resumable checkpoint.
+- [x] **M6.10** Run lifecycle `PENDING → RUNNING → COMPLETED | FAILED`, with the failure reason recorded.
+- [x] **M6.11** Idempotency: re-running the same period and sources returns the existing run, or supersedes it under a documented rule, without duplicating matches or active exceptions.
+- [x] **M6.12** Retrying a `FAILED` run doesn't duplicate matches it had already committed.
+- [x] **M6.13** Emit audit events for run started, completed and failed.
 
 ### API
-- [ ] **M6.14** `POST /api/v1/reconciliation-runs`, accepting an `Idempotency-Key` header and returning `202` with the run (ADR 0003), or `200` with the existing run for a repeated request (ADR 0006).
-- [ ] **M6.15** `GET /api/v1/reconciliation-runs/{id}` for status, summary counts and totals.
-- [ ] **M6.16** `GET /api/v1/reconciliation-runs/{id}/matches`, paginated.
-- [ ] **M6.17** `GET /api/v1/reconciliation-runs`, listing runs, paginated.
+- [x] **M6.14** `POST /api/v1/reconciliation-runs`, accepting an `Idempotency-Key` header and returning `202` with the run (ADR 0003), or `200` with the existing run for a repeated request (ADR 0006).
+- [x] **M6.15** `GET /api/v1/reconciliation-runs/{id}` for status, summary counts and totals.
+- [x] **M6.16** `GET /api/v1/reconciliation-runs/{id}/matches`, paginated.
+- [x] **M6.17** `GET /api/v1/reconciliation-runs`, listing runs, paginated.
 
 ### Tests
-- [ ] **M6.18** Engine unit tests driven by the worked example tables in the README and projectoverview.md §5, with exact expected outcomes for each record.
-- [ ] **M6.19** Property-style test: every input record ends up in exactly one place (matched, mismatched, unmatched or duplicate), so nothing is lost or counted twice.
-- [ ] **M6.20** Running the same reconciliation twice produces no duplicate matches or exceptions.
-- [ ] **M6.21** A record from Organization B never takes part in a run for Organization A.
-- [ ] **M6.22** `BigDecimal` equality uses `compareTo`, so `1000.0` and `1000.00` count as equal. Add a regression test for it.
+- [x] **M6.18** Engine unit tests driven by the worked example tables in the README and projectoverview.md §5, with exact expected outcomes for each record.
+- [x] **M6.19** Property-style test: every input record ends up in exactly one place (matched, mismatched, unmatched or duplicate), so nothing is lost or counted twice.
+- [x] **M6.20** Running the same reconciliation twice produces no duplicate matches or exceptions.
+- [x] **M6.21** A record from Organization B never takes part in a run for Organization A.
+- [x] **M6.22** `BigDecimal` equality uses `compareTo`, so `1000.0` and `1000.00` count as equal. Add a regression test for it.
 
 **Exit criteria:** uploading both sample files and starting a run produces the expected matches and exceptions, and repeating the run changes nothing.
 

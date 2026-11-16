@@ -1,6 +1,6 @@
 # Phase M6 — Reconciliation Engine
 
-**Status:** Not started · **Tasks:** TASKS.md M6.1–M6.22 · **Depends on:** M3 (tenant context, permissions), M4 (audit), M5 (normalized `transaction_record` rows, job runner) · **Date:** 2026-11-01
+**Status:** Done (2026-11-16; as-built notes in §9) · **Tasks:** TASKS.md M6.1–M6.22 · **Depends on:** M3 (tenant context, permissions), M4 (audit), M5 (normalized `transaction_record` rows, job runner) · **Date:** 2026-11-01
 
 This is the core of ReconFlow. It takes the normalized ledger and gateway records that M5 imported, compares them for a period and currency, and produces three kinds of output: **matches**, **exception cases**, and **summary totals** on the run. Everything in M7 (investigation) and M8 (reporting) reads what this phase writes.
 
@@ -1238,19 +1238,19 @@ Rules:
 
 ## 6. Exit criteria checklist
 
-- [ ] Migration `V<next>__reconciliation_engine.sql` applied; app starts with `ddl-auto: validate`
-- [ ] `POST /reconciliation-runs` returns `202` for new, `200` for existing, `422` for a reused client key with a different body
-- [ ] Concurrent identical `POST`s create one run and one job
-- [ ] The run moves `PENDING → RUNNING → COMPLETED`, with summary columns filled
-- [ ] Both worked examples produce the exact per-record outcomes in M6.18
-- [ ] The property test passes with 100 tries
-- [ ] Crash-and-retry gives the same final state as a clean run
-- [ ] A second run with a new key creates no new active exception cases
-- [ ] Cross-tenant tests pass for every run endpoint, with RLS on
-- [ ] `BigDecimal.equals` is banned by ArchUnit
-- [ ] `docs/reconciliation-rules.md` has the scope table, the outcome precedence, the key format, the sign convention, and the "resolved case reappears" rule
-- [ ] ADRs written: anchor-day chunking; run idempotency key; `202` for run creation; exceptions-module API instead of events
-- [ ] **TASKS.md exit criterion:** upload both sample files, start a run, get the expected matches and exceptions; repeat the run, nothing changes
+- [x] Migration `V<next>__reconciliation_engine.sql` applied; app starts with `ddl-auto: validate`
+- [x] `POST /reconciliation-runs` returns `202` for new, `200` for existing, `422` for a reused client key with a different body
+- [x] Concurrent identical `POST`s create one run and one job
+- [x] The run moves `PENDING → RUNNING → COMPLETED`, with summary columns filled
+- [x] Both worked examples produce the exact per-record outcomes in M6.18
+- [x] The property test passes with 100 tries
+- [x] Crash-and-retry gives the same final state as a clean run
+- [x] A second run with a new key creates no new active exception cases
+- [x] Cross-tenant tests pass for every run endpoint, with RLS on
+- [x] `BigDecimal.equals` is banned by ArchUnit
+- [x] `docs/reconciliation-rules.md` has the scope table, the outcome precedence, the key format, the sign convention, and the "resolved case reappears" rule
+- [x] ADRs written: anchor-day chunking; run idempotency key; `202` for run creation; exceptions-module API instead of events
+- [x] **TASKS.md exit criterion:** upload both sample files, start a run, get the expected matches and exceptions; repeat the run, nothing changes
 
 ---
 
@@ -1304,3 +1304,36 @@ Instead of fixed examples, you state an invariant and let the framework generate
 | Mocking the database in engine tests | Tests pass, SQL is wrong | Testcontainers with real migrations |
 | Truncating tables between tests | Fails on append-only tables; tests depend on order | Fresh organization per test |
 | Testing tenancy as superuser | RLS is silently bypassed | Run tests with the application's DB role |
+
+---
+
+## 9. As built: where the code differs from this plan, and why
+
+docs/ win over this plan wherever they disagree (reconciliation-rules.md, api-design.md, database-design.md, ADRs 0006, 0009, 0012). Choices made while building M6:
+
+| Plan said | Built | Why |
+|---|---|---|
+| Migration `V<next>` with the five gaps | `V5__reconciliation_engine.sql`, plus `reconciliation_run.excluded_count` and the partial unique index `reconciliation_run_active_scope_uk` | Rules §2/§4 count excluded records and the samples' summaries list them; one active run per organization and scope must hold in the database, not in a check-then-insert |
+| `exception_case_run` without RLS | ENABLE + FORCE RLS and a `tenant_isolation` policy in V5 | CONTRIBUTING: every tenant-owned table gets a policy (`RlsCoverageIT`) |
+| Classify SQL filters status, org and period | Also P2 (the run's sources) and P3 (only records of `COMPLETED`/`COMPLETED_WITH_ERRORS` batches, a join to `import_batch`) in every engine query, including the counterpart and excluded queries | reconciliation-rules.md §2 (P3) |
+| No duplicate reason codes; `DUPLICATE` | `SAME_AMOUNT` / `DIFFERENT_AMOUNTS` from `min(amount) = max(amount)`; type `DUPLICATE_IN_SOURCE` | Rules §5.2, V1 CHECK |
+| `RecordRef(id, date, sourceType)` | `RecordRef(id, transactionDate)` | `exceptions` may not depend on `ledger` (architecture.md §4); the link table has no source column |
+| `Idempotency-Key` 1–255 characters | 1–128 printable ASCII; `client:`/`auto:` prefixes; `422 idempotency-key-reused` | api-design.md §5, ADR 0006 |
+| Currency must be upper case | Trimmed and upper-cased, then validated; `aed` is the same run as `AED` | Friendlier, and the fingerprint uses the normalized value |
+| Retry: `200`, no body, `409 invalid-state-transition`, `RUN_CREATE` | `202 Accepted` with `Location`, required `reason`, `409 invalid-transition` with `currentStatus` | api-design.md §3.1, §7, rules §7.2 |
+| — | `409 run-in-progress` (`existingRunId`) for a request or retry while a run of the same scope is active; new catalogue row | The one-active-run index needs a client-facing answer; its violation aborts the transaction, so it is caught outside and decided in a second transaction (an identical request that lost the race still gets `200`) |
+| Transitions `PENDING→RUNNING→COMPLETED/FAILED`, `FAILED→PENDING` | Also `PENDING → FAILED`, added to rules §7.2 | A job can exhaust its attempts before the run starts, as imports have `RECEIVED → FAILED` |
+| Worker "re-schedules the job a minute later" while an import is in progress | New `shared.jobs.JobDeferredException`: back to `QUEUED` with `run_after = now() + 1 min`, attempts unchanged | The queue had no way to wait without spending an attempt; a deferral must never exhaust `max_attempts` |
+| `StaleRunOwnershipException`, non-retryable | Extends `LeaseLostException` (new protected message constructor) | A permanent failure would mark the run FAILED while another worker is processing it; "lost ownership" means stop and change nothing |
+| Each chunk fenced on the checkpoint | Fenced twice: run row `FOR UPDATE` + checkpoint check, and `JobContext.fence()` on the job lease (which also extends it) | M5's queue fences every write on the lease; both together stop a zombie |
+| Failure injection by a test-only `MatchingStrategy` decorator | `RunChunkHook` (no-op in production, `@Primary` armable hook in tests), called before the checkpoint inside the chunk transaction | Same pattern as M5's `ImportProcessingHook`; keeps `ExactReferenceStrategy` the only strategy bean |
+| Worker audit `request_id` = `job:<jobId>` | Done by the RECONCILE handler putting it in the MDC for `handle` and `onPermanentFailure` | AuditService reads the request id from the MDC |
+| `RUN_READ` added to `Permission` and `RolePermissions` | Already there (M3, from api-design.md §9) | — |
+| Anchor-day ADR `NNNN-anchor-day-chunking.md` | Covered by ADR 0012 | ADR 0012 already records anchor-day chunking |
+| `excluded` not in the summary | `summary.excluded.count` (records) next to the case counts | Rules §2, samples README summaries |
+| jqwik + Spring | `TestContextManager` on a class with the shared IT configuration: the context cache returns the running context and container | jqwik properties aren't Jupiter tests, so `SpringExtension` doesn't apply; no extra dependency (jqwik-spring) needed |
+| "See the property fail by removing the anchor filter" | Removing it does **not** fail the property: a group re-classified on a later day loads the same full group, so its match hits `ON CONFLICT DO NOTHING` and its case is re-observed by key. Seen failing instead by filtering on currency before grouping (shrinks to one AED ledger + one USD gateway record) | The idempotency safety nets mask the bug; the anchor filter is about not doing redundant work |
+| ArchUnit ban on `BigDecimal.equals` | Done, plus a test that the rule fires on a class that calls it, and a rule that only `RunLifecycle` calls the run's transition methods | M6.22, M6.10 |
+
+Not built, deliberately: an `EXPLAIN (ANALYZE, BUFFERS)` of the classify query on realistic volume (M9.5's generator and M9.7 measure it); the `reconciliation_run_day` rows (M8.1 adds them in the chunk transaction); auto-resolving cases that no longer reproduce (v2).
+

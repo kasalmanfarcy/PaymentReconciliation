@@ -21,6 +21,7 @@ V1 has `reconciliation_run UNIQUE (organization_id, idempotency_key)` and `excep
 - The run also stores a `request_fingerprint`, the SHA-256 of the canonical request.
 - Insert with `ON CONFLICT (organization_id, idempotency_key) DO NOTHING`. New → `202 Accepted`. Existing with the same fingerprint → **`200 OK` with the existing run** in whatever state it's in. Existing `client:` key with a different fingerprint → `422 idempotency-key-reused`.
 - To re-run a period on purpose, send a fresh key.
+- **One active run per scope** (added in M6): a partial unique index allows at most one `PENDING`/`RUNNING` run per organization, period, sources and currency. Two requests with *different* keys for one scope can't both start a run; the loser gets `409 run-in-progress` with `existingRunId`. Its violation aborts the transaction, so it is caught outside it and a second transaction decides (an identical request that lost the race on the same key still gets `200` with the winner).
 
 **Exception identity across runs.** Each case has a deterministic `discrepancy_key` (`<TYPE>:<reference>:<transaction_type>:<sorted currencies>`, reconciliation-rules.md §6) with no run ID or period in it. A run that finds an active case with its key links to it instead of creating another; the partial unique index guarantees at most one active case per key, even under concurrent runs.
 

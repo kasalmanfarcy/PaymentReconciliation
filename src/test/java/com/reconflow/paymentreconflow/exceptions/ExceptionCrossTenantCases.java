@@ -69,6 +69,13 @@ class ExceptionCrossTenantCases implements CrossTenantCases {
                 f -> Map.of("status", "IN_REVIEW"),
                 NOT_FOUND,
                 VERSIONED_MERGE_PATCH));
+        cases.add(new CrossTenantCase(
+                "add a note to org B's exception",
+                HttpMethod.POST,
+                "/api/v1/exceptions/{id}/notes",
+                f -> Map.of("id", f.orgBCase()),
+                f -> Map.of("body", "planted"),
+                NOT_FOUND));
         return cases;
     }
 }

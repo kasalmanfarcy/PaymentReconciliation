@@ -195,6 +195,26 @@ public class ExceptionQueries {
                         .toList());
     }
 
+    /** One note of one of the caller's cases, as the detail view shows it. */
+    public NoteView note(UUID caseId, UUID noteId) {
+        NoteRow row = jdbc.sql(NOTES.replace("ORDER BY", "AND id = :noteId ORDER BY"))
+                .param("id", caseId)
+                .param("org", tenant.organizationId())
+                .param("noteId", noteId)
+                .query((rs, n) -> new NoteRow(
+                        rs.getObject("id", UUID.class),
+                        rs.getObject("author_id", UUID.class),
+                        rs.getString("body"),
+                        instant(rs, "created_at")))
+                .optional()
+                .orElseThrow(() -> new NotFoundException("Note", noteId));
+        return new NoteView(
+                row.id(),
+                UserRef.of(row.authorId(), users.displayNames(Set.of(row.authorId()))),
+                row.body(),
+                row.createdAt());
+    }
+
     private record NoteRow(UUID id, UUID authorId, String body, Instant createdAt) {}
 
     private record HistoryRow(

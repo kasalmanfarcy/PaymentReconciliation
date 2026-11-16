@@ -3,6 +3,7 @@ package com.reconflow.paymentreconflow.exceptions.internal.api;
 import com.reconflow.paymentreconflow.exceptions.ExceptionType;
 import com.reconflow.paymentreconflow.exceptions.internal.application.ExceptionCommands;
 import com.reconflow.paymentreconflow.exceptions.internal.application.ExceptionDetailView;
+import com.reconflow.paymentreconflow.exceptions.internal.application.ExceptionDetailView.NoteView;
 import com.reconflow.paymentreconflow.exceptions.internal.application.ExceptionFilter;
 import com.reconflow.paymentreconflow.exceptions.internal.application.ExceptionList;
 import com.reconflow.paymentreconflow.exceptions.internal.application.ExceptionPatch;
@@ -12,7 +13,11 @@ import com.reconflow.paymentreconflow.exceptions.internal.application.IfMatch;
 import com.reconflow.paymentreconflow.exceptions.internal.domain.ExceptionStatus;
 import com.reconflow.paymentreconflow.shared.context.Permission;
 import com.reconflow.paymentreconflow.shared.context.RequiresPermission;
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
 import java.math.BigDecimal;
+import java.net.URI;
 import java.time.LocalDate;
 import java.util.List;
 import java.util.UUID;
@@ -23,6 +28,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -103,6 +109,21 @@ class ExceptionController {
         long expected = IfMatch.parseRequired(ifMatch);
         commands.patch(id, expected, ExceptionPatch.from(body));
         return withETag(queries.detail(id));
+    }
+
+    /** Not trimmed or cleaned beyond rejecting blank: a note is evidence. */
+    record NoteRequest(@NotBlank @Size(max = 4000) String body) {}
+
+    /**
+     * 201 with the note: it is complete when the response is sent. Needs no If-Match (the case row
+     * doesn't change). The Location names the note; notes are read through the case's detail view.
+     */
+    @PostMapping("/{id}/notes")
+    @RequiresPermission(Permission.EXCEPTION_UPDATE)
+    ResponseEntity<NoteView> addNote(@PathVariable UUID id, @Valid @RequestBody NoteRequest request) {
+        NoteView note = queries.note(id, commands.addNote(id, request.body()));
+        return ResponseEntity.created(URI.create("/api/v1/exceptions/" + id + "/notes/" + note.id()))
+                .body(note);
     }
 
     static ResponseEntity<ExceptionDetailView> withETag(ExceptionDetailView view) {

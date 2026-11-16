@@ -1,20 +1,30 @@
 package com.reconflow.paymentreconflow.exceptions.internal.application;
 
+import com.reconflow.paymentreconflow.audit.AuditAction;
+import com.reconflow.paymentreconflow.audit.AuditEntityType;
+import com.reconflow.paymentreconflow.audit.AuditEntry;
+import com.reconflow.paymentreconflow.audit.AuditService;
 import com.reconflow.paymentreconflow.exceptions.internal.domain.ExceptionCase;
 import com.reconflow.paymentreconflow.exceptions.internal.domain.ExceptionCaseRepository;
+import com.reconflow.paymentreconflow.exceptions.internal.domain.ExceptionNote;
+import com.reconflow.paymentreconflow.exceptions.internal.domain.ExceptionNoteRepository;
 import com.reconflow.paymentreconflow.exceptions.internal.domain.ExceptionStateMachine;
 import com.reconflow.paymentreconflow.exceptions.internal.domain.ExceptionStatus;
 import com.reconflow.paymentreconflow.exceptions.internal.domain.InvalidTransitionException;
 import com.reconflow.paymentreconflow.exceptions.internal.domain.Transition;
 import com.reconflow.paymentreconflow.exceptions.internal.domain.TransitionInput;
+import com.reconflow.paymentreconflow.shared.context.CurrentUser;
+import com.reconflow.paymentreconflow.shared.context.Permission;
 import com.reconflow.paymentreconflow.shared.context.TenantContext;
 import com.reconflow.paymentreconflow.shared.error.NotFoundException;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.OptimisticLockException;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.function.Consumer;
 import org.hibernate.StaleStateException;
 import org.springframework.dao.OptimisticLockingFailureException;
+import org.springframework.security.access.AccessDeniedException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 
@@ -46,6 +56,9 @@ public class ExceptionCommands {
     private final TenantContext tenant;
     private final TransactionTemplate tx;
     private final EntityManager em;
+    private final ExceptionNoteRepository notes;
+    private final AuditService audit;
+    private final CurrentUser currentUser;
 
     ExceptionCommands(
             ExceptionCaseRepository cases,
@@ -54,7 +67,10 @@ public class ExceptionCommands {
             ExceptionWriteHook hook,
             TenantContext tenant,
             TransactionTemplate tx,
-            EntityManager em) {
+            EntityManager em,
+            ExceptionNoteRepository notes,
+            AuditService audit,
+            CurrentUser currentUser) {
         this.cases = cases;
         this.machine = machine;
         this.assignments = assignments;
@@ -62,6 +78,32 @@ public class ExceptionCommands {
         this.tenant = tenant;
         this.tx = tx;
         this.em = em;
+        this.notes = notes;
+        this.audit = audit;
+        this.currentUser = currentUser;
+    }
+
+    /**
+     * Adds an investigation note, in any status (a post-resolution "refund confirmed" is a fair
+     * note). No If-Match and no version bump: a note is a new row in another table and changes
+     * nothing on the case, so it can't conflict with anyone's edit, and two people adding notes at
+     * once both succeed. The case is still loaded first, so a note on another tenant's case is a
+     * 404, not a foreign-key error.
+     */
+    public UUID addNote(UUID id, String body) {
+        UUID org = tenant.organizationId();
+        // Defense in depth, as in the state machine: the endpoint's annotation is the first guard.
+        if (!tenant.has(Permission.EXCEPTION_UPDATE)) {
+            throw new AccessDeniedException("Missing permission " + Permission.EXCEPTION_UPDATE);
+        }
+        return Objects.requireNonNull(tx.execute(s -> {
+            cases.findByIdAndOrganizationId(id, org).orElseThrow(() -> new NotFoundException("Exception", id));
+            ExceptionNote saved = notes.save(ExceptionNote.create(org, id, currentUser.id(), body));
+            // The body isn't copied: it is stored immutably already, and audit payloads stay small.
+            audit.record(AuditEntry.of(AuditAction.EXCEPTION_NOTE_ADDED, AuditEntityType.EXCEPTION_CASE, id)
+                    .with("noteId", saved.getId()));
+            return saved.getId();
+        }));
     }
 
     /**

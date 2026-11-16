@@ -7,6 +7,7 @@ import static com.tngtech.archunit.core.domain.properties.HasOwner.Predicates.Wi
 import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.methods;
 import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noClasses;
 
+import com.reconflow.paymentreconflow.exceptions.internal.domain.ExceptionCase;
 import com.reconflow.paymentreconflow.reconciliation.domain.ReconciliationRun;
 import com.reconflow.paymentreconflow.shared.context.RequiresPermission;
 import com.tngtech.archunit.core.domain.JavaClasses;
@@ -131,6 +132,26 @@ class ArchitectureRulesTest {
                         .or(target(name("complete")))
                         .or(target(name("fail")))
                         .and(target(owner(type(ReconciliationRun.class)))))
+                .check(classes);
+    }
+
+    @Test
+    void onlyTheExceptionStateMachineChangesACase() {
+        // M7.5: every status change and assignment of a case checks the transition table, the
+        // permission and the reason, and writes history and audit in one place. The mutators are
+        // package-private already; this names the rule, and catches a second class added to the
+        // domain package that starts calling them.
+        noClasses()
+                .that()
+                .doNotHaveFullyQualifiedName(ROOT + ".exceptions.internal.domain.ExceptionStateMachine")
+                .and()
+                .doNotHaveFullyQualifiedName(ROOT + ".exceptions.internal.domain.ExceptionCase")
+                .should()
+                .callMethodWhere(target(name("moveTo"))
+                        .or(target(name("assignTo")))
+                        .or(target(name("markResolved")))
+                        .or(target(name("clearResolution")))
+                        .and(target(owner(type(ExceptionCase.class)))))
                 .check(classes);
     }
 

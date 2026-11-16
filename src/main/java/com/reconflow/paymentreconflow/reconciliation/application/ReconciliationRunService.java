@@ -235,7 +235,7 @@ public class ReconciliationRunService {
                         .orElse(Map.of()));
     }
 
-    /** api-design.md §8.8 "Run request validation", plus the header (§5). */
+    /** api-design.md §8.8, plus the header (§5). */
     private Scope validate(RunRequest request, @Nullable String clientKey) {
         if (clientKey != null && !RunKeys.isValidClientKey(clientKey)) {
             throw new ValidationFailedException(

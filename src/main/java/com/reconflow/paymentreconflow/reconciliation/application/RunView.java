@@ -11,7 +11,7 @@ import java.util.UUID;
 import org.jspecify.annotations.Nullable;
 
 /**
- * A run as the API shows it (api-design.md §8.9). {@code summary} is null until COMPLETED. Counts
+ * A run as the API shows it (api-design.md §8.10). {@code summary} is null until COMPLETED. Counts
  * are cases, not records; {@code excluded} is records (rules P4/P5). Money is serialized as strings
  * by the shared MoneySerializer, always next to the run's {@code currency}.
  */

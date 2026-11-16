@@ -110,6 +110,7 @@ Validation errors add an `errors` array, one entry per problem:
 | `active-case-exists` | 409 | Reopen would create a second active case for the same discrepancy (`existingCaseId`) |
 | `last-org-admin` | 409 | Demoting or disabling the organization's last active org admin |
 | `already-a-member` | 409 | Adding a user who is already a member of this organization |
+| `run-in-progress` | 409 | Requesting or retrying a run while another run of the same organization, period, sources and currency is `PENDING` or `RUNNING` (`existingRunId`); added in M6 |
 | `file-too-large` | 413 | Upload over 50 MB |
 | `unsupported-media-type` | 415 | Upload isn't a `.csv` with an accepted content type; or a body in the wrong content type |
 | `idempotency-key-reused` | 422 | Same `Idempotency-Key`, different request body |
@@ -412,7 +413,45 @@ Search the organization's normalized records (M5.19). Only records of accepted b
 
 `raw_values` is not part of the list (it's the largest column). **Errors:** `400 validation-failed` (missing or reversed range, range over 366 days, unknown sort field, bad enum or UUID).
 
-### 8.8 Notes for later sections
+### 8.8 `POST /api/v1/reconciliation-runs`
+
+Request a reconciliation run for one period, currency and source pair (M6.11, M6.14). The run is processed in the background, one anchor day at a time ([ADR 0012](adr/0012-set-based-matching-in-sql.md)).
+
+**Request:**
+
+```http
+POST /api/v1/reconciliation-runs
+Idempotency-Key: 7f9c2a10-3d1e-4b4f-9f0e-1c8a7b6d5e4f
+X-Organization-Id: 0193b9e2-7c41-7a10-8d2e-5f6a7b8c9d0e
+Content-Type: application/json
+
+{ "periodStart": "2026-10-01", "periodEnd": "2026-10-31", "currency": "AED" }
+```
+
+| Field | Required | Rule |
+|---|---|---|
+| `periodStart`, `periodEnd` | Yes | `YYYY-MM-DD`, both inclusive; `periodEnd ≥ periodStart`; at most 92 days |
+| `currency` | Yes | An ISO-4217 code; trimmed and upper-cased first, so `aed` is `AED` (and the same run) |
+| `leftSource`, `rightSource` | No | Default `INTERNAL_LEDGER` / `GATEWAY`; must differ |
+| `Idempotency-Key` header | No | 1–128 printable ASCII characters (§5) |
+
+**Response `202 Accepted`** (a new run) with `Location: /api/v1/reconciliation-runs/{id}` and `Retry-After: 2`; the body is the run shape of §8.10, `status` `PENDING`, `summary` `null`. The run, its job and the `RUN_REQUESTED` audit event commit in one transaction.
+
+**Response `200 OK`** (an idempotent repeat, §5): the existing run, in whatever state it is in, with `Location`; `Retry-After: 2` while it isn't terminal. A repeat is answered even while an import is in progress, because it starts nothing.
+
+**Errors:** `400 validation-failed` (each rule above; `errors[]` names the field, e.g. `must-not-be-before-start`, `period-too-long`, `invalid-currency`, `sources-must-differ`, `invalid-idempotency-key`), `409 import-in-progress` (an import of the organization is `RECEIVED` or `PROCESSING`), `409 run-in-progress` (another run of the same organization, period, sources and currency is `PENDING` or `RUNNING`, `existingRunId`; enforced by a partial unique index, so even racing requests with different keys can't both start one), `422 idempotency-key-reused`. On any error, nothing is created.
+
+### 8.9 `POST /api/v1/reconciliation-runs/{id}/retry`
+
+Retry a `FAILED` run (M6.12), with an audited reason.
+
+**Request:** `{ "reason": "Database restarted during the first attempt" }` (required, non-blank, ≤ 1,000 characters).
+
+**Response `202 Accepted`:** the run, now `PENDING`, `failureReason` cleared, plus `Location` and `Retry-After: 2`. The run **keeps** `progress.lastCompletedDate`: the new job resumes after the last committed day, so days already done are never redone or duplicated. A new job is queued in the same transaction; the old one stays `FAILED` for history. The audit event `RUN_RETRY_REQUESTED` carries the reason and the previous failure reason.
+
+**Errors:** `400 validation-failed` (no reason), `404 not-found`, `409 invalid-transition` (the run isn't `FAILED`; `currentStatus`), `409 run-in-progress` (another run of the same scope became active meanwhile).
+
+### 8.13 Notes for later sections
 
 Decisions already made that the later endpoint sections must reflect:
 

@@ -20,7 +20,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * {@code /api/v1/reconciliation-runs} (api-design.md §8.9–§8.13). The organization comes from
+ * {@code /api/v1/reconciliation-runs} (api-design.md §8.8–§8.12). The organization comes from
  * TenantContext, never from the request.
  */
 @RestController

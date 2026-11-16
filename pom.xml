@@ -45,6 +45,8 @@
         <spring-modulith.version>2.1.2</spring-modulith.version>
         <spotless-maven-plugin.version>3.11.0</spotless-maven-plugin.version>
         <palantir-java-format.version>2.103.0</palantir-java-format.version>
+        <!-- 0.8.14+ is needed to instrument Java 25 class files. -->
+        <jacoco-maven-plugin.version>0.8.16</jacoco-maven-plugin.version>
     </properties>
     <dependencyManagement>
         <dependencies>
@@ -173,6 +175,44 @@
                             <goal>integration-test</goal>
                             <goal>verify</goal>
                         </goals>
+                    </execution>
+                </executions>
+            </plugin>
+            <!-- Coverage report on every build, no threshold yet (M2.14): measure the baseline
+                 first, decide in M9 whether to enforce one. prepare-agent sets ${argLine} for
+                 Surefire, prepare-agent-integration for Failsafe; if either plugin ever gets its
+                 own <argLine>, write it as "@{argLine} ..." or the agent is silently dropped.
+                 Reports: target/site/jacoco (unit) and target/site/jacoco-it (integration). -->
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <version>${jacoco-maven-plugin.version}</version>
+                <executions>
+                    <execution>
+                        <id>prepare-agent</id>
+                        <goals>
+                            <goal>prepare-agent</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>prepare-agent-it</id>
+                        <goals>
+                            <goal>prepare-agent-integration</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>report</id>
+                        <goals>
+                            <goal>report</goal>
+                        </goals>
+                        <phase>verify</phase>
+                    </execution>
+                    <execution>
+                        <id>report-it</id>
+                        <goals>
+                            <goal>report-integration</goal>
+                        </goals>
+                        <phase>verify</phase>
                     </execution>
                 </executions>
             </plugin>

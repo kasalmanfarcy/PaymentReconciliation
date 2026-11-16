@@ -31,6 +31,8 @@ import java.util.Locale;
 import java.util.Set;
 import java.util.UUID;
 import org.jspecify.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
@@ -56,6 +58,8 @@ import org.springframework.web.multipart.MultipartFile;
  */
 @Service
 public class ImportReceiver {
+
+    private static final Logger log = LoggerFactory.getLogger(ImportReceiver.class);
 
     /** What browsers and tools send for a .csv (Windows with Excel installed: vnd.ms-excel). */
     static final Set<String> ACCEPTED_TYPES =
@@ -142,6 +146,7 @@ public class ImportReceiver {
             // A concurrent upload of the same bytes won the race. Our object is now an orphan:
             // delete it (best effort; the sweeper catches a failure) and point at the winner. The
             // lookup runs in a new transaction: the failed one is rolled back and unusable.
+            log.info("Lost a duplicate-upload race for {}; deleting the stored copy", key);
             storage.deleteQuietly(key);
             UUID winner = batches.findByOrganizationIdAndSourceTypeAndContentHash(organizationId, sourceType, hash)
                     .map(ImportBatch::getId)

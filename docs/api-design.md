@@ -118,7 +118,7 @@ Validation errors add an `errors` array, one entry per problem:
 | `idempotency-key-reused` | 422 | Same `Idempotency-Key`, different request body |
 | `invalid-assignee` | 422 | The assignee isn't a member of this organization with `EXCEPTION_UPDATE` |
 | `precondition-required` | 428 | `If-Match` missing on a versioned update |
-| `rate-limited` | 429 | Too many requests (login: M3.3f; uploads and runs: M10.4); with `Retry-After` |
+| `rate-limited` | 429 | Too many requests, with `Retry-After` (seconds). Uploads and import retries: 10 a minute per user per organization; run requests and run retries: 20 a minute (M10.4, `RateLimit-Remaining` on accepted requests). Also when the organization already has 50 imports, runs or exports queued or running (`Retry-After: 30`); the request then created nothing |
 | `internal-error` | 500 | Anything unexpected; no details in the body |
 | `storage-unavailable` | 503 | Object storage didn't answer (an outage, not a problem with the request): an upload stored nothing and created nothing; retry after `Retry-After` seconds. Added in M9.4 (it was a `500` before) |
 

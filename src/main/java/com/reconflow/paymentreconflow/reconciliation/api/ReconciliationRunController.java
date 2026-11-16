@@ -8,6 +8,8 @@ import com.reconflow.paymentreconflow.reconciliation.application.RunView;
 import com.reconflow.paymentreconflow.reconciliation.domain.RunStatus;
 import com.reconflow.paymentreconflow.shared.context.Permission;
 import com.reconflow.paymentreconflow.shared.context.RequiresPermission;
+import com.reconflow.paymentreconflow.shared.ratelimit.RateLimitPolicy;
+import com.reconflow.paymentreconflow.shared.ratelimit.RateLimited;
 import com.reconflow.paymentreconflow.shared.web.Pagination;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
@@ -74,6 +76,7 @@ class ReconciliationRunController {
      */
     @PostMapping
     @RequiresPermission(Permission.RUN_CREATE)
+    @RateLimited(RateLimitPolicy.RUN_CREATE)
     ResponseEntity<RunView> create(
             @RequestHeader(name = "Idempotency-Key", required = false) @Nullable String idempotencyKey,
             @Valid @RequestBody RunRequest request) {
@@ -94,6 +97,7 @@ class ReconciliationRunController {
     /** 202 like the request: the run is PENDING again and its new job is queued. */
     @PostMapping("/{id}/retry")
     @RequiresPermission(Permission.RUN_CREATE)
+    @RateLimited(RateLimitPolicy.RUN_CREATE)
     ResponseEntity<RunView> retry(@PathVariable UUID id, @Valid @RequestBody RetryRequest request) {
         RunView run = runs.retry(id, request.reason());
         return ResponseEntity.accepted()

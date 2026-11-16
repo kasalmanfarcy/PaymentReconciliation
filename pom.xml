@@ -53,6 +53,8 @@
         <awssdk.version>2.59.1</awssdk.version>
         <!-- M6.19 property tests. 1.10.x is the line that runs on the JUnit Platform Boot 4 ships. -->
         <jqwik.version>1.10.2</jqwik.version>
+        <!-- M10.4 request rate limits (token buckets). Not managed by Boot. -->
+        <bucket4j.version>8.22.0</bucket4j.version>
         <!-- M10.5: the weekly vulnerability scan (.github/workflows/dependency-check.yml). -->
         <dependency-check-maven.version>13.0.0</dependency-check-maven.version>
     </properties>
@@ -167,6 +169,19 @@
             </exclusions>
         </dependency>
 
+        <!-- M10.4: token buckets per user and organization on the upload and run endpoints. The
+             "_jdk17" artifact is the line for Java 17+; the plain one targets Java 8. -->
+        <dependency>
+            <groupId>com.bucket4j</groupId>
+            <artifactId>bucket4j_jdk17-core</artifactId>
+            <version>${bucket4j.version}</version>
+        </dependency>
+        <!-- Bounded, expiring map of those buckets: keys come from users, so an unbounded map would
+             be a memory-exhaustion hole. Version managed by Boot. -->
+        <dependency>
+            <groupId>com.github.ben-manes.caffeine</groupId>
+            <artifactId>caffeine</artifactId>
+        </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-devtools</artifactId>

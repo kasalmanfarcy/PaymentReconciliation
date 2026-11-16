@@ -178,7 +178,10 @@ class JobQueueHardeningIT extends AbstractIntegrationTest {
                         },
                         (rs, n) -> rs.getString(1)));
 
-        assertThat(plan).contains("job_claim_idx").doesNotContain("Seq Scan on job");
+        // Either partial index of live jobs will do: job_claim_idx (QUEUED) or, since M10.4,
+        // job_pending_org_idx (QUEUED + RUNNING, for the pending-job cap). Both skip finished jobs,
+        // which is the property that matters; the planner picks between them on statistics.
+        assertThat(plan).containsAnyOf("job_claim_idx", "job_pending_org_idx").doesNotContain("Seq Scan on job");
         jdbc.update("DELETE FROM job WHERE organization_id = ?", org); // keep the shared table small
     }
 

@@ -1,6 +1,8 @@
 package com.reconflow.paymentreconflow.shared.jobs;
 
 import com.reconflow.paymentreconflow.shared.id.Ids;
+import com.reconflow.paymentreconflow.shared.ratelimit.RateLimitExceededException;
+import java.time.Duration;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -19,13 +21,27 @@ import org.springframework.transaction.annotation.Transactional;
 public class JobQueue {
 
     private final JobStore store;
+    private final JobProperties props;
 
-    JobQueue(JobStore store) {
+    JobQueue(JobStore store, JobProperties props) {
         this.store = store;
+        this.props = props;
     }
 
+    /**
+     * Also the exact layer of M10.4's rate limiting: an organization can't have more than
+     * {@code max-pending-per-org} jobs QUEUED or RUNNING. The request-rate buckets are per instance
+     * and approximate; this count is in the database, so it holds across every API node. Throwing
+     * rolls back the business row with it (same transaction), so nothing half-created remains.
+     */
     @Transactional(propagation = Propagation.MANDATORY)
     public UUID enqueue(UUID organizationId, String type, Map<String, ?> payload) {
+        if (store.lockAndCountPending(organizationId) >= props.maxPendingPerOrg()) {
+            throw new RateLimitExceededException(
+                    "This organization already has " + props.maxPendingPerOrg()
+                            + " imports, runs or exports waiting. Retry when some have finished.",
+                    Duration.ofSeconds(30));
+        }
         UUID id = Ids.newId();
         store.insert(id, organizationId, type, payload);
         return id;

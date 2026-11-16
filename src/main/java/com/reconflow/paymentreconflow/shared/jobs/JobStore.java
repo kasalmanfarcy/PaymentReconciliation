@@ -66,6 +66,22 @@ class JobStore {
         this.json = json;
     }
 
+    /**
+     * Locks the organization's enqueue path until the transaction ends, then counts its QUEUED and
+     * RUNNING jobs (M10.4). Without the lock, two concurrent requests at cap - 1 both count cap - 1
+     * and both insert. A transaction-scoped advisory lock serialises only this organization's
+     * enqueues, not the table, and is released at commit or rollback.
+     */
+    int lockAndCountPending(UUID organizationId) {
+        jdbc.queryForObject(
+                "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", Object.class, "job-quota:" + organizationId);
+        Integer pending = jdbc.queryForObject(
+                "SELECT count(*) FROM job WHERE organization_id = ? AND status IN ('QUEUED', 'RUNNING')",
+                Integer.class,
+                organizationId);
+        return pending == null ? 0 : pending;
+    }
+
     void insert(UUID id, UUID organizationId, String type, Map<String, ?> payload) {
         jdbc.update(
                 "INSERT INTO job (id, organization_id, type, payload) VALUES (?, ?, ?, ?::jsonb)",

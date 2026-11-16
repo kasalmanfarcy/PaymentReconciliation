@@ -1,5 +1,6 @@
 package com.reconflow.paymentreconflow.shared.error;
 
+import com.reconflow.paymentreconflow.shared.ratelimit.RateLimitExceededException;
 import com.reconflow.paymentreconflow.shared.storage.StorageUnavailableException;
 import java.util.List;
 import java.util.Locale;
@@ -53,6 +54,14 @@ class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
         }
         ex.properties().forEach(problem::setProperty);
         return problem;
+    }
+
+    /** {@code 429} with {@code Retry-After} (M10.4): without it clients retry at once. */
+    @ExceptionHandler(RateLimitExceededException.class)
+    ResponseEntity<ProblemDetail> handleRateLimited(RateLimitExceededException ex) {
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+                .header(HttpHeaders.RETRY_AFTER, Long.toString(ex.retryAfterSeconds()))
+                .body(handleApi(ex));
     }
 
     /** An optimistic-lock failure that escaped the service layer (M7.8 maps it explicitly too). */

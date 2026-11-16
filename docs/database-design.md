@@ -221,6 +221,7 @@ erDiagram
 |---|---|
 | `job_claim_idx (run_after, created_at) WHERE status = 'QUEUED'` | The claim query: oldest runnable job first |
 | `job_running_org_idx (organization_id) WHERE status = 'RUNNING'` | The per-organization fairness count (≤ 2 running) |
+| `job_pending_org_idx (organization_id) WHERE status IN ('QUEUED', 'RUNNING')` (V11, M10.4) | The pending-job cap counted at every enqueue (≤ 50 per organization) |
 | `job_lease_idx (lease_until) WHERE status = 'RUNNING'` | The sweeper's search for expired leases |
 
 ### 3.3 Ingestion

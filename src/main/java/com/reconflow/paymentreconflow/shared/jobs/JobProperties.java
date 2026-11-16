@@ -16,6 +16,7 @@ import org.springframework.validation.annotation.Validated;
  * @param baseBackoff the retry delay is {@code baseBackoff × 2^attempts}, up to {@code maxBackoff}
  * @param retentionDone how long DONE jobs are kept before {@code JobRetention} deletes them
  * @param retentionFailed how long FAILED jobs are kept (longer: they are what an operator diagnoses)
+ * @param maxPendingPerOrg an organization's QUEUED + RUNNING jobs may not exceed this (M10.4)
  */
 @Validated
 @ConfigurationProperties("reconflow.jobs")
@@ -28,4 +29,5 @@ public record JobProperties(
         @DefaultValue("10s") Duration baseBackoff,
         @DefaultValue("1h") Duration maxBackoff,
         @DefaultValue("30d") Duration retentionDone,
-        @DefaultValue("180d") Duration retentionFailed) {}
+        @DefaultValue("180d") Duration retentionFailed,
+        @DefaultValue("50") @Min(1) int maxPendingPerOrg) {}

@@ -162,6 +162,15 @@ reconflow:
   bootstrap:
     # One-time: creates the first platform admin in a fresh environment (security.bootstrap).
     admin-email: ${RECONFLOW_BOOTSTRAP_ADMIN_EMAIL:}
+  rate-limit:
+    # M10.4, per user per organization, token buckets in memory on each API node (so N nodes allow
+    # up to N times this). The exact protection is jobs.max-pending-per-org below.
+    import-upload:
+      capacity: 10
+      period: 1m
+    run-create:
+      capacity: 20
+      period: 1m
   import:
     max-rows: 500000
     chunk-size: 5000                # rows per transaction, and the checkpoint granularity
@@ -186,6 +195,9 @@ reconflow:
     heartbeat: 30s           # live workers extend their leases this often
     sweep-interval: 30s      # how often expired leases are recovered
     per-org-max-running: 2   # fairness: one tenant can't occupy every worker thread
+    # M10.4: hard cap on an organization's QUEUED + RUNNING jobs, checked exactly (advisory lock) at
+    # enqueue; over it the request is 429 rate-limited. Stops one client filling the queue and storage.
+    max-pending-per-org: 50
     base-backoff: 10s        # retry delay = base × 2^attempts (ADR 0004): 20 s, 40 s, … 320 s
     max-backoff: 1h          # cap; with max_attempts 5 it never binds, but a raised limit would
     retention-done: 30d      # DONE jobs are deleted after this (JobRetention); history is in audit_event

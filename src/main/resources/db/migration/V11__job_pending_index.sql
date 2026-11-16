@@ -1,0 +1,11 @@
+-- =====================================================================
+-- ReconFlow — index for the per-organization pending-job cap (M10.4)
+--
+-- Every enqueue now counts the organization's QUEUED and RUNNING jobs
+-- (under an advisory lock, so the check and the insert are atomic per
+-- organization). Without this index that count scans the whole job
+-- table, DONE and FAILED history included, on every upload and run
+-- request. Partial: only live jobs are indexed, so it stays small however
+-- long the retention keeps finished ones.
+-- =====================================================================
+CREATE INDEX job_pending_org_idx ON job (organization_id) WHERE status IN ('QUEUED', 'RUNNING');

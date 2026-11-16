@@ -9,6 +9,8 @@ import com.reconflow.paymentreconflow.ingestion.domain.ImportBatchStatus;
 import com.reconflow.paymentreconflow.ledger.SourceType;
 import com.reconflow.paymentreconflow.shared.context.Permission;
 import com.reconflow.paymentreconflow.shared.context.RequiresPermission;
+import com.reconflow.paymentreconflow.shared.ratelimit.RateLimitPolicy;
+import com.reconflow.paymentreconflow.shared.ratelimit.RateLimited;
 import com.reconflow.paymentreconflow.shared.web.Pagination;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
@@ -61,6 +63,7 @@ class ImportController {
      */
     @PostMapping(consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     @RequiresPermission(Permission.IMPORT_CREATE)
+    @RateLimited(RateLimitPolicy.IMPORT_UPLOAD)
     ResponseEntity<ImportView> upload(
             @RequestPart(name = "file", required = false) @Nullable MultipartFile file,
             @RequestParam SourceType sourceType) {
@@ -103,6 +106,7 @@ class ImportController {
     /** 202 like the upload: the batch is RECEIVED again and its new job is queued. */
     @PostMapping("/{id}/retry")
     @RequiresPermission(Permission.IMPORT_CREATE)
+    @RateLimited(RateLimitPolicy.IMPORT_UPLOAD)
     ResponseEntity<ImportView> retry(@PathVariable UUID id, @Valid @RequestBody RetryRequest request) {
         ImportView batch = retries.retry(id, request.reason());
         return ResponseEntity.accepted()

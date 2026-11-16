@@ -33,10 +33,12 @@ public class ImportOutcomes {
     public static final String ORPHANED = "orphaned";
 
     private final AuditService audit;
+    private final ImportMetrics metrics;
     private final Clock clock;
 
-    ImportOutcomes(AuditService audit, Clock clock) {
+    ImportOutcomes(AuditService audit, ImportMetrics metrics, Clock clock) {
         this.audit = audit;
+        this.metrics = metrics;
         this.clock = clock;
     }
 
@@ -63,6 +65,7 @@ public class ImportOutcomes {
                 .with("errorRows", batch.getErrorRows())
                 .with("durationMs", took.toMillis())
                 .with("jobId", job.id()));
+        metrics.finished(batch.getSourceType(), batch.getStatus(), took);
     }
 
     /** The job won't run again: the batch fails with the reason users will see. */
@@ -72,6 +75,7 @@ public class ImportOutcomes {
             return;
         }
         batch.fail(reason, clock.instant());
+        recordFailure(batch);
         audit.record(AuditEntry.of(AuditAction.IMPORT_FAILED, AuditEntityType.IMPORT_BATCH, batch.getId())
                 .with("failureReason", reason)
                 .with("attempts", job.attempts())
@@ -90,8 +94,16 @@ public class ImportOutcomes {
             return;
         }
         batch.fail(ORPHANED, clock.instant());
+        recordFailure(batch);
         audit.record(AuditEntry.of(AuditAction.IMPORT_FAILED, AuditEntityType.IMPORT_BATCH, batch.getId())
                 .with("failureReason", ORPHANED)
                 .with("lastCommittedRow", batch.getLastCommittedRow()));
+    }
+
+    private void recordFailure(ImportBatch batch) {
+        Duration took = batch.getStartedAt() == null || batch.getCompletedAt() == null
+                ? Duration.ZERO
+                : Duration.between(batch.getStartedAt(), batch.getCompletedAt());
+        metrics.finished(batch.getSourceType(), ImportBatchStatus.FAILED, took);
     }
 }

@@ -91,6 +91,19 @@ server:
   shutdown: graceful
 
 management:
+  metrics:
+    tags:
+      application: reconflow
+    distribution:
+      # Histogram buckets (not client-side percentiles): buckets add up across instances, so
+      # Prometheus can compute a fleet-wide p95; SLO boundaries are exact buckets, so "what share of
+      # requests met the 300 ms read SLO" is a count, not an estimate (M9.9, scalability.md §6).
+      percentiles-histogram:
+        http.server.requests: true
+      slo:
+        http.server.requests: 100ms, 300ms, 500ms, 1s
+        reconflow.import.duration: 30s, 2m, 5m
+        reconflow.reconciliation.duration: 30s, 1m, 5m, 15m
   endpoints:
     web:
       exposure:

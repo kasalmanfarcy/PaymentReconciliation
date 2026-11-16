@@ -40,6 +40,9 @@ class JobStore {
     // The per-organization count is a soft cap: two claimers at the same instant can both see 1
     // running and both claim (SKIP LOCKED locks rows, not predicates). Fine for fairness; a hard cap
     // would take pg_advisory_xact_lock(hashtext(organization_id::text)) in the claim.
+    /** A claimed job and how long it had been runnable ({@code now() - run_after}), for the metric. */
+    record Claimed(Job job, Duration waited) {}
+
     static final String CLAIM = """
             UPDATE job
                SET status = 'RUNNING', locked_by = ?, lease_until = now() + make_interval(secs => ?),
@@ -53,7 +56,7 @@ class JobStore {
                     ORDER BY j.created_at, j.id
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1)
-            """ + RETURNING;
+            """ + RETURNING + ", extract(epoch FROM now() - run_after)::float8 AS waited_s";
 
     private final JdbcTemplate jdbc;
     private final JsonMapper json;
@@ -117,10 +120,10 @@ class JobStore {
      * organizations; production passes null. It exists for tests, which share one database and
      * must not run each other's jobs.
      */
-    Optional<Job> claim(
+    Optional<Claimed> claim(
             String workerId, Duration lease, int perOrgMaxRunning, @Nullable Collection<UUID> onlyOrganizations) {
         String sql = CLAIM.formatted(onlyOrganizations == null ? "" : "AND j.organization_id = ANY(?)");
-        List<Job> claimed = jdbc.query(
+        List<Claimed> claimed = jdbc.query(
                 (Connection c) -> {
                     PreparedStatement ps = c.prepareStatement(sql);
                     int i = 1;
@@ -133,7 +136,9 @@ class JobStore {
                     ps.setInt(i, perOrgMaxRunning);
                     return ps;
                 },
-                (rs, n) -> map(rs, workerId));
+                (rs, n) -> new Claimed(
+                        map(rs, workerId),
+                        Duration.ofMillis(Math.max(0, Math.round(rs.getDouble("waited_s") * 1000)))));
         return claimed.stream().findFirst();
     }
 
@@ -244,6 +249,15 @@ class JobStore {
                         + " WHERE id = ? AND status = 'RUNNING'",
                 truncate(error),
                 jobId);
+    }
+
+    /** QUEUED jobs per type, for the {@code reconflow.jobs.queued} gauge (a partial-index count). */
+    Map<String, Long> countQueuedByType() {
+        Map<String, Long> counts = new java.util.HashMap<>();
+        jdbc.query("SELECT type, count(*) FROM job WHERE status = 'QUEUED' GROUP BY type", rs -> {
+            counts.put(rs.getString(1), rs.getLong(2));
+        });
+        return counts;
     }
 
     /**

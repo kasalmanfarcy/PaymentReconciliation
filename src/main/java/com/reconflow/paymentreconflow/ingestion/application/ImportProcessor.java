@@ -71,6 +71,7 @@ public class ImportProcessor {
     private final ImportProperties props;
     private final ImportProcessingHook hook;
     private final ImportOutcomes outcomes;
+    private final ImportMetrics metrics;
     private final TransactionTemplate tx;
     private final TransientRetry retry;
     private final FaultInjector faults;
@@ -87,6 +88,7 @@ public class ImportProcessor {
             ImportProperties props,
             ImportProcessingHook hook,
             ImportOutcomes outcomes,
+            ImportMetrics metrics,
             TransactionTemplate tx,
             TransientRetry retry,
             FaultInjector faults,
@@ -101,6 +103,7 @@ public class ImportProcessor {
         this.props = props;
         this.hook = hook;
         this.outcomes = outcomes;
+        this.metrics = metrics;
         this.tx = tx;
         this.retry = retry;
         this.faults = faults;
@@ -198,7 +201,8 @@ public class ImportProcessor {
                 hook.afterRow(batchId, number);
                 if (chunk.rows() >= props.chunkSize()) {
                     months.addAll(chunk.months());
-                    errorBudget -= commit(organizationId, batchId, chunk, committedThrough, lastRow, context);
+                    errorBudget -= commit(
+                            organizationId, batchId, start.sourceType(), chunk, committedThrough, lastRow, context);
                     committedThrough = lastRow;
                     chunk = new Chunk(errorBudget);
                     if (context.stopRequested()) {
@@ -208,7 +212,7 @@ public class ImportProcessor {
             }
             if (!chunk.isEmpty()) {
                 months.addAll(chunk.months());
-                commit(organizationId, batchId, chunk, committedThrough, lastRow, context);
+                commit(organizationId, batchId, start.sourceType(), chunk, committedThrough, lastRow, context);
             }
         } catch (CsvEncodingException e) {
             throw new PermanentJobFailure(e.rowNumber() == 0 ? "invalid-encoding in the header" : e.getMessage(), e);
@@ -226,7 +230,13 @@ public class ImportProcessor {
      * land (a connection lost during COMMIT) a no-op instead of counting the chunk twice.
      */
     private int commit(
-            UUID organizationId, UUID batchId, Chunk chunk, int previousRow, int lastRow, JobContext context) {
+            UUID organizationId,
+            UUID batchId,
+            SourceType sourceType,
+            Chunk chunk,
+            int previousRow,
+            int lastRow,
+            JobContext context) {
         records.ensurePartitions(chunk.months()); // own short transactions, before this one
         retry.run(
                 "import.chunk",
@@ -252,6 +262,7 @@ public class ImportProcessor {
                     errorWriter.insert(organizationId, batchId, chunk.errors());
                     faults.at(FaultPoints.IMPORT_BEFORE_CHUNK_COMMIT);
                 }));
+        metrics.rows(sourceType, chunk.valid().size(), chunk.errorRows());
         faults.at(FaultPoints.IMPORT_AFTER_CHUNK_COMMIT);
         log.debug(
                 "Committed batch {} up to row {}: {} valid, {} invalid",

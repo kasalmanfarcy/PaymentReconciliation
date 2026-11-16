@@ -43,6 +43,7 @@ public class JobRunner {
     private final JobProperties props;
     private final TenantScope tenantScope;
     private final TransactionTemplate tx;
+    private final JobMetrics metrics;
     private final Map<String, JobHandler> handlers = new HashMap<>();
     private final AtomicBoolean stopping = new AtomicBoolean();
     /** Jobs whose heartbeat found the lease gone; their handlers stop at the next check. */
@@ -55,11 +56,13 @@ public class JobRunner {
             JobProperties props,
             TenantScope tenantScope,
             TransactionTemplate tx,
+            JobMetrics metrics,
             ObjectProvider<JobHandler> handlers) {
         this.store = store;
         this.props = props;
         this.tenantScope = tenantScope;
         this.tx = tx;
+        this.metrics = metrics;
         for (JobHandler h : handlers.orderedStream().toList()) {
             if (this.handlers.put(h.type(), h) != null) {
                 throw new IllegalStateException("Two job handlers for type " + h.type());
@@ -100,7 +103,11 @@ public class JobRunner {
      * workers at once (a zombie and its successor).
      */
     public Optional<Job> claim(String workerId, @Nullable Collection<UUID> organizations) {
-        return store.claim(workerId, props.lease(), props.perOrgMaxRunning(), organizations);
+        return store.claim(workerId, props.lease(), props.perOrgMaxRunning(), organizations)
+                .map(c -> {
+                    metrics.claimed(c.job().type(), c.waited());
+                    return c.job();
+                });
     }
 
     /** Runs one claimed job to an outcome: DONE, re-queued with backoff, FAILED, released, or abandoned. */
@@ -131,8 +138,10 @@ public class JobRunner {
         try {
             handler.handle(job, new Context(job));
             store.markDone(job.id(), job.workerId()); // no-op if the handler already completed it
+            metrics.completed(job.type(), "done");
         } catch (LeaseLostException e) {
             // Someone else owns the job now; whatever this worker had in flight was rolled back.
+            metrics.leaseLost(job.type());
             log.warn("Lease lost on job {}; another worker owns it now", job.id());
         } catch (JobDeferredException e) {
             store.defer(job.id(), job.workerId(), e.delay(), e.getMessage());
@@ -148,6 +157,7 @@ public class JobRunner {
                     var delay = Backoff.delay(
                             job.attempts(), props.baseBackoff(), props.maxBackoff(), ThreadLocalRandom.current());
                     store.reschedule(job.id(), job.workerId(), delay, describe(e));
+                    metrics.completed(job.type(), "retried");
                     log.warn(
                             "Job {} failed transiently (attempt {}), retrying in {}",
                             job.id(),
@@ -167,6 +177,7 @@ public class JobRunner {
     /** The handler's clean-up and the job's FAILED status in one transaction, fenced. */
     private void failPermanently(Job job, JobHandler handler, String reason, Exception cause) {
         log.error("Job {} failed permanently: {}", job.id(), reason, cause);
+        metrics.completed(job.type(), "failed");
         try {
             tx.executeWithoutResult(s -> {
                 handler.onPermanentFailure(job, reason);
@@ -224,6 +235,7 @@ public class JobRunner {
                         return true;
                     }));
             if (Boolean.TRUE.equals(done)) {
+                metrics.completed(job.type(), "failed");
                 failed++;
             }
         }

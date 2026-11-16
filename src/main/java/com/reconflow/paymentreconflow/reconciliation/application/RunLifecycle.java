@@ -55,6 +55,7 @@ public class RunLifecycle {
     private final DiscrepancyRecorder discrepancies;
     private final ImportActivity imports;
     private final AuditService audit;
+    private final RunMetrics metrics;
     private final Clock clock;
 
     RunLifecycle(
@@ -63,12 +64,14 @@ public class RunLifecycle {
             DiscrepancyRecorder discrepancies,
             ImportActivity imports,
             AuditService audit,
+            RunMetrics metrics,
             Clock clock) {
         this.runs = runs;
         this.jdbc = jdbc;
         this.discrepancies = discrepancies;
         this.imports = imports;
         this.audit = audit;
+        this.metrics = metrics;
         this.clock = clock;
     }
 
@@ -215,6 +218,7 @@ public class RunLifecycle {
                 .with("currencyMismatchCount", summary.currencyMismatchCount())
                 .with("excludedCount", summary.excludedCount()));
         log.info("Completed run {}: {}", run.getId(), summary);
+        metrics.completed(summary, took(run));
         return summary;
     }
 
@@ -230,6 +234,7 @@ public class RunLifecycle {
                 return;
             }
             run.fail(reason, clock.instant());
+            metrics.failed(took(run));
             audit.record(AuditEntry.of(AuditAction.RUN_FAILED, AuditEntityType.RECONCILIATION_RUN, runId)
                     .with("reason", run.getFailureReason())
                     .with("lastCompletedDate", dateOrNull(run.getLastCompletedDate())));
@@ -254,6 +259,12 @@ public class RunLifecycle {
                 .with("previousFailureReason", previousFailure)
                 .with("lastCompletedDate", dateOrNull(run.getLastCompletedDate())));
         return run;
+    }
+
+    private static java.time.Duration took(ReconciliationRun run) {
+        return run.getStartedAt() == null || run.getCompletedAt() == null
+                ? java.time.Duration.ZERO
+                : java.time.Duration.between(run.getStartedAt(), run.getCompletedAt());
     }
 
     private RunSummary summarize(RunContext run) {

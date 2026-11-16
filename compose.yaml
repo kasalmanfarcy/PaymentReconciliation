@@ -46,7 +46,7 @@ services:
   postgres:
     # Pinned to the same tag as TestcontainersConfiguration, so local runs and tests use one engine.
     # A floating tag ("postgres:16") can change underneath you between two runs.
-    image: postgres:16.4-alpine
+    image: postgres:18.6-alpine
     # pg_stat_statements (M9.6/M9.7): per-statement totals, the evidence behind every tuning change
     # and the Kafka decision (is the job claim among the top statements?). Enable once per database
     # with CREATE EXTENSION pg_stat_statements; preloading it costs a few hundred KB of shared memory.

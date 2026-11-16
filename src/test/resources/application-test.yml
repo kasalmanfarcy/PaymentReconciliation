@@ -18,6 +18,8 @@ logging:
     com.github.dockerjava: WARN
 
 reconflow:
+  cors:
+    allowed-origins: http://localhost:5173
   import:
     # Small chunks, so a 1,000-row fixture spans 10 chunk commits (M5.14, M5.25).
     chunk-size: 100

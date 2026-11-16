@@ -150,8 +150,9 @@ management:
         include: health,info,prometheus
   endpoint:
     health:
-      # Anonymous callers see only {"status":"UP"}; component details help attackers.
-      show-details: when-authorized
+      # M10: never on shared profiles: component details (database, storage) help attackers, and
+      # since M10.1 every Keycloak user would count as "authorized". application-local.yml shows them.
+      show-details: never
       probes:
         # /actuator/health/liveness and /readiness for the orchestrator.
         enabled: true
@@ -180,6 +181,10 @@ reconflow:
   bootstrap:
     # One-time: creates the first platform admin in a fresh environment (security.bootstrap).
     admin-email: ${RECONFLOW_BOOTSTRAP_ADMIN_EMAIL:}
+  cors:
+    # Origins allowed to call the API from a browser (M10). None by default; application-local.yml
+    # allows the future UI's dev server. Never "*".
+    allowed-origins: ""
   rate-limit:
     # M10.4, per user per organization, token buckets in memory on each API node (so N nodes allow
     # up to N times this). The exact protection is jobs.max-pending-per-org below.

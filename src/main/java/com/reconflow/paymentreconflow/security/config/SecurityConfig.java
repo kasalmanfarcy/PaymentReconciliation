@@ -8,6 +8,9 @@ import com.reconflow.paymentreconflow.shared.error.ProblemCodes;
 import com.reconflow.paymentreconflow.shared.error.ProblemDetailWriter;
 import com.reconflow.paymentreconflow.shared.error.ProblemDetails;
 import jakarta.servlet.DispatcherType;
+import java.time.Duration;
+import java.util.List;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.HttpStatus;
@@ -24,6 +27,10 @@ import org.springframework.security.oauth2.server.resource.web.authentication.Be
 import org.springframework.security.web.AuthenticationEntryPoint;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.access.AccessDeniedHandler;
+import org.springframework.security.web.header.writers.ReferrerPolicyHeaderWriter.ReferrerPolicy;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.CorsConfigurationSource;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
 
 /**
  * The security filter chain (authentication.plan §6): a stateless OAuth2 resource server. Since
@@ -55,6 +62,18 @@ class SecurityConfig {
                 // Bearer tokens aren't sent automatically by browsers, so CSRF can't use them, and
                 // since M10.1 there are no cookies at all (refresh tokens live with Keycloak's client).
                 .csrf(AbstractHttpConfigurer::disable)
+                // A JSON API renders nothing a browser should run or frame: a CSP that forbids
+                // everything, no referrer, and HSTS for a year (written only over HTTPS; behind a
+                // TLS-terminating proxy that needs server.forward-headers-strategy, M11). nosniff,
+                // X-Frame-Options DENY and Cache-Control: no-store are Spring Security's defaults.
+                .headers(headers -> headers.contentSecurityPolicy(
+                                csp -> csp.policyDirectives("default-src 'none'; frame-ancestors 'none'"))
+                        .referrerPolicy(referrer -> referrer.policy(ReferrerPolicy.NO_REFERRER))
+                        .httpStrictTransportSecurity(
+                                hsts -> hsts.includeSubDomains(true).maxAgeInSeconds(31_536_000)))
+                // Cross-origin calls only from the configured front-end origins (none by default),
+                // never "*": see corsConfigurationSource.
+                .cors(Customizer.withDefaults())
                 .httpBasic(AbstractHttpConfigurer::disable)
                 .formLogin(AbstractHttpConfigurer::disable)
                 .logout(AbstractHttpConfigurer::disable)
@@ -93,6 +112,28 @@ class SecurityConfig {
                         new TenantContextFilter(principalResolver, tenantLookup, problemWriter),
                         BearerTokenAuthenticationFilter.class);
         return http.build();
+    }
+
+    /**
+     * CORS with an explicit list of origins ({@code reconflow.cors.allowed-origins}, empty by
+     * default, so a deployed API answers no cross-origin request until someone decides it should).
+     * Bearer tokens, not cookies, so no credentials mode is needed; a wildcard origin would let any
+     * site read responses with a stolen token's help.
+     */
+    @Bean
+    CorsConfigurationSource corsConfigurationSource(
+            @Value("${reconflow.cors.allowed-origins:}") List<String> allowedOrigins) {
+        CorsConfiguration cors = new CorsConfiguration();
+        cors.setAllowedOrigins(allowedOrigins.stream().filter(o -> !o.isBlank()).toList());
+        cors.setAllowedMethods(List.of("GET", "POST", "PATCH", "OPTIONS"));
+        cors.setAllowedHeaders(List.of(
+                "Authorization", "Content-Type", "X-Organization-Id", "If-Match", "Idempotency-Key", "X-Request-Id"));
+        cors.setExposedHeaders(List.of("ETag", "Location", "Retry-After", "X-Request-Id", "RateLimit-Remaining"));
+        cors.setAllowCredentials(false);
+        cors.setMaxAge(Duration.ofHours(1));
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/api/**", cors);
+        return source;
     }
 
     /**

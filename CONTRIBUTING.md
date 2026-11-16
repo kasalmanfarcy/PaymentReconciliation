@@ -23,7 +23,8 @@
 
     <body: why the change was needed, wrapped at 72 columns>
 
-Types: `feat`, `fix`, `docs`, `test`, `refactor`, `build`, `ci`, `chore`.
+Types: `feat`, `fix`, `perf`, `docs`, `test`, `refactor`, `build`, `ci`, `chore`. `perf` is a
+change whose purpose is speed or resource use, backed by a measurement (M9.7).
 
 Scopes: the module (`organization`, `ingestion`, `ledger`, `reconciliation`,
 `exceptions`, `reporting`, `audit`, `security`, `shared`) or `repo` for

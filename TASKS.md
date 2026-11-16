@@ -286,13 +286,13 @@ Built early so later milestones emit events as they go, instead of retrofitting 
 
 ## M10 — Security hardening
 
-- [ ] **M10.1** Migrate login to OIDC with a Keycloak container in Compose. Only the security package should change; if anything outside it has to change, that's a design lesson worth writing down. Write a comparison ADR covering what we built in M3.3, what Keycloak gives us, and what each costs.
-- [ ] **M10.2** CSV injection protection on export: escape cells that start with `=`, `+`, `-` or `@`.
-- [ ] **M10.3** Upload limits enforced at the servlet level as well as in code.
-- [ ] **M10.4** Rate limiting on the upload and run endpoints.
-- [ ] **M10.5** Dependency vulnerability scanning in CI (OWASP Dependency-Check or GitHub Dependabot).
-- [ ] **M10.6** Review logs for PII and financial data, and mask references where appropriate.
-- [ ] **M10.7** Least-privilege DB roles: separate users for migrations and for the application.
+- [x] **M10.1** Migrate login to OIDC with a Keycloak container in Compose. Only the security package should change; if anything outside it has to change, that's a design lesson worth writing down. Write a comparison ADR covering what we built in M3.3, what Keycloak gives us, and what each costs.
+- [x] **M10.2** CSV injection protection on export: escape cells that start with `=`, `+`, `-` or `@`.
+- [x] **M10.3** Upload limits enforced at the servlet level as well as in code.
+- [x] **M10.4** Rate limiting on the upload and run endpoints.
+- [x] **M10.5** Dependency vulnerability scanning in CI (OWASP Dependency-Check or GitHub Dependabot).
+- [x] **M10.6** Review logs for PII and financial data, and mask references where appropriate.
+- [x] **M10.7** Least-privilege DB roles: separate users for migrations and for the application.
 
 **Exit criteria:** a security checklist in `docs/security.md` is complete, with each item linked to its test or config.
 

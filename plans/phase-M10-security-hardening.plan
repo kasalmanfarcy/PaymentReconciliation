@@ -1,6 +1,6 @@
 # Phase M10 — Security hardening
 
-**Status:** Not started · **Tasks:** TASKS.md M10.1–M10.7 · **Depends on:** M3 (auth, tenant context, RLS), M5 (uploads), M8 (CSV export), M9 (rate-sensitive endpoints, metrics) · **Date:** 2026-11-01
+**Status:** Done (2026-11-16; as built: §9) · **Tasks:** TASKS.md M10.1–M10.7 · **Depends on:** M3 (auth, tenant context, RLS), M5 (uploads), M8 (CSV export), M9 (rate-sensitive endpoints, metrics) · **Date:** 2026-11-01
 
 By this point the system works end to end. M10 doesn't add features; it removes ways to abuse the features that exist. Every control added here has to be backed by a test or a config file, linked from `docs/security.md`. A control that you can't point to is a control you only think you have.
 
@@ -803,17 +803,17 @@ One rule for the whole phase: **every security test must fail first.** Break the
 
 ## 6. Exit criteria checklist
 
-- [ ] Login goes through Keycloak; in-house auth code and tests are removed; contract migration written
-- [ ] Cross-tenant suite passes unchanged after M10.1
-- [ ] ADR comparing M3.3 and Keycloak merged, with the "changed outside `security/`" list
-- [ ] Exported CSVs escape formula characters in free-text columns; numbers stay numeric
-- [ ] Oversized uploads get `413` from the container, with a `ProblemDetail`
-- [ ] Upload and run endpoints return `429` + `Retry-After`; per-org pending-job cap enforced exactly
-- [ ] Dependabot, dependency review on PRs, weekly Dependency-Check, push protection enabled
-- [ ] Logging policy written; `LogLeakIT` passes
-- [ ] App connects as `reconflow_app`; RLS proven against it; audit tables can't be updated or deleted
-- [ ] Security headers and actuator exposure verified by tests
-- [ ] `docs/security.md` complete, every row linked to its config and test
+- [x] Login goes through Keycloak; in-house auth code and tests are removed; contract migration written
+- [x] Cross-tenant suite passes unchanged after M10.1
+- [x] ADR comparing M3.3 and Keycloak merged, with the "changed outside `security/`" list
+- [x] Exported CSVs escape formula characters in free-text columns; numbers stay numeric
+- [x] Oversized uploads get `413` from the container, with a `ProblemDetail`
+- [x] Upload and run endpoints return `429` + `Retry-After`; per-org pending-job cap enforced exactly
+- [x] Dependabot, dependency review on PRs, weekly Dependency-Check configured (enabling them and push protection on GitHub is a user step: docs/security.md §3)
+- [x] Logging policy written; `LogLeakIT` passes
+- [x] App connects as `reconflow_app`; RLS proven against it; audit tables can't be updated or deleted
+- [x] Security headers and actuator exposure verified by tests
+- [x] `docs/security.md` complete, every row linked to its config and test
 
 **`docs/security.md` format.** One table, one row per control, nothing claimed without a link:
 
@@ -881,3 +881,30 @@ Dependabot proposes upgrades. Dependency review blocks a PR that introduces a kn
 - **Exposing `env`, `heapdump` or `configprops`** "for debugging".
 - **Security controls with no test**, or tests that were never seen failing.
 - **A `docs/security.md` that claims more than the code does.** Every row needs a link, and accepted risks are listed honestly.
+
+---
+
+## 9. As built: where the code differs from this plan, and why
+
+docs/ win over this plan wherever they disagree (api-design.md §3.1's error codes, the CSV-export decisions of M8, ADR 0004's queue). Built in the plan's recommended order (M10.5, M10.7, M10.3, M10.2, M10.4, M10.6, M10.1), one commit per task, then the cross-cutting controls. Every control has a row in [docs/security.md](../docs/security.md) with its config and its test; the security tests were seen failing with the control removed (escape, audience, pgjdbc setting).
+
+| Plan said | Built | Why |
+|---|---|---|
+| **M10.5** Dependabot (maven, actions, docker), dependency review, weekly Dependency-Check | All three, plus `dependency-submission.yml` (the resolved Maven tree on pushes to `main`), gitleaks over the full history on every PR (`secret-scan.yml`, `.gitleaks.toml`) and Trivy over the packaged jar in the weekly workflow. Dependabot watches `docker-compose` (no Dockerfile until M11.1). The Dependency-Check plugin is configured in the pom (threshold CVSS 7, suppressions with reasons and expiry) | The plan's own "secret scanning" and "image scan" items, wired into CI where they can run without an account; locally gitleaks found only two `Idempotency-Key` examples (allowlisted) and Trivy found nothing at MEDIUM or above. Enabling Dependabot, secret scanning/push protection and adding `NVD_API_KEY` are repository settings (docs/security.md §3) |
+| **M10.7** Roles, grants migration, Spring credentials, Testcontainers as `reconflow_app` | As planned (`infra/db/bootstrap-roles.sql`, `V10__app_role_grants.sql`), plus: `TEMPORARY` on the database (the engine's temp table), every `transaction_record` partition revoked from the app (a partition has no policy of its own) with narrow `SECURITY DEFINER` functions for create, drop, `ANALYZE`, the default-partition count and archival's organization list; compose runs the same script on first init; Testcontainers runs the *committed* script with `psql` in the container; fixtures use a separate superuser pool (`support.TestDatabase`) | A non-owner's `ANALYZE` silently skips the table, and a partition queried by name bypassed RLS. Switching the suite to the real role found two production bugs: the duplicate-upload fast path and `run-in-progress`'s `existingRunId` ran lookups outside a transaction, so under RLS they saw nothing (one surfaced as a `500`). `RlsProbe` now asserts it runs on an unprivileged app connection instead of `SET ROLE`-ing |
+| **M10.3** `max-swallow-size: 2MB`, `location`, code `upload-too-large` | `max-swallow-size` stays 100 MB; no custom `location`; code `file-too-large` (api-design.md §3.1); one `RECONFLOW_MAX_UPLOAD` variable for both layers and `UploadLimitsCheck` refusing to start if they disagree; `max-http-form-post-size: 2MB`, `connection-timeout: 20s` | 2 MB turns the documented `413` into a connection reset for any honestly oversized file (accepted risk R-02 until a proxy caps bodies in M11); a non-existent `location` directory fails every upload |
+| **M10.2** `shared/csv/SpreadsheetSafe`, `QuoteMode.ALL` | Kept M8.4's `reporting.export.CsvCell` (broader: leading spaces, LF, full-width forms) and minimal quoting; added `ExportInjectionIT`, the end-to-end proof through upload, import, run and export | Already built and documented in M8; the archive CSVs are deliberately not escaped (restore data must stay byte-exact) |
+| **M10.4** Pending-job check in `ImportService`; capacities in the enum | The exact cap is in `shared.jobs.JobQueue.enqueue` (every user-initiated job: imports, runs, exports, retries), with `V11`'s partial index; capacities in `reconflow.rate-limit.*`; `RateLimit-Remaining` on accepted requests; the interceptor takes `ObjectProvider`s | One place guards the queue whatever creates work; `@WebMvcTest` slices pick up interceptors and must still start. The claim-plan test now accepts either partial index of live jobs |
+| **M10.6** `Masked`, policy, canary test | All three, and the main fix at the source: pgjdbc `logServerErrorDetail: false`, because PostgreSQL's `DETAIL` and pgjdbc's failed-batch messages carried emails and whole raw CSV rows into exception messages. Log level raised programmatically in `LogLeakIT` (shared context). MDC keeps only `requestId` | A sanitizer in front of every logger would be easier to bypass than removing the data where it enters |
+| **M10.1** Keycloak `26.4`; `keycloak-admin-client`; dual-issuer period optional; contract migration as `V<next>`; tests with `jwt()` and `testcontainers-keycloak` | Keycloak `26.8.2` (current); the Admin API through `RestClient` (five calls); switched directly (dual-issuer explained in ADR 0015); the contract step written as `infra/db/contract/drop_in_house_auth.sql`, not a numbered migration, so it can't run before its release; integration tests sign tokens with a stand-in OIDC issuer (`support.TestIssuer`) validated by the real `issuer-uri` decoder, and `KeycloakIT` runs the committed realm in a plain `GenericContainer` | `keycloak-admin-client` drags RESTEasy and a second Jackson onto the Boot 4 classpath; a numbered contract migration would be applied by the next deploy; `jwt()` would skip signature, `iss` and `aud` checks entirely, and one less dependency |
+| — | Realm details found while building: the audience mapper (default `aud` is `account`), the `kc-admin-api` scope (Keycloak 26.6+ rejects Admin API tokens without its audience), first and last name on every account (the user profile requires them, or login stops at "Account is not fully set up") | Each one was a `401` before it was a test |
+| Bootstrap with a temporary password | The bootstrap runner makes an email the platform admin and generates no password; the operator creates the Keycloak account with a verified email and the first login links it | No secret is ever logged (the M3 runner printed one once) |
+| — | `mustChangePassword` removed from member responses; `invalid-credentials`, `password-policy`, `password-change-required` removed from the catalogue; `identity-provider-unavailable` (503) added | Keycloak owns those states now; docs updated with the code |
+| Cross-cutting: headers, actuator | CSP, `Referrer-Policy`, HSTS, explicit CORS allow-list (none by default), health details `never` outside `local`; `SecurityHeadersIT`. `forward-headers-strategy` left to M11 with the proxy | Behind no proxy yet, trusting forwarded headers would let any client spoof its scheme and IP |
+
+Changed outside `security/` for M10.1 (the full list is in ADR 0015): configuration, compose, scripts and k6, `audit.AuditAction.USER_LINKED`, `shared.error.ProblemCodes`. No business module changed, and the cross-tenant and authorization-matrix suites passed without edits.
+
+Tests added: `AppRolePrivilegesIT`, `ExportInjectionIT`, `UploadLimitsCheckTest`, `RateLimitIT`, `LogLeakIT`, `MaskedTest`, `KeycloakIT`, `SecurityHeadersIT`, new cases in `UploadSizeLimitIT`, `ResourceServerIT`, `MemberManagementIT`, `LocalSeederIT`, `SecurityAuditIT`. Deleted with the in-house login (M10.1): `LoginIT`, `SessionFlowIT`, `BruteForceProtectionIT`, `AuthenticationChecklistIT`, `LoginRateLimiterTest`, `PasswordStorageTest`, `RefreshTokenServiceIT`, `JwtKeyConfigTest` (42 test methods; ADR 0015 maps each behaviour to the Keycloak setting that now provides it).
+
+Not done here: enabling the GitHub-side settings and the first scheduled Dependency-Check run (repository owner, docs/security.md §3); a deployed realm without the password grant, Keycloak on PostgreSQL with TLS, an edge body-size and per-IP limit, `forward-headers-strategy` and an image scan (M11).
+

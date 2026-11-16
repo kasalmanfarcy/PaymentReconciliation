@@ -1,6 +1,6 @@
 # Authentication & Authorization — Architecture Plan
 
-**Status:** Draft (revised twice on 2026-10-29 — see §12 and §13 for the change logs) · **Tasks:** TASKS.md M3.3 (build in-house), M10.1 (migrate to Keycloak) · **Date:** 2026-10-29
+**Status:** Built in M3.3, replaced by Keycloak in M10.1 ([ADR 0015](../docs/adr/0015-delegate-authentication-to-keycloak.md)); kept as the design record (revised twice on 2026-10-29 — see §12 and §13) · **Tasks:** TASKS.md M3.3 (build in-house), M10.1 (migrate to Keycloak) · **Date:** 2026-10-29
 
 This is the full design for the in-house authentication built in M3.3. It's structured so that M10's move to Keycloak replaces only the parts that issue tokens.
 

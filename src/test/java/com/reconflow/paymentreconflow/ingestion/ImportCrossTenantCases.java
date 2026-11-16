@@ -50,6 +50,14 @@ class ImportCrossTenantCases implements CrossTenantCases {
                         "/api/v1/imports/{id}/errors",
                         f -> Map.of("id", f.orgBBatch()),
                         null,
+                        NOT_FOUND),
+                // Org B's failed batch must stay FAILED, its job count unchanged (the snapshot).
+                new CrossTenantCase(
+                        "retry org B's failed import",
+                        HttpMethod.POST,
+                        "/api/v1/imports/{id}/retry",
+                        f -> Map.of("id", f.orgBFailedBatch()),
+                        f -> Map.of("reason", "hijack"),
                         NOT_FOUND));
     }
 }

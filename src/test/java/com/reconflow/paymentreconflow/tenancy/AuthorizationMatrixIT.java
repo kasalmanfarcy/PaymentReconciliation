@@ -77,6 +77,12 @@ class AuthorizationMatrixIT extends AbstractIntegrationTest {
                         .param("sourceType", "INTERNAL_LEDGER")),
         new Endpoint("GET /imports", Permission.IMPORT_READ, target -> get("/api/v1/imports")),
         new Endpoint(
+                "POST /imports/{id}/retry",
+                Permission.IMPORT_CREATE,
+                target -> post("/api/v1/imports/" + target.batchId() + "/retry")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"reason\":\"storage outage\"}")),
+        new Endpoint(
                 "GET /transactions",
                 Permission.TRANSACTION_READ,
                 target -> get("/api/v1/transactions?transactionDateFrom=2026-10-01&transactionDateTo=2026-10-31")),

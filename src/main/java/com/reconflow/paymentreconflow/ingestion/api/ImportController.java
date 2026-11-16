@@ -2,12 +2,16 @@ package com.reconflow.paymentreconflow.ingestion.api;
 
 import com.reconflow.paymentreconflow.ingestion.application.ImportQueries;
 import com.reconflow.paymentreconflow.ingestion.application.ImportReceiver;
+import com.reconflow.paymentreconflow.ingestion.application.ImportRetryService;
 import com.reconflow.paymentreconflow.ingestion.application.ImportView;
 import com.reconflow.paymentreconflow.ingestion.application.RowErrorView;
 import com.reconflow.paymentreconflow.ingestion.domain.ImportBatchStatus;
 import com.reconflow.paymentreconflow.ledger.SourceType;
 import com.reconflow.paymentreconflow.shared.context.Permission;
 import com.reconflow.paymentreconflow.shared.context.RequiresPermission;
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
 import java.net.URI;
 import java.util.List;
 import java.util.UUID;
@@ -18,6 +22,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RequestPart;
@@ -35,12 +40,17 @@ class ImportController {
     /** Seconds a client should wait before polling a batch that isn't finished (ADR 0003). */
     static final String RETRY_AFTER_SECONDS = "2";
 
+    /** A retry must say why (requirements.md FR-08); it goes into the audit trail. */
+    record RetryRequest(@NotBlank @Size(max = 1000) String reason) {}
+
     private final ImportReceiver receiver;
     private final ImportQueries queries;
+    private final ImportRetryService retries;
 
-    ImportController(ImportReceiver receiver, ImportQueries queries) {
+    ImportController(ImportReceiver receiver, ImportQueries queries, ImportRetryService retries) {
         this.receiver = receiver;
         this.queries = queries;
+        this.retries = retries;
     }
 
     /**
@@ -85,6 +95,17 @@ class ImportController {
             @RequestParam(defaultValue = "0") int page,
             @RequestParam(defaultValue = "50") int size) {
         return new PagedModel<>(queries.errors(id, page, size));
+    }
+
+    /** 202 like the upload: the batch is RECEIVED again and its new job is queued. */
+    @PostMapping("/{id}/retry")
+    @RequiresPermission(Permission.IMPORT_CREATE)
+    ResponseEntity<ImportView> retry(@PathVariable UUID id, @Valid @RequestBody RetryRequest request) {
+        ImportView batch = retries.retry(id, request.reason());
+        return ResponseEntity.accepted()
+                .location(URI.create("/api/v1/imports/" + batch.id()))
+                .header("Retry-After", RETRY_AFTER_SECONDS)
+                .body(batch);
     }
 
     /** {@code Retry-After: 2} while the batch is RECEIVED or PROCESSING: how often to poll. */

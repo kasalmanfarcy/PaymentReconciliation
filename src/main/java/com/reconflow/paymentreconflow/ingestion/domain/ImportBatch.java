@@ -148,6 +148,22 @@ public class ImportBatch implements Persistable<UUID> {
         updatedAt = now;
     }
 
+    /**
+     * An explicit retry (M5.20): back to RECEIVED with every counter, the checkpoint, the reason
+     * and the timestamps cleared, to reprocess from row 1. The caller deletes the batch's records
+     * and row errors in the same transaction.
+     */
+    public void resetForRetry(Instant now) {
+        transitionTo(ImportBatchStatus.RECEIVED, now); // throws unless FAILED
+        totalRows = 0;
+        validRows = 0;
+        errorRows = 0;
+        lastCommittedRow = 0;
+        failureReason = null;
+        startedAt = null;
+        completedAt = null;
+    }
+
     /** {@code FAILED} with the reason users see: a short code, never a stack trace. */
     public void fail(String reason, Instant now) {
         transitionTo(ImportBatchStatus.FAILED, now);

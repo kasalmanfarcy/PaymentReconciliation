@@ -69,4 +69,22 @@ class ArchitectureRulesTest {
                 .resideInAPackage(ROOT + ".audit.internal..")
                 .check(classes);
     }
+
+    @Test
+    void identityIsReadOnlyThroughCurrentUserAndTenantContext() {
+        // M3.3i: one seam. Business code asks shared.context.CurrentUser / TenantContext, never the
+        // SecurityContext, an Authentication's JWT, or the resource server. M10 replaces what's
+        // behind the seam (Keycloak) and nothing outside security notices; tests bind a tenant
+        // without building a JWT; workers bind one from a job row.
+        noClasses()
+                .that()
+                .resideOutsideOfPackage(ROOT + ".security..")
+                .should()
+                .dependOnClassesThat()
+                .resideInAnyPackage(
+                        "org.springframework.security.core.context..",
+                        "org.springframework.security.oauth2.jwt..",
+                        "org.springframework.security.oauth2.server.resource..")
+                .check(classes);
+    }
 }

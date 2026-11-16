@@ -4,6 +4,7 @@ import com.reconflow.paymentreconflow.security.auth.AuthService.ChangeResult;
 import com.reconflow.paymentreconflow.security.token.RefreshCookies;
 import com.reconflow.paymentreconflow.security.token.RefreshService;
 import com.reconflow.paymentreconflow.security.user.MembershipQueries.MembershipSummary;
+import com.reconflow.paymentreconflow.shared.context.CurrentUser;
 import com.reconflow.paymentreconflow.shared.error.ProblemCodes;
 import com.reconflow.paymentreconflow.shared.error.ProblemDetails;
 import jakarta.servlet.http.HttpServletRequest;
@@ -17,8 +18,6 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
-import org.springframework.security.core.annotation.AuthenticationPrincipal;
-import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.web.bind.annotation.CookieValue;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -59,12 +58,19 @@ class AuthController {
     private final RefreshService refresh;
     private final RefreshCookies cookies;
     private final LoginRateLimiter rateLimiter;
+    private final CurrentUser currentUser;
 
-    AuthController(AuthService auth, RefreshService refresh, RefreshCookies cookies, LoginRateLimiter rateLimiter) {
+    AuthController(
+            AuthService auth,
+            RefreshService refresh,
+            RefreshCookies cookies,
+            LoginRateLimiter rateLimiter,
+            CurrentUser currentUser) {
         this.auth = auth;
         this.refresh = refresh;
         this.cookies = cookies;
         this.rateLimiter = rateLimiter;
+        this.currentUser = currentUser;
     }
 
     @PostMapping(path = "/login", consumes = MediaType.APPLICATION_JSON_VALUE)
@@ -120,11 +126,9 @@ class AuthController {
     }
 
     @PostMapping(path = "/change-password", consumes = MediaType.APPLICATION_JSON_VALUE)
-    ResponseEntity<?> changePassword(
-            @AuthenticationPrincipal Jwt jwt,
-            @Valid @RequestBody ChangePasswordRequest request,
-            HttpServletRequest http) {
-        UUID userId = UUID.fromString(jwt.getSubject());
+    ResponseEntity<?> changePassword(@Valid @RequestBody ChangePasswordRequest request, HttpServletRequest http) {
+        // The caller as TenantContextFilter resolved it (an active user), not the raw JWT.
+        UUID userId = currentUser.id();
         return switch (auth.changePassword(
                 userId, request.currentPassword(), request.newPassword(), ClientInfo.of(http))) {
             case ChangeResult.Changed c ->

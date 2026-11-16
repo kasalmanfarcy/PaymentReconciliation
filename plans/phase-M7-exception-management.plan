@@ -1,0 +1,1125 @@
+# Phase M7 — Exception Management
+
+**Status:** Not started · **Tasks:** TASKS.md M7.1–M7.18 · **Depends on:** M3 (tenant context, permissions), M4 (audit), M6 (exception cases created by `DiscrepancyRecorder`) · **Date:** 2026-11-01
+
+M6 finds discrepancies. This phase lets people **work** them: look at both sides, assign an owner, write investigation notes, resolve with a reason, and reopen when a resolution turns out to be wrong. It answers the fourth of the README's questions: *who investigated it, and how was it resolved?*
+
+Three promises drive the design:
+
+1. **No silent overwrites.** If two people act on the same case at once, one succeeds and the other is told, with `409`, that they acted on stale data.
+2. **Nothing is forgotten.** Notes and status history are append-only. Reopening a case never erases how it was resolved before.
+3. **One rulebook.** Every status change goes through one state machine that checks the transition, the permission and the required reason, and writes history and audit in the same transaction.
+
+---
+
+## 1. Goal
+
+When this phase is done:
+
+- `GET /api/v1/exceptions` lists cases with filters (type, status, assignee, run, date range, amount range), paginated.
+- `GET /api/v1/exceptions/{id}` shows the case, **both source records side by side**, its notes, its status history, and an `ETag`.
+- `PATCH /api/v1/exceptions/{id}` assigns or moves the case between `OPEN` and `IN_REVIEW`, guarded by `If-Match`.
+- `POST …/notes`, `POST …/resolve` and `POST …/reopen` work, each with its permission and reason rules.
+- `GET /api/v1/audit-events?entityType=&entityId=` returns the timeline of one entity.
+- Tests prove: two concurrent resolves give exactly one `200` and one `409`; invalid transitions are rejected; each role can do exactly what the matrix allows; a reopen keeps the earlier resolution visible; another tenant's cases are invisible (`404`).
+
+**Demo:** run reconciliation on the sample files, then as an investigator: list open exceptions → open `PAY-103` (ledger 750.00 vs gateway 700.00) → assign it to yourself → move it to `IN_REVIEW` → add a note → resolve with `GATEWAY_FEE`. As an org admin: reopen it with a reason. Show the detail view's history (both the resolution and the reopen) and the audit timeline.
+
+---
+
+## 2. Concepts to understand first
+
+### 2.1 State machines
+
+A **state machine** is a fixed set of states plus a fixed set of allowed transitions between them. Anything not in the table is forbidden. Writing the table down (phase-M1 §4.7) and enforcing it in **one place** gives you:
+
+- **Correctness by construction.** "Resolve an already-resolved case" can't happen, because `RESOLVED → RESOLVED` isn't in the table.
+- **One place to attach rules.** Who may make the transition, whether a reason is required, which audit event it emits.
+- **Testability.** You can test every cell of the table (allowed and forbidden) in a table-driven unit test.
+
+The anti-pattern is `exceptionCase.setStatus(RESOLVED)` scattered across controllers and services. Six months later nobody knows which paths check permissions.
+
+The exception case machine (from phase-M1 §4.7):
+
+```mermaid
+stateDiagram-v2
+    [*] --> OPEN : engine creates (M6)
+    OPEN --> IN_REVIEW : start review
+    IN_REVIEW --> OPEN : back to open (reason)
+    OPEN --> RESOLVED : resolve (code, note if required)
+    IN_REVIEW --> RESOLVED : resolve (code, note if required)
+    RESOLVED --> OPEN : reopen (org admin, reason)
+```
+
+Assigning and adding notes don't change the status, so they aren't transitions.
+
+`OPEN → RESOLVED` is allowed directly. An investigator who can tell at a glance that a case is a known timing difference shouldn't have to click "start review" first. The resolution code and note are the evidence, not the intermediate state.
+
+### 2.2 The lost-update problem
+
+Two investigators open case 42 at 10:00. Both see status `IN_REVIEW`.
+
+```
+10:01  Alice: resolve as GATEWAY_FEE          → saved
+10:02  Bob:   resolve as DATA_ENTRY_ERROR     → saved, overwrites Alice
+```
+
+Alice's resolution is gone and nobody was told. That's a **lost update**. Database transactions alone don't prevent it, because the two writes are in **separate** transactions minutes apart: each transaction is perfectly consistent on its own. The conflict exists at the level of the *user's read → think → write* cycle, which spans HTTP requests.
+
+### 2.3 Optimistic versus pessimistic locking
+
+| | Pessimistic | Optimistic |
+|---|---|---|
+| Idea | Lock the row when you read it; others wait | Don't lock; detect at write time that someone else changed it |
+| Mechanism | `SELECT … FOR UPDATE` | A `version` column checked in `UPDATE … WHERE version = ?` |
+| Across HTTP requests | **Impossible**: a lock can't outlive the transaction, and holding a transaction open while a user thinks for 5 minutes is out of the question | Natural: the client carries the version it saw |
+| Conflict cost | Waiting | The loser gets an error and retries |
+| Good when | Conflicts are frequent and short (inside one transaction) | Conflicts are rare and the "think time" is long |
+
+Exceptions are edited by humans, rarely at the same moment, with long think time. **Optimistic locking** is the right choice (ADR 0007).
+
+### 2.4 How `@Version` works in Hibernate
+
+```java
+@Version
+private long version;
+```
+
+When Hibernate flushes a change to a versioned entity, it issues:
+
+```sql
+UPDATE exception_case
+   SET status = ?, resolution_code = ?, ..., version = 8
+ WHERE id = ? AND version = 7;
+```
+
+If the row's version is no longer 7 (someone else committed in between), the `UPDATE` affects **0 rows**. Hibernate notices and throws `OptimisticLockException`, which Spring translates to `ObjectOptimisticLockingFailureException`. Your handler maps it to `409`.
+
+**The trap, and the most important thing in this phase.** In a REST API, each request loads the entity **fresh**. The loaded entity has the *current* version (say 8), not the version the client saw (7). Hibernate compares the loaded version with the database, which match. So `@Version` on its own catches only races *within the few milliseconds of one request*, not the minutes between Bob's `GET` and his `POST`.
+
+To catch the real race, the client must send the version it saw, and the server must compare it **explicitly** before applying the change:
+
+```java
+if (exceptionCase.getVersion() != expectedVersion) {
+    throw new StaleVersionException(exceptionCase.getVersion());   // → 409
+}
+```
+
+You need **both**: the explicit compare catches the slow race (Bob's stale page), and `@Version` catches the fast race (two requests that both pass the compare in the same millisecond, then both try to commit).
+
+### 2.5 `ETag` and `If-Match`
+
+HTTP has a standard way to carry "the version I saw":
+
+- The server sends the version as an **`ETag`** response header on `GET`: `ETag: "7"`.
+- The client sends it back on writes as **`If-Match: "7"`**.
+- If it doesn't match, the server refuses.
+
+Decisions (phase-M1 §6, ADR 0007):
+
+| Situation | Response | Code |
+|---|---|---|
+| `If-Match` missing on `PATCH` / `resolve` / `reopen` | `428 Precondition Required` | `precondition-required` |
+| `If-Match` doesn't match the current version | `409 Conflict`, body includes `currentVersion` | `stale-version` |
+| Concurrent commit detected by `@Version` | `409 Conflict` | `stale-version` |
+
+Strict HTTP says a failed `If-Match` is `412 Precondition Failed`. The project uses `409` to follow TASKS.md, and ADR 0007 records `412` as the alternative. Be ready to explain that choice in an interview: it's a defensible convention, and knowing the strict answer shows you know the spec.
+
+The ETag here is a **strong validator** built from `version`, not a hash of the body. The version changes on every write to the case, which is exactly the property needed.
+
+### 2.6 JSON Merge Patch
+
+`PATCH` with `Content-Type: application/merge-patch+json` (RFC 7396) means: *the fields present in the body are set; fields absent are unchanged; a field set to `null` is cleared.*
+
+```json
+{ "assignedTo": "0192f3a1-…" }      // assign
+{ "assignedTo": null }               // unassign
+{ "status": "IN_REVIEW" }            // start review
+{ "status": "OPEN", "reason": "Waiting for gateway support reply" }
+```
+
+Distinguishing "absent" from "explicitly null" means you can't deserialize straight into a record with nullable fields. Read the body as a `JsonNode` (Jackson 3: `tools.jackson.databind.JsonNode`) and check `has("assignedTo")`.
+
+### 2.7 Append-only history versus mutable state
+
+`exception_case` holds the **current** state and is mutable. `exception_status_history` and `exception_note` hold **what happened** and must never change. V1 already applies that to `audit_event` with triggers; this phase does the same for the two history tables.
+
+Why both `exception_status_history` *and* `audit_event`? They answer different questions (V1 comments explain this):
+
+| Table | Question | Shape |
+|---|---|---|
+| `exception_status_history` | "What happened to this case?" | Typed columns (`from_status`, `to_status`, `resolution_code`), cheap to query and show in the UI |
+| `audit_event` | "Who did what, anywhere in the system?" | Generic, JSON payload, for compliance and cross-entity timelines |
+
+Both are written in the same transaction as the change, so they can't disagree.
+
+---
+
+## 3. Starting point
+
+V1 created every table this phase needs, and M6 added the gaps:
+
+| Table | Exists since | Relevant contents |
+|---|---|---|
+| `exception_case` | V1 | `type`, `reason_code`, `discrepancy_key`, `status` CHECK, `assigned_to`, `resolution_code`/`note`/`resolved_by`/`resolved_at`, `version BIGINT`, CHECK that resolution fields are set **exactly** when `RESOLVED` |
+| `exception_case_active_uk` | V1 | Partial unique index: one non-`RESOLVED` case per `(organization_id, discrepancy_key)` |
+| `exception_case_record` | V1 | Links a case to 1..n `transaction_record` rows (with `transaction_date` for the partitioned FK) |
+| `exception_note` | V1 | `author_id`, `body` (non-blank CHECK) |
+| `exception_status_history` | V1 | `from_status`, `to_status`, `reason`, `resolution_code`, `resolution_note`, `actor_id` |
+| `exception_case.amount` | M6 migration | Amount at stake: drives amount filters |
+| `exception_case_run` | M6 migration | Every run that observed a case: drives the run filter |
+
+M6 also created the **public API** of the `exceptions` module (top-level package): `DiscrepancyRecorder`, `Discrepancy`, `RecordRef`, `ExceptionType`, `RunExceptionSummary`, with the implementation in `exceptions/internal/`. The recorder already inserts the `OPEN` case, its first history row (`NULL → OPEN`) and the `EXCEPTION_CREATED` audit event. This phase builds everything people do after that.
+
+From earlier phases: `TenantContext` / `CurrentUser` / `Permission` (interfaces in `shared`, M3), `AuditService.record(...)` with `Propagation.MANDATORY` and the `AuditAction` enum that already lists the `EXCEPTION_*` actions (M4), `ProblemDetail` handling with `type = https://reconflow.dev/problems/<code>` (M2.10), the cross-tenant test registry `CrossTenantCase` (M3.9), and RLS on every tenant table (M3.5).
+
+**Gaps this phase closes** (one new migration, next free version):
+
+1. Append-only triggers on `exception_note` and `exception_status_history`.
+2. An index for the assignee list query that includes unassigned cases, if `EXPLAIN` shows it's needed (M7.6).
+
+Package layout:
+
+```
+com.reconflow.paymentreconflow.exceptions
+  DiscrepancyRecorder, Discrepancy, RecordRef, ExceptionType, ...   (public API, from M6)
+  internal/
+    api/          ExceptionController, ExceptionNoteController,
+                  ExceptionListQuery, ExceptionSummaryResponse,
+                  ExceptionDetailResponse, ResolveRequest, ReopenRequest, NoteRequest
+    application/  ExceptionCommandService     (assign, review, resolve, reopen, note)
+                  ExceptionQueryService       (list, detail)
+                  ExceptionStateMachine       (the only place status changes)
+                  IfMatch                     (parse and compare the header)
+    domain/       ExceptionCase, ExceptionStatus, ExceptionNote,
+                  ExceptionStatusHistory, ResolutionCode, Transition
+    persistence/  ExceptionCaseRepository, ExceptionNoteRepository,
+                  ExceptionHistoryRepository, ExceptionListQueries (JdbcClient)
+
+com.reconflow.paymentreconflow.audit
+  internal/api/   AuditEventController        (M7.13)
+```
+
+Controllers live under `internal/`: Spring Modulith only restricts **Java type** dependencies between modules, and nothing outside the module should call a controller.
+
+---
+
+## 4. Step by step
+
+Build order: **M7.1 → M7.2 → M7.4 → M7.5** (domain and rules, unit-testable without HTTP) → **M7.7 → M7.6** (reads) → **M7.8 → M7.9 → M7.10 → M7.11** (writes) → **M7.12** (verify audit everywhere) → **M7.13** → tests **M7.14–M7.18**. M7.3 is a verification task you do alongside M7.11.
+
+---
+
+### M7.1 — `exception_case` entity
+
+**What.** Map `exception_case` as a JPA entity with `@Version`, and put the state-changing methods on it.
+
+**Why.** The entity is the aggregate root for the workflow: notes, history and links all hang off it, and every change to it goes through one versioned row.
+
+**How.**
+
+```java
+@Entity
+@Table(name = "exception_case")
+public class ExceptionCase {
+
+    @Id private UUID id;
+    @Column(name = "organization_id", nullable = false, updatable = false) private UUID organizationId;
+    @Column(name = "run_id", nullable = false, updatable = false)          private UUID runId;
+
+    @Enumerated(EnumType.STRING) @Column(nullable = false, updatable = false)
+    private ExceptionType type;
+
+    @Column(name = "reason_code", updatable = false)       private String reasonCode;
+    @Column(name = "discrepancy_key", nullable = false, updatable = false) private String discrepancyKey;
+
+    @Enumerated(EnumType.STRING) @Column(nullable = false)
+    private ExceptionStatus status;
+
+    @Column(nullable = false, updatable = false, length = 3) private String currency;
+    @Column(nullable = false, updatable = false, precision = 19, scale = 4) private BigDecimal amount;
+    @Column(name = "amount_difference", updatable = false, precision = 19, scale = 4) private BigDecimal amountDifference;
+
+    @Column(name = "assigned_to")      private UUID assignedTo;
+
+    @Enumerated(EnumType.STRING) @Column(name = "resolution_code")
+    private ResolutionCode resolutionCode;
+    @Column(name = "resolution_note")  private String resolutionNote;
+    @Column(name = "resolved_by")      private UUID resolvedBy;
+    @Column(name = "resolved_at")      private Instant resolvedAt;
+
+    @Version private long version;
+
+    @Column(name = "created_at", nullable = false, updatable = false) private Instant createdAt;
+    @UpdateTimestamp @Column(name = "updated_at", nullable = false)   private Instant updatedAt;
+
+    protected ExceptionCase() {}   // JPA only. Cases are created by DiscrepancyRecorder in SQL (M6).
+
+    // State changes: package-private, called only by ExceptionStateMachine.
+    void moveTo(ExceptionStatus target)                  { this.status = target; }
+    void assignTo(UUID userIdOrNull)                     { this.assignedTo = userIdOrNull; }
+    void markResolved(ResolutionCode code, String note, UUID by, Instant at) { ... }
+    void clearResolution()                               { ... all four fields to null ... }
+
+    // getters only, no setters
+}
+```
+
+Notes on the mapping:
+
+- **No public setters.** State changes are package-private methods in `domain/`, and `ExceptionStateMachine` lives in `application/`. To keep them callable only from there, either put the state machine in `domain/` or make the methods public but have an ArchUnit rule that only `ExceptionStateMachine` calls them. The simplest working answer: **move `ExceptionStateMachine` into `domain/`** and keep the methods package-private. The compiler then enforces "one place".
+- `updatable = false` on everything the engine sets. Hibernate leaves those columns out of the `UPDATE`, which documents intent and saves bytes.
+- `ResolutionCode` is a Java enum of the M1 list (`TIMING_DIFFERENCE`, `GATEWAY_FEE`, `DATA_ENTRY_ERROR`, `DUPLICATE_CONFIRMED`, `DUPLICATE_FILE_ARTIFACT`, `WRITTEN_OFF`, `FALSE_POSITIVE`, `OTHER`) with a `noteRequired()` flag. The DB column is plain `TEXT` with no CHECK, so adding a code is a code change only. Consider adding a CHECK in the migration for defense in depth; if you do, adding a code needs a migration too. Pick one and write it in `reconciliation-rules.md`.
+- `type` is the `ExceptionType` enum from the module API (M6).
+- `version` is a primitive `long`. Hibernate treats a `null` wrapper as "transient entity", which confuses things. The column defaults to 0.
+
+Repository, tenant-scoped (M3.5 convention: extend `Repository`, every method takes `organizationId`):
+
+```java
+interface ExceptionCaseRepository extends Repository<ExceptionCase, UUID> {
+    Optional<ExceptionCase> findByIdAndOrganizationId(UUID id, UUID organizationId);
+    ExceptionCase save(ExceptionCase c);
+}
+```
+
+**Pitfalls.**
+- Don't map `exception_case_record` as a `@OneToMany` on the entity. It's a link to a **partitioned** table with composite keys, and the detail view reads it with one SQL join anyway (M7.7). Loading it as a collection invites N+1 queries.
+- Don't map `notes` and `history` as collections either. They're append-only and can grow; read them with paged queries.
+- Hibernate's `@UpdateTimestamp` sets `updated_at` on every flush that changes the row, which is what V1's conventions expect.
+
+**Done when.** `ExceptionCaseRepositoryIT` loads a case that `DiscrepancyRecorder` created, and `ddl-auto: validate` passes on startup.
+
+---
+
+### M7.2 — `exception_note` entity and append-only enforcement
+
+**What.** Map `exception_note`, and make it (and `exception_status_history`) append-only in the database.
+
+**Why.** An investigation note is evidence. If notes can be edited, the trail is worthless: "I checked with the gateway on Monday" can become anything. Corrections are new notes.
+
+**How.**
+
+Migration (next free version, e.g. `V<n>__exception_history_append_only.sql`):
+
+```sql
+-- =====================================================================
+-- ReconFlow — investigation history is append-only (M7.2, M7.4)
+-- Same pattern as audit_event in V1: row triggers block UPDATE/DELETE,
+-- a statement trigger blocks TRUNCATE.
+-- =====================================================================
+
+CREATE FUNCTION block_history_changes() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION '% is append-only: % is not allowed', TG_TABLE_NAME, TG_OP;
+END;
+$$;
+
+CREATE TRIGGER exception_note_no_update_delete
+    BEFORE UPDATE OR DELETE ON exception_note
+    FOR EACH ROW EXECUTE FUNCTION block_history_changes();
+CREATE TRIGGER exception_note_no_truncate
+    BEFORE TRUNCATE ON exception_note
+    FOR EACH STATEMENT EXECUTE FUNCTION block_history_changes();
+
+CREATE TRIGGER exception_status_history_no_update_delete
+    BEFORE UPDATE OR DELETE ON exception_status_history
+    FOR EACH ROW EXECUTE FUNCTION block_history_changes();
+CREATE TRIGGER exception_status_history_no_truncate
+    BEFORE TRUNCATE ON exception_status_history
+    FOR EACH STATEMENT EXECUTE FUNCTION block_history_changes();
+```
+
+A new function rather than reusing `audit_event_block_changes()`, whose message hard-codes "audit_event". `TG_TABLE_NAME` makes this one reusable.
+
+Entity, immutable:
+
+```java
+@Entity
+@Table(name = "exception_note")
+@Immutable                                   // org.hibernate.annotations: never issue UPDATE
+public class ExceptionNote {
+    @Id private UUID id;
+    @Column(name = "organization_id", nullable = false) private UUID organizationId;
+    @Column(name = "exception_id", nullable = false)    private UUID exceptionId;
+    @Column(name = "author_id", nullable = false)       private UUID authorId;
+    @Column(nullable = false)                           private String body;
+    @Column(name = "created_at", nullable = false)      private Instant createdAt;
+
+    protected ExceptionNote() {}
+    public static ExceptionNote create(UUID org, UUID exceptionId, UUID author, String body, Instant now) { ... }
+}
+```
+
+Map `exception_status_history` the same way (`ExceptionStatusHistory`, `@Immutable`).
+
+**Pitfalls.**
+- The data deletion question: an append-only table can't honour "delete my data" requests by deleting rows. For v1 (synthetic data, business users), document that notes are retained with the case. Real systems handle it by pseudonymising authors or crypto-shredding. Mention it in `docs/security.md` as an accepted risk.
+- `@Immutable` stops Hibernate from writing changes, but a native `UPDATE` would still reach the DB. The trigger is the real guarantee.
+- Tests must not `TRUNCATE` these tables. They already create a fresh organization per test (M3), so nothing needs cleaning.
+
+**Done when.** An integration test shows `UPDATE exception_note …`, `DELETE …` and `TRUNCATE …` each raise an error containing "append-only", and inserting works.
+
+---
+
+### M7.3 — One active case per discrepancy
+
+**What.** Verify that the partial unique index `exception_case_active_uk` does its job on every path that can create or reactivate a case.
+
+**Why.** Without it, two overlapping runs (or a reopen) could leave two active cases for the same discrepancy: double work for investigators and double-counted totals.
+
+**How.** The index already exists (V1). Two paths can collide with it:
+
+| Path | Who | What happens on collision |
+|---|---|---|
+| Engine creates a case | `DiscrepancyRecorder` (M6) | `INSERT … ON CONFLICT … DO NOTHING` finds the existing active case and links it. No error. |
+| Admin reopens a case | `ExceptionStateMachine.reopen` (M7.11) | The `UPDATE … SET status = 'OPEN'` violates the index if a later run already created a new active case for the same key → `409 active-case-exists` with `existingCaseId` |
+
+This phase owns the second path. See M7.11 for how to detect and translate it.
+
+**Pitfalls.**
+- The partial index **can't be a deferred constraint**, so the violation fires at the `UPDATE` statement, which with JPA means at **flush time**, possibly at commit. Call `flush()` explicitly inside the reopen method so the violation surfaces where you can translate it, not in the transaction interceptor.
+- Don't "fix" collisions by auto-merging the two cases. A resolved case and a newer open case are separate investigations; the admin decides.
+
+**Done when.** The M7.11 test "reopen while a newer active case exists → 409 active-case-exists" passes, and a test inserting two `OPEN` cases with the same key directly via SQL fails with `23505`.
+
+---
+
+### M7.4 — Resolution history survives a reopen
+
+**What.** Every status change writes a row to `exception_status_history` that includes the resolution data, so clearing `exception_case`'s resolution fields on reopen loses nothing.
+
+**Why.** V1's CHECK forces resolution fields to be set **only** while `RESOLVED`. That keeps the current state honest ("is this resolved?" has one answer), but it means a reopen must clear them. The history table is where they live on.
+
+**How.** The history row for each transition:
+
+| Transition | `from_status` | `to_status` | `reason` | `resolution_code` | `resolution_note` | `actor_id` |
+|---|---|---|---|---|---|---|
+| Created (M6) | `NULL` | `OPEN` | — | — | — | `NULL` (system) |
+| Start review | `OPEN` | `IN_REVIEW` | — | — | — | user |
+| Back to open | `IN_REVIEW` | `OPEN` | required | — | — | user |
+| Resolve | `OPEN`/`IN_REVIEW` | `RESOLVED` | — | code | note | user |
+| Reopen | `RESOLVED` | `OPEN` | required | **previous code** | **previous note** | admin |
+
+Copying the previous resolution onto the reopen row is redundant (the resolve row already has it), but it makes the reopen row self-explanatory: "reopened case resolved as GATEWAY_FEE because …". Cheap, and the UI can show it without pairing rows.
+
+Assignment changes and notes are **not** status history rows. They go to `audit_event` only (M7.12). The history table stays exactly what its name says.
+
+**Pitfalls.**
+- Order the history by `(created_at, id)`. Two transitions in the same millisecond are possible in tests; UUIDv7 `id`s are time-ordered, so they break the tie correctly.
+- `resolved_by`/`resolved_at` are **not** copied to the reopen row; they're in the resolve row's `actor_id`/`created_at`.
+
+**Done when.** M7.17's test passes: resolve → reopen → resolve again, and the history shows both resolutions with their codes, notes and actors.
+
+---
+
+### M7.5 — The state machine
+
+**What.** One class that owns every status transition: checks it's allowed, checks the permission, checks the reason, applies it, and writes history and audit.
+
+**Why.** Promise 3. If the rules live in one class, a unit test can cover the whole table, and a reviewer can see every rule at once.
+
+**How.**
+
+```java
+public enum Transition {
+    START_REVIEW (Set.of(OPEN),             IN_REVIEW, Permission.EXCEPTION_UPDATE,  ReasonRule.NONE,     AuditAction.EXCEPTION_STATUS_CHANGED),
+    RETURN_TO_OPEN(Set.of(IN_REVIEW),       OPEN,      Permission.EXCEPTION_UPDATE,  ReasonRule.REQUIRED, AuditAction.EXCEPTION_STATUS_CHANGED),
+    RESOLVE      (Set.of(OPEN, IN_REVIEW),  RESOLVED,  Permission.EXCEPTION_RESOLVE, ReasonRule.RESOLUTION, AuditAction.EXCEPTION_RESOLVED),
+    REOPEN       (Set.of(RESOLVED),         OPEN,      Permission.EXCEPTION_REOPEN,  ReasonRule.REQUIRED, AuditAction.EXCEPTION_REOPENED);
+
+    final Set<ExceptionStatus> from;
+    final ExceptionStatus to;
+    final Permission permission;
+    final ReasonRule reasonRule;
+    final AuditAction auditAction;
+    ...
+}
+```
+
+```java
+@Component
+public class ExceptionStateMachine {           // in domain/, see M7.1
+
+    private final CurrentUser currentUser;
+    private final ExceptionHistoryRepository history;
+    private final AuditService audit;
+    private final Clock clock;
+
+    /** Must run inside the caller's transaction. */
+    public void apply(ExceptionCase c, Transition t, TransitionInput in) {
+        if (!t.from.contains(c.getStatus())) {
+            throw new InvalidTransitionException(c.getStatus(), t);          // → 409 invalid-transition
+        }
+        if (!currentUser.hasPermission(t.permission)) {
+            throw new AccessDeniedException(t.permission.name());            // → 403
+        }
+        t.reasonRule.validate(in);                                           // → 400 validation errors
+
+        ExceptionStatus from = c.getStatus();
+        ResolutionCode prevCode = c.getResolutionCode();
+        String prevNote = c.getResolutionNote();
+
+        switch (t) {
+            case RESOLVE -> c.markResolved(in.code(), in.note(), currentUser.id(), clock.instant());
+            case REOPEN  -> c.clearResolution();
+            default      -> { }
+        }
+        c.moveTo(t.to);
+
+        history.save(ExceptionStatusHistory.of(c, from, t.to, in.reason(),
+                t == RESOLVE ? in.code() : t == REOPEN ? prevCode : null,
+                t == RESOLVE ? in.note() : t == REOPEN ? prevNote : null,
+                currentUser.id(), clock.instant()));
+
+        audit.record(t.auditAction, "EXCEPTION_CASE", c.getId(), Map.of(
+                "from", from, "to", t.to,
+                "version", c.getVersion() + 1,          // the version after this write
+                "reason", nullToAbsent(in.reason()),
+                "resolutionCode", ...));
+    }
+}
+```
+
+The permission check here duplicates the `@PreAuthorize` on the controller (M3.7). That's intended: `@PreAuthorize` guards the **endpoint**, the state machine guards the **transition**. If someone later adds an endpoint that calls `apply(…, REOPEN, …)` without the annotation, the state machine still refuses. Defense in depth, and the unit test can check permissions without HTTP.
+
+`ReasonRule`:
+
+| Rule | Validation |
+|---|---|
+| `NONE` | Ignore any reason sent |
+| `REQUIRED` | `reason` not blank, ≤ 1,000 chars |
+| `RESOLUTION` | `resolutionCode` present and a valid `ResolutionCode`; `note` required if `code.noteRequired()`; note ≤ 4,000 chars |
+
+Response mapping (add to the `@RestControllerAdvice` from M2.10):
+
+| Exception | Status | `code` |
+|---|---|---|
+| `InvalidTransitionException` | `409` | `invalid-transition` (body: `currentStatus`, `allowedTransitions`) |
+| Validation failure | `400` | `validation-failed` (with `errors[]`) |
+| `AccessDeniedException` | `403` | `forbidden` |
+
+Why `409` for an invalid transition rather than `400`? The request is well-formed; it conflicts with the **current state** of the resource. `409 Conflict` is defined for exactly that.
+
+**Pitfalls.**
+- Check the transition **before** the permission? Either order is defensible. Transition first leaks the case's status to someone without permission. They can read it anyway (`EXCEPTION_READ` is held by every role), so it doesn't matter here. Write the order down.
+- Don't let the state machine load or save the case. The command service loads it (tenant-scoped), checks `If-Match`, calls `apply`, and the transaction commits. Keeping I/O out makes the machine unit-testable with plain objects.
+
+**Done when.** `ExceptionStateMachineTest` is table-driven over **every** `(status, transition)` pair (3 × 4 = 12 cells) and asserts allowed/forbidden, plus every `(role, transition)` pair against the permission matrix, plus each reason rule.
+
+---
+
+### M7.6 — `GET /api/v1/exceptions` (list with filters)
+
+**What.** The investigator's work queue: filterable, paginated, newest first.
+
+**Why.** This is the busiest query in the product (docs/scalability.md §7 S1: 60% of browsing traffic). It must be fast and correctly tenant-scoped.
+
+**How.**
+
+Query parameters:
+
+| Param | Example | SQL |
+|---|---|---|
+| `type` (repeatable) | `type=AMOUNT_MISMATCH&type=DUPLICATE_IN_SOURCE` | `type = ANY(:types)` |
+| `status` (repeatable) | `status=OPEN&status=IN_REVIEW` | `status = ANY(:statuses)` |
+| `assignee` | a user ID, `me`, or `unassigned` | `assigned_to = :id` / `assigned_to IS NULL` |
+| `runId` | | `EXISTS (SELECT 1 FROM exception_case_run r WHERE r.exception_id = e.id AND r.run_id = :runId)` |
+| `createdFrom`, `createdTo` | ISO dates | `created_at >= :from AND created_at < :to + 1 day` |
+| `amountMin`, `amountMax` | `100.00` | `amount BETWEEN …` (strings parsed as `BigDecimal`) |
+| `page`, `size`, `sort` | `sort=createdAt,desc` | Whitelisted sort keys only: `createdAt`, `amount`, `status`, `type` |
+
+`runId` uses `exception_case_run` (M6), not `exception_case.run_id`. The latter is "the run that **raised** it"; the former is "every run that **saw** it". When a user filters by run they mean the second.
+
+Build the query with `JdbcClient` and a small builder that appends `AND …` clauses and binds named parameters. **Never concatenate user input** into SQL; the sort key is mapped from a whitelist `Map<String, String>` to a column name.
+
+```sql
+SELECT e.id, e.type, e.status, e.currency, e.amount, e.amount_difference,
+       e.assigned_to, e.created_at, e.updated_at, e.version,
+       split_part(e.discrepancy_key, ':', 2) AS reference      -- see pitfall
+FROM exception_case e
+WHERE e.organization_id = :org
+  AND e.status = ANY(:statuses)
+  ...
+ORDER BY e.created_at DESC, e.id DESC
+LIMIT :limit OFFSET :offset;
+```
+
+Response: the page shape from phase-M1's `api-design.md` (`{content, page:{number,size,totalElements,totalPages}}`) with the page size limits it defines. Money values serialize as strings (M1 decision).
+
+Defaults: `status` defaults to `OPEN,IN_REVIEW` (the work queue). Resolved cases appear only when asked for.
+
+Indexes (V1): `exception_case_list_idx (organization_id, status, created_at DESC)` serves the default query; `exception_case_assignee_idx (organization_id, assigned_to, status) WHERE assigned_to IS NOT NULL` serves "my exceptions". Run `EXPLAIN (ANALYZE, BUFFERS)` against a seeded dataset (M9.5 generator, or a few thousand generated cases) for: default list, `assignee=me`, `assignee=unassigned`, and `runId=…`. If `unassigned` does a large scan, add a partial index `(organization_id, status, created_at DESC) WHERE assigned_to IS NULL` in this phase's migration.
+
+**Pitfalls.**
+- `split_part(discrepancy_key, ':', 2)` gets the reference only if the reference has no `:`. M6 §M6.6 says references **may** contain `:`, so derive the reference safely: strip the type prefix and the last two `:`-fields. Better: show the reference from the linked records in the detail view, and in the list use `regexp_replace(discrepancy_key, '^[^:]+:(.*):[^:]+:[^:]+$', '\1')`. Put the parsing in one SQL function or one Java method, not in several places.
+- `totalElements` costs a `count(*)` per request. Fine at v1 volumes; if `EXPLAIN` shows it dominating, switch to a `Slice` (M5 did that for `/transactions`).
+- `OFFSET` gets slow deep into the list. Investigators don't page to page 400. Note keyset pagination as the scaling fix and move on.
+- Filter by `assignee` must accept only users who are members of the org; an unknown ID simply returns an empty page (don't confirm whether a user ID exists in another org).
+
+**Done when.** An integration test seeds cases across types, statuses, assignees, runs and amounts, and asserts each filter alone and in combination; a cross-tenant case never appears.
+
+---
+
+### M7.7 — `GET /api/v1/exceptions/{id}` (detail)
+
+**What.** One case with everything an investigator needs on one screen.
+
+**Why.** Investigation means comparing the two sides. Making the user open two other pages to see the ledger and gateway rows is how mistakes happen.
+
+**How.** Response shape:
+
+```json
+{
+  "id": "0192f3a1-…",
+  "type": "AMOUNT_MISMATCH",
+  "status": "IN_REVIEW",
+  "reference": "PAY-103",
+  "currency": "AED",
+  "amount": "750.0000",
+  "amountDifference": "-50.0000",
+  "assignedTo": { "id": "…", "displayName": "Ravi" },
+  "resolution": null,
+  "version": 3,
+  "records": {
+    "ledger":  [ { "id": "…", "rawReference": "pay-103 ", "amount": "750.0000", "transactionDate": "2026-10-03",
+                   "status": "SUCCESS", "batchId": "…", "sourceRowNumber": 3, "rawValues": { … } } ],
+    "gateway": [ { "id": "…", "rawReference": "PAY-103",  "amount": "700.0000", … } ]
+  },
+  "runs":    [ { "runId": "…", "created": true, "observedAt": "…" } ],
+  "notes":   [ { "id": "…", "author": { … }, "body": "…", "createdAt": "…" } ],
+  "history": [ { "from": null, "to": "OPEN", "actor": null, "at": "…" }, … ]
+}
+```
+
+Response header: `ETag: "3"`.
+
+Queries (all tenant-scoped, inside one read-only transaction):
+
+```sql
+-- 1. the case
+SELECT … FROM exception_case WHERE id = :id AND organization_id = :org;
+
+-- 2. linked records, both sides; transaction_date lets the planner prune partitions
+SELECT t.id, t.source_type, t.raw_reference, t.normalized_reference, t.amount, t.currency,
+       t.transaction_type, t.status, t.transaction_date, t.transaction_at,
+       t.batch_id, t.source_row_number, t.raw_values
+FROM exception_case_record l
+JOIN transaction_record t
+  ON t.id = l.transaction_record_id AND t.transaction_date = l.transaction_date
+WHERE l.exception_id = :id AND l.organization_id = :org
+ORDER BY t.source_type, t.transaction_date, t.source_row_number;
+
+-- 3. notes, 4. history, 5. runs: simple ordered selects by exception_id
+```
+
+Show **raw** values next to normalized ones. "The ledger says `pay-103 ` with a trailing space" is often the whole investigation.
+
+A duplicate case can link many records across several days and both sides (M6 §M6.8). Return them all; there's no pagination on records in v1 (cap at, say, 500, and say so in `api-design.md`). Notes and history are returned in full for v1, newest last; if a case ever accumulates hundreds of notes, add `/notes?page=` later.
+
+User display names come from the `organization`/`security` module's public API (`UserDirectory.displayNames(Set<UUID>)` or whatever M3 exposes). One batched call, not one per note.
+
+**Pitfalls.**
+- Not found **or** another tenant's → `404` with the same body (M3.6). Don't run a second query to distinguish.
+- `rawValues` is JSONB. Return it as a JSON object, not as an escaped string. Map the column to `JsonNode` or `Map<String,Object>`.
+- Use `@Transactional(readOnly = true)`. With RLS the transaction is also what sets `app.org_id` (M3.5), so reads **must** be in a transaction.
+
+**Done when.** The PAY-103 demo case returns both records side by side with the correct amounts, `ETag` equals the version, and a request for another tenant's case returns `404`.
+
+---
+
+### M7.8 — `PATCH /api/v1/exceptions/{id}` (assign, review)
+
+**What.** Change the assignee and/or move between `OPEN` and `IN_REVIEW`, guarded by `If-Match`.
+
+**Why.** Assignment is how work gets distributed; review status is how a team sees what's being looked at. Both are edits on the shared case, so both need conflict detection.
+
+**How.**
+
+```http
+PATCH /api/v1/exceptions/0192f3a1-…
+Content-Type: application/merge-patch+json
+If-Match: "3"
+X-Organization-Id: …
+
+{ "assignedTo": "0192f3b7-…", "status": "IN_REVIEW" }
+```
+
+Controller:
+
+```java
+@PatchMapping(path = "/{id}", consumes = "application/merge-patch+json")
+@PreAuthorize("hasAuthority('EXCEPTION_UPDATE')")
+ResponseEntity<ExceptionDetailResponse> patch(@PathVariable UUID id,
+                                              @RequestHeader(value = HttpHeaders.IF_MATCH, required = false) String ifMatch,
+                                              @RequestBody JsonNode body) {
+    long expected = IfMatch.parseRequired(ifMatch);          // 428 if missing, 400 if malformed
+    ExceptionCase updated = commands.patch(id, expected, ExceptionPatch.from(body));
+    return ResponseEntity.ok().eTag(Long.toString(updated.getVersion())).body(queries.detail(id));
+}
+```
+
+`IfMatch.parseRequired`: accepts `"3"` and `W/"3"` (treat weak as strong for simplicity, or reject weak; document it), rejects `*` for these endpoints (meaning "any version" defeats the purpose).
+
+Service:
+
+```java
+@Transactional
+public ExceptionCase patch(UUID id, long expectedVersion, ExceptionPatch patch) {
+    ExceptionCase c = repo.findByIdAndOrganizationId(id, tenant.organizationId())
+                          .orElseThrow(NotFoundException::new);
+    if (c.getVersion() != expectedVersion) {
+        throw new StaleVersionException(c.getVersion());                  // 409, the slow race
+    }
+    if (patch.hasAssignee()) {
+        assignments.assign(c, patch.assignee());                          // validates membership, audits
+    }
+    if (patch.hasStatus()) {
+        stateMachine.apply(c, transitionFor(c.getStatus(), patch.status()), patch.input());
+    }
+    repo.save(c);
+    entityManager.flush();     // surface @Version conflicts here, inside the method (the fast race)
+    return c;
+}
+```
+
+`transitionFor(OPEN, IN_REVIEW) = START_REVIEW`, `transitionFor(IN_REVIEW, OPEN) = RETURN_TO_OPEN`. `status: RESOLVED` via PATCH → `400` with a message pointing at `/resolve`: resolving needs a code and is a separate permission, so it gets its own endpoint.
+
+**Assignment rules** (put them in a small `ExceptionAssignments` component in `application/`):
+- The assignee must be a member of the **same** organization with `EXCEPTION_UPDATE` (an investigator or admin). Otherwise `422` with code `invalid-assignee`. Ask the security module's public API; don't query `membership` from here.
+- Assigning a `RESOLVED` case is rejected: `409 invalid-transition`. Reopen first.
+- Assigning to the current assignee is a no-op: no audit event, but the version still must match.
+- Audit: `EXCEPTION_ASSIGNED` with `{ "from": oldUserId, "to": newUserId }`.
+
+Map `ObjectOptimisticLockingFailureException` → `409 stale-version` in the advice. Map `StaleVersionException` the same way, with `currentVersion` in the body so the client can refetch.
+
+An empty patch body `{}` → `400` (`validation-failed`, "nothing to update"). It would otherwise bump nothing and return 200, which hides client bugs.
+
+**Pitfalls.**
+- **Forgetting the explicit compare** (§2.4). Without it, `If-Match` is decoration and the test in M7.14 still passes by luck only when requests truly overlap.
+- `JsonNode` vs typed DTO: with a typed DTO, `{"assignedTo": null}` and `{}` look the same. Use `JsonNode` (or a `JsonNullable` wrapper) for merge-patch.
+- Does assignment alone bump `version`? Yes, any column change does. That's correct: Bob, who saw version 3, shouldn't resolve a case that was reassigned to Alice at version 4 without seeing that.
+- Spring MVC needs to accept `application/merge-patch+json`. Jackson's `MappingJackson2HttpMessageConverter` (Jackson 3: check the Boot 4 name, "verify against the Boot 4 docs") handles `application/*+json`, so `JsonNode` binding works; set `consumes` so a plain `application/json` PATCH gets `415` rather than silently being accepted with different semantics, or accept both deliberately. Decide and document in `api-design.md`.
+
+**Done when.** Tests cover: assign; unassign with `null`; start review; back to open without a reason (400) and with a reason; missing `If-Match` (428); stale `If-Match` (409 with `currentVersion`); assignee from another org (422); assigning a resolved case (409); and the response `ETag` increases by one after each successful write.
+
+---
+
+### M7.9 — `POST /api/v1/exceptions/{id}/notes`
+
+**What.** Add an investigation note.
+
+**Why.** Notes are the narrative of the investigation: what was checked, who was contacted, what the gateway said.
+
+**How.**
+
+```http
+POST /api/v1/exceptions/{id}/notes
+{ "body": "Gateway support confirms a 50 AED fee on this settlement. Ticket GW-8812." }
+```
+
+- Permission: `EXCEPTION_UPDATE`.
+- `body`: required, not blank, ≤ 4,000 characters (`@NotBlank @Size(max = 4000)`).
+- Allowed in **any** status, including `RESOLVED`: "post-resolution: refund confirmed on 12 Nov" is a legitimate note.
+- **No `If-Match`, no version bump.** A note is a new row in another table; it doesn't change the case, so it can't conflict with anyone's edit. Two people adding notes at once is fine and both succeed. (If you want "last activity" on the case, compute it from the latest note/history, don't write it to the case row.)
+- Response: `201 Created`, `Location: /api/v1/exceptions/{id}/notes/{noteId}`, body = the note.
+- Audit: `EXCEPTION_NOTE_ADDED` with `{ "noteId": … }`. Don't copy the note body into the audit payload: it's already stored immutably, and the M4 payload limit is 8 KB.
+
+The service still loads the case with `findByIdAndOrganizationId` first, so a note on another tenant's case is a `404`, not an FK error.
+
+**Pitfalls.**
+- Rendering notes in a future UI: they're user input, so escape on output (XSS). The API returns plain text; say so in `api-design.md`.
+- Don't trim or "clean" the body beyond rejecting blank. It's evidence.
+
+**Done when.** A note appears in the detail view in order, a blank body gets `400`, a note on a resolved case succeeds, and the case's `version` is unchanged.
+
+---
+
+### M7.10 — `POST /api/v1/exceptions/{id}/resolve`
+
+**What.** Close the case with a resolution code and, where required, a note.
+
+**Why.** "Resolved" without a reason is useless for audit and for reporting (M8 groups by resolution code).
+
+**How.**
+
+```http
+POST /api/v1/exceptions/{id}/resolve
+If-Match: "4"
+{ "resolutionCode": "GATEWAY_FEE", "note": "50 AED fee, confirmed in GW-8812" }
+```
+
+- Permission: `EXCEPTION_RESOLVE` (`@PreAuthorize` + the state machine).
+- Allowed from `OPEN` or `IN_REVIEW` (Transition `RESOLVE`). From `RESOLVED` → `409 invalid-transition`.
+- Validation (`ReasonRule.RESOLUTION`): unknown code → `400`; note missing for `DATA_ENTRY_ERROR`, `DUPLICATE_CONFIRMED`, `WRITTEN_OFF`, `FALSE_POSITIVE`, `OTHER` → `400`.
+- Effects, all in one transaction: case fields (`status`, `resolution_code`, `resolution_note`, `resolved_by`, `resolved_at`), version + 1, history row, `EXCEPTION_RESOLVED` audit event. V1's CHECK guarantees the four resolution fields are set together.
+- Response: `200` with the updated detail and new `ETag`.
+
+Why a `POST` to a sub-resource instead of `PATCH {status: RESOLVED}`? Resolving is a **command** with its own permission, its own required inputs and its own audit event. Modelling it as a field update hides all of that inside a generic patch handler. Action endpoints for state-machine transitions are a common, defensible REST style; be ready to argue it.
+
+Should the resolver have to be the assignee? Not in v1: any user with `EXCEPTION_RESOLVE` may resolve. Document it, and list "only the assignee (or an admin) may resolve" as a possible later rule.
+
+**Pitfalls.**
+- Resolving does **not** unassign. The assignee is part of the record of who worked the case.
+- If you use `@Valid` on the request record for size checks, still run `ReasonRule.RESOLUTION` in the state machine for the code-dependent "note required" rule. Bean Validation can't express it cleanly without a class-level custom constraint.
+
+**Done when.** The PAY-103 case resolves with `GATEWAY_FEE`; resolving again gets `409 invalid-transition`; resolving with `OTHER` and no note gets `400`; a `VIEWER` or `UPLOADER` gets `403`.
+
+---
+
+### M7.11 — `POST /api/v1/exceptions/{id}/reopen`
+
+**What.** An org admin reopens a resolved case with a reason.
+
+**Why.** Resolutions can be wrong: the "fee" turns out to be an underpayment, the "duplicate file artifact" was a real double charge. Reopening must be possible, rare, explained and attributable, so it's admin-only.
+
+**How.**
+
+```http
+POST /api/v1/exceptions/{id}/reopen
+If-Match: "5"
+{ "reason": "Gateway fee schedule shows 25 AED, not 50. Remaining 25 unexplained." }
+```
+
+- Permission: `EXCEPTION_REOPEN` (org admin only, per the matrix in plans/authentication.plan §5).
+- Transition `REOPEN`: `RESOLVED → OPEN`; reason required.
+- Effects: `clearResolution()` (V1 CHECK requires it), `status = OPEN`, version + 1, history row carrying the **previous** code and note (M7.4), `EXCEPTION_REOPENED` audit event.
+- The assignee is kept: the person who worked it is the natural owner of the reopened case. An admin can reassign via `PATCH`.
+
+**The active-case collision** (M7.3). Between resolve and reopen, a later run may have seen the same discrepancy and created a **new** `OPEN` case (M6 §M6.6 explains why it does). Reopening the old one would make two active cases for one key, which `exception_case_active_uk` forbids.
+
+Handle it in two layers:
+
+```java
+@Transactional
+public ExceptionCase reopen(UUID id, long expectedVersion, String reason) {
+    ExceptionCase c = loadForUpdate(id, expectedVersion);       // tenant check + If-Match compare
+    Optional<UUID> active = repo.findActiveIdByKey(c.getOrganizationId(), c.getDiscrepancyKey());
+    if (active.isPresent()) {
+        throw new ActiveCaseExistsException(active.get());      // 409 active-case-exists, existingCaseId
+    }
+    stateMachine.apply(c, Transition.REOPEN, TransitionInput.reason(reason));
+    try {
+        entityManager.flush();
+    } catch (ConstraintViolationException | DataIntegrityViolationException e) {
+        if (isConstraint(e, "exception_case_active_uk")) {      // a run created one in the last few ms
+            throw new ActiveCaseExistsException(repo.findActiveIdByKey(...).orElse(null));
+        }
+        throw e;
+    }
+    return c;
+}
+```
+
+The pre-check gives a friendly answer in the common case; the constraint is the guarantee under a race. Same pattern as the duplicate-file check in M5.
+
+**Pitfalls.**
+- After a constraint violation, PostgreSQL has aborted the transaction (M6 §2.4). The second `findActiveIdByKey` in the catch block would fail inside the same transaction. Either throw without the ID, or look it up in the exception handler (a new transaction). Simplest: throw `ActiveCaseExistsException(null)` there and let the advice do a fresh lookup if it wants to fill `existingCaseId`.
+- Reading the constraint name: walk the cause chain to `org.hibernate.exception.ConstraintViolationException.getConstraintName()` or the PostgreSQL `PSQLException`'s `ServerErrorMessage.getConstraint()`. Put that in one helper in `shared` (M5 needs the same for `import_batch_content_uk`).
+
+**Done when.** Reopen works with a reason and keeps the previous resolution in history; reopen without a reason → `400`; an investigator → `403`; reopening an `OPEN` case → `409 invalid-transition`; reopening while a newer active case exists → `409 active-case-exists` with that case's ID.
+
+---
+
+### M7.12 — Audit every action
+
+**What.** Every assignment, status change, note, resolution and reopen emits an audit event in the same transaction.
+
+**Why.** The audit log answers "who did what, when" across the system: regulators and internal controls ask that question, not "what's the status of case 42".
+
+**How.** Already wired in the steps above; this task is the checklist and the test.
+
+| Action | `AuditAction` | `entity_type` / `entity_id` | Payload |
+|---|---|---|---|
+| Created by engine (M6) | `EXCEPTION_CREATED` | `EXCEPTION_CASE` / case id | `type`, `discrepancyKey`, `runId` |
+| Assignment change | `EXCEPTION_ASSIGNED` | same | `from`, `to` (user IDs) |
+| `OPEN ↔ IN_REVIEW` | `EXCEPTION_STATUS_CHANGED` | same | `from`, `to`, `reason`, `version` |
+| Note added | `EXCEPTION_NOTE_ADDED` | same | `noteId` |
+| Resolved | `EXCEPTION_RESOLVED` | same | `resolutionCode`, `version` (note body not copied) |
+| Reopened | `EXCEPTION_REOPENED` | same | `reason`, `previousResolutionCode`, `version` |
+
+Use the names already in M4's `AuditAction` enum. If one is missing, add it there, not as a string literal.
+
+`entity_type` is the case for every row, **including notes**, so the case's timeline (M7.13) shows everything in one query without joins.
+
+`AuditService.record` runs with `Propagation.MANDATORY` (M4): if someone calls it outside a transaction, it fails loudly instead of committing an audit row for a change that later rolls back.
+
+**Done when.** One integration test performs every action on one case and asserts the audit timeline for that case has exactly the expected actions in order, with the right actor on each; and a forced rollback after `apply()` (test hook) leaves neither the status change nor the audit row.
+
+---
+
+### M7.13 — `GET /api/v1/audit-events?entityType=&entityId=`
+
+**What.** The timeline of one entity, for admins.
+
+**Why.** Investigators see the case's history in the detail view. Admins and auditors need the raw, authoritative trail, including events the history table doesn't hold (assignments, notes).
+
+**How.**
+
+- Lives in the **audit** module (`audit/internal/api/AuditEventController`). The audit module owns its table; the exceptions module has no part in reading it.
+- Permission: `AUDIT_READ` (org admin).
+- Both parameters required: `entityType` from a whitelist enum (`EXCEPTION_CASE`, `IMPORT_BATCH`, `RECONCILIATION_RUN`, `MEMBERSHIP`, …), `entityId` a UUID. Without them → `400`. There's no "list all audit events" in v1; that's a reporting feature with its own paging and export concerns.
+- Query, served by V1's `audit_event_entity_idx (organization_id, entity_type, entity_id, created_at)`:
+
+```sql
+SELECT id, actor_id, action, payload, request_id, created_at
+FROM audit_event
+WHERE organization_id = :org AND entity_type = :type AND entity_id = :id
+ORDER BY created_at, id
+LIMIT :limit OFFSET :offset;
+```
+
+- Response: paginated (same page shape), each item with `actor` resolved to a display name (or `"system"` when `actor_id` is NULL), `action`, `payload` as JSON, `requestId`, `at`.
+- An entity ID from another tenant simply returns an empty page (the `organization_id` filter and RLS both apply). Returning `404` would need a lookup in the entity's own table, which this module doesn't own. Empty is safe: it reveals nothing.
+
+**Pitfalls.**
+- Platform events with `organization_id IS NULL` (failed login for an unknown email) never appear here, which is correct: they're not the tenant's.
+- `requestId` lets an admin jump from an audit row to the logs for that request (M2.11). Keep it in the response.
+
+**Done when.** An admin sees the full timeline for the demo case; an investigator gets `403`; a case ID from another org returns an empty page.
+
+---
+
+### M7.14 — Concurrency test: two simultaneous resolves
+
+**What.** Prove promise 1 under a real race.
+
+**Why.** Concurrency bugs don't show up in sequential tests. This is the test interviewers ask about.
+
+**How.** Two variants, because there are two races (§2.4).
+
+**Variant A, the slow race (stale `If-Match`).** Sequential, deterministic:
+
+```java
+@Test
+void secondResolveWithSameVersionGets409() {
+    var c = givenOpenCase();                          // version 0
+    var first  = resolve(c.id(), "\"0\"", GATEWAY_FEE, null);
+    var second = resolve(c.id(), "\"0\"", DATA_ENTRY_ERROR, "typo");
+
+    assertThat(first.getStatusCode()).isEqualTo(HttpStatus.OK);
+    assertThat(second.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+    assertThat(second.problem().code()).isEqualTo("stale-version");
+    assertThat(load(c.id()).resolutionCode()).isEqualTo(GATEWAY_FEE);    // not overwritten
+}
+```
+
+This one exercises the explicit compare. Without it, this test fails.
+
+**Variant B, the fast race (both pass the compare).** Two threads, released together:
+
+```java
+@RepeatedTest(20)
+void concurrentResolvesProduceExactlyOneSuccess() throws Exception {
+    var c = givenOpenCase();
+    var start = new CountDownLatch(1);
+    try (var pool = Executors.newFixedThreadPool(2)) {
+        Callable<Integer> attempt = () -> { start.await(); return resolveStatus(c.id(), "\"0\""); };
+        var f1 = pool.submit(attempt);
+        var f2 = pool.submit(attempt);
+        start.countDown();
+        assertThat(List.of(f1.get(), f2.get())).containsExactlyInAnyOrder(200, 409);
+    }
+    assertThat(historyRows(c.id(), RESOLVED)).hasSize(1);
+    assertThat(auditRows(c.id(), EXCEPTION_RESOLVED)).hasSize(1);
+}
+```
+
+To make the race **certain** rather than likely, add a test-only hook after the compare and before the flush (a `CyclicBarrier(2)` that both requests wait on, injected via a test `@Bean`). Then both definitely pass the compare, and `@Version` must catch the second one. Use the same fault-hook mechanism M9.4 uses.
+
+Use a real HTTP client against `@SpringBootTest(webEnvironment = RANDOM_PORT)` so each request has its own transaction. `MockMvc` runs in the test thread and is fine too, as long as the test method itself isn't `@Transactional` (it never is, per M2's test conventions).
+
+**Pitfalls.**
+- Asserting only status codes. Also assert the **database**: one resolution, one history row, one audit row. The point is "no silent overwrite", which is a property of the data.
+- `@RepeatedTest(20)` without the barrier can pass by luck. The barrier variant is the real proof; keep the repeated one as a smoke test.
+
+**Done when.** Both variants pass reliably (run the suite 10 times in CI-like conditions).
+
+---
+
+### M7.15 — Invalid transitions are rejected
+
+**What.** Every forbidden transition and every missing reason is rejected, through the API.
+
+**How.** The unit test (M7.5) covers the full table. Add API-level tests for the interesting cells:
+
+| Case | Request | Expect |
+|---|---|---|
+| Resolve a `RESOLVED` case | `POST /resolve` | `409 invalid-transition` |
+| Reopen an `OPEN` case | `POST /reopen` | `409 invalid-transition` |
+| `IN_REVIEW → OPEN` without reason | `PATCH {status: OPEN}` | `400 validation-failed` |
+| Resolve with a note-required code, no note | `POST /resolve {OTHER}` | `400 validation-failed` |
+| Resolve with unknown code | `POST /resolve {BANANA}` | `400 validation-failed` |
+| `PATCH {status: RESOLVED}` | | `400` pointing at `/resolve` |
+| `PATCH {status: IN_REVIEW}` on `RESOLVED` | | `409 invalid-transition` |
+
+Each rejected request leaves the case, history and audit **unchanged**: assert the version didn't move.
+
+---
+
+### M7.16 — Each role can do only what it's allowed
+
+**What.** The permission matrix, tested through the API.
+
+**How.** A parameterized test over `(role, action)`:
+
+| Action | VIEWER | UPLOADER | INVESTIGATOR | ORG_ADMIN |
+|---|---|---|---|---|
+| List / detail | 200 | 200 | 200 | 200 |
+| PATCH (assign/review) | 403 | 403 | 200 | 200 |
+| Add note | 403 | 403 | 201 | 201 |
+| Resolve | 403 | 403 | 200 | 200 |
+| Reopen | 403 | 403 | 403 | 200 |
+| Audit timeline | 403 | 403 | 403 | 200 |
+
+Generate the expected column from `RolePermissions` (M3) rather than hard-coding it twice, **or** hard-code it deliberately so a change to `RolePermissions` breaks this test and forces a conscious decision. The second is better for a security matrix: the test is the specification.
+
+Also: a **platform admin** gets `404` on every exception endpoint (plans/authentication.plan §5: platform admin never satisfies an org-scoped permission).
+
+---
+
+### M7.17 — The earlier resolution survives a reopen
+
+**What.** Resolve → reopen → resolve differently, then check nothing was lost.
+
+**How.**
+
+```java
+@Test
+void reopenKeepsPreviousResolutionInHistory() {
+    var c = givenOpenCase();
+    resolveAs(investigator, c, GATEWAY_FEE, null);
+    reopenAs(admin, c, "Fee schedule says 25, not 50");
+    resolveAs(investigator, c, DATA_ENTRY_ERROR, "Ledger amount corrected upstream");
+
+    var history = detail(c).history();
+    assertThat(history).extracting(H::to).containsExactly(OPEN, RESOLVED, OPEN, RESOLVED);
+    assertThat(history.get(1).resolutionCode()).isEqualTo(GATEWAY_FEE);
+    assertThat(history.get(2).resolutionCode()).isEqualTo(GATEWAY_FEE);     // reopen row carries it
+    assertThat(history.get(2).reason()).contains("25, not 50");
+    assertThat(history.get(3).resolutionCode()).isEqualTo(DATA_ENTRY_ERROR);
+    assertThat(detail(c).resolution().code()).isEqualTo(DATA_ENTRY_ERROR);
+}
+```
+
+---
+
+### M7.18 — Cross-tenant tests for every exception endpoint
+
+**What.** Register every endpoint from this phase in the M3.9 cross-tenant suite.
+
+**How.** For each endpoint, a `CrossTenantCase` entry: a case in org B, a request as an org A user (with full permissions in A) targeting it:
+
+| Endpoint | Expect |
+|---|---|
+| `GET /exceptions` | 200, org B's case absent |
+| `GET /exceptions/{bId}` | 404 |
+| `PATCH /exceptions/{bId}` | 404, case unchanged |
+| `POST /exceptions/{bId}/notes` | 404, no note row |
+| `POST /exceptions/{bId}/resolve` | 404, case unchanged |
+| `POST /exceptions/{bId}/reopen` | 404, case unchanged |
+| `GET /exceptions?runId={bRunId}` | 200, empty |
+| `GET /exceptions?assignee={bUserId}` | 200, empty |
+| `GET /audit-events?entityType=EXCEPTION_CASE&entityId={bId}` | 200, empty |
+| `PATCH` assigning org B's user to an org A case | 422 `invalid-assignee` |
+
+Also check the "unchanged" part: after each write attempt, org B's case version, history count and audit count are identical. M3.9's meta-test fails the build if a new endpoint isn't registered.
+
+---
+
+## 5. Testing strategy
+
+| Layer | What | Tools | Where |
+|---|---|---|---|
+| Unit | `ExceptionStateMachine` (every status × transition, every role × transition, reason rules), `IfMatch` parsing, `ResolutionCode.noteRequired`, discrepancy-key → reference parsing | JUnit 5, AssertJ, plain objects, a fake `CurrentUser` | `src/test/.../exceptions/` (`*Test`) |
+| Repository / SQL | List filters and sort whitelist, detail joins across partitions, append-only triggers, partial-index collision | Testcontainers PostgreSQL 16, real migrations | `*IT` extending `AbstractIntegrationTest` |
+| API | Every endpoint's happy path and its error codes (`400`, `403`, `404`, `409`, `422`, `428`), `ETag` on responses | `MockMvc` or `RestClient` against a random port | `*IT` |
+| Concurrency | M7.14 variants A and B | Threads, `CountDownLatch`, test barrier hook | `ExceptionConcurrencyIT` |
+| Security | Role matrix (M7.16), cross-tenant (M7.18), platform admin | Parameterized tests, M3.9 registry | `*IT` |
+| Audit | Every action leaves exactly one audit row; rollback leaves none | Integration tests reading `audit_event` | `ExceptionAuditIT` |
+
+Test data: create cases through the **real** `DiscrepancyRecorder` (seed a small set of transaction records and call the recorder), not by inserting `exception_case` rows by hand. That way the tests exercise the same shape M6 produces. For list-filter tests that need many cases, a test-only builder that inserts directly is fine. Mark it as test support.
+
+Every test creates its own organization (M3 convention). No `TRUNCATE`, no `@Transactional` on tests: the triggers forbid the first, and the second would hide the very commit-time behaviour (`@Version`, constraints) this phase is about.
+
+---
+
+## 6. Exit criteria checklist
+
+- [ ] Migration with append-only triggers on `exception_note` and `exception_status_history` applied; trigger test passes.
+- [ ] `ExceptionCase` entity with `@Version`; no public setters; `ddl-auto: validate` passes.
+- [ ] `ExceptionStateMachine` is the only code that changes `status` (grep: `moveTo(` appears only there).
+- [ ] `GET /exceptions` with every filter, paginated, default `OPEN,IN_REVIEW`; `EXPLAIN` checked for the four main shapes.
+- [ ] `GET /exceptions/{id}` shows both sides, notes, history, runs, and returns `ETag`.
+- [ ] `PATCH`, `/resolve`, `/reopen` require `If-Match`: `428` when missing, `409 stale-version` when stale.
+- [ ] Notes: `201`, any status, no version bump.
+- [ ] Reopen: admin-only, reason required, previous resolution kept in history, `409 active-case-exists` on collision.
+- [ ] Audit event for every action, same transaction; rollback test passes.
+- [ ] `GET /audit-events?entityType=&entityId=` for `AUDIT_READ`.
+- [ ] Concurrency test (both variants) passes reliably.
+- [ ] Role matrix and cross-tenant suites cover every endpoint in this phase.
+- [ ] `docs/api-design.md` updated: endpoints, merge-patch, `ETag`/`If-Match` rules, error codes, record cap on detail.
+- [ ] `docs/reconciliation-rules.md` updated: resolution codes, note rules, re-raise-after-resolve behaviour, reopen collision rule.
+
+Verification:
+
+```bash
+./mvnw verify                                    # unit + integration, including concurrency tests
+./mvnw -Dit.test=ExceptionConcurrencyIT verify   # repeat a few times
+grep -rn "moveTo(" src/main/java | grep -v ExceptionStateMachine   # expect no output
+```
+
+Then run the demo from §1 with `curl` (or the Bruno collection, once M11.8 exists).
+
+---
+
+## 7. Interview questions this phase prepares you for
+
+**Q: How do you prevent two users from overwriting each other's changes?**
+Optimistic locking. Each case has a `version` column; the client gets it as an `ETag` and sends it back in `If-Match`. The server compares it explicitly and rejects a stale version with `409`, and Hibernate's `@Version` adds `WHERE version = ?` to the `UPDATE` to catch two requests racing within milliseconds. The loser refetches and decides again; nothing is silently overwritten.
+
+**Q: Why not just use `SELECT … FOR UPDATE`?**
+A database lock can't outlive a transaction, and the conflict here spans minutes of human think time across separate HTTP requests. Holding a transaction open that long would block everyone and exhaust connections. Pessimistic locks are right for short in-transaction contention; optimistic locking is right for long, rarely-conflicting edits like this.
+
+**Q: Isn't `@Version` enough on its own?**
+No. Each request loads the entity fresh, so the loaded version is the current one, and Hibernate's check passes even if the user's screen was stale. You have to compare the client's version explicitly. `@Version` still matters for the fast race where two requests both pass the explicit compare at the same moment.
+
+**Q: Should a stale `If-Match` return 409 or 412?**
+The HTTP spec says `412 Precondition Failed`. We return `409` to follow the project's convention and record `412` as the alternative in an ADR. Either is defensible if it's consistent and documented; a missing `If-Match` is `428 Precondition Required` either way.
+
+**Q: How do you enforce valid status transitions?**
+A single state machine holds a table of allowed transitions, each with its required permission, reason rule and audit action. Every change goes through it, entity setters are not public, and a table-driven test covers every cell, allowed and forbidden. The database CHECK on resolution fields adds a second guard for the most important invariant.
+
+**Q: How do you make sure audit records can't be tampered with?**
+They're written in the same transaction as the change, so they can't disagree with the data, and database triggers block `UPDATE`, `DELETE` and `TRUNCATE` on the history and audit tables. In M10 the application's DB role also loses `UPDATE`/`DELETE` privileges on them. Corrections are new entries, never edits.
+
+**Q: Why use action endpoints like `/resolve` instead of `PATCH status=RESOLVED`?**
+Resolving is a command with its own permission, required inputs (code, note) and audit event. A generic `PATCH` would bury those rules in conditional logic and make the permission check depend on the body. Action sub-resources make each transition explicit, separately authorizable and easy to document.
+
+**Q: What happens if a discrepancy shows up again after it was resolved?**
+The partial unique index only covers non-resolved cases, so the engine creates a new `OPEN` case. That's deliberate: the discrepancy still exists, so someone should look. If an admin then tries to reopen the old case, it would create a second active case for the same discrepancy, so it's rejected with `409 active-case-exists`, pointing to the new one.
+
+**Q: How do you test a race condition reliably?**
+Release two threads together with a latch, and to make it deterministic, insert a test-only barrier between the version check and the commit so both requests are guaranteed to pass the check. Then assert on the data, not just the status codes: exactly one resolution, one history row, one audit row.
+
+**Q: How do you stop someone in Organization A from reading Organization B's exception?**
+Every query filters by the caller's organization ID, PostgreSQL row-level security filters again at the database, and the API returns `404`, not `403`, so IDs can't be probed. A cross-tenant test suite covers every endpoint and fails the build if a new endpoint isn't registered.
+
+---
+
+## 8. Common mistakes
+
+| Mistake | Consequence | Instead |
+|---|---|---|
+| Relying on `@Version` alone | Stale screens overwrite newer data; tests pass anyway | Compare the client's `If-Match` version explicitly, then let `@Version` catch the fast race |
+| `exceptionCase.setStatus(...)` in several services | Unchecked transitions, missing audit events | One state machine; no public setters |
+| Making `If-Match` optional | Clients never send it; locking is decoration | `428` when missing |
+| Bumping the case version on a new note | Notes cause spurious `409`s for people editing the case | Notes are separate rows; no version change |
+| Clearing the resolution on reopen without saving it | The old resolution is lost forever | History row carries the previous code and note |
+| Catching a constraint violation and querying again in the same transaction | "current transaction is aborted" | Throw, and look up in a new transaction if needed |
+| Mapping records/notes/history as JPA collections | N+1 queries, huge entities | Read them with explicit paged queries |
+| Typed DTO for merge-patch | Can't tell "unassign" (`null`) from "leave as is" (absent) | `JsonNode` or `JsonNullable` |
+| `403` for another tenant's case | Leaks which IDs exist | `404`, same body as not-found |
+| Asserting only HTTP status in concurrency tests | A silent overwrite with correct status codes passes | Assert the database state too |
+| Concatenating the `sort` parameter into SQL | SQL injection | Whitelist map from API name to column |
+| `TRUNCATE` in test cleanup | Triggers raise; tests depend on order | Fresh organization per test |

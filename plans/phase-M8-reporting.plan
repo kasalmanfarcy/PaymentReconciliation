@@ -1,0 +1,769 @@
+# Phase M8 — Reporting
+
+**Status:** Not started · **Tasks:** TASKS.md M8.1–M8.6 · **Depends on:** M6 (runs, matches, precomputed run totals), M7 (exception workflow and status history), M3 (tenant context, RLS, permissions) · **Date:** 2026-11-01
+
+This phase turns the data the earlier phases produce into answers. The four questions ReconFlow promises to answer (README, projectoverview.md §1) are: *Which transactions match? Which don't? Why? Who investigated and resolved them?* At the end of M8, a single API call answers all four for a run.
+
+Reporting is a read-only module. It writes nothing except export files, and it never changes business state. This makes it the simplest module to reason about, and also the easiest place to write slow queries. Most of this plan is therefore about writing aggregate SQL that stays fast at 550M rows a year.
+
+---
+
+## 1. Goal
+
+By the end of M8:
+
+1. `GET /api/v1/reports/reconciliation?runId=…` returns the matched, unmatched, mismatched and duplicate counts and totals for a run, the exceptions it raised grouped by type and reason, and their resolution state, including who resolved them.
+2. The same endpoint with `?from=…&to=…&currency=…` reports over a date range **without double counting** records that several runs covered.
+3. `GET /api/v1/reports/import-quality` shows error rows by error code, for one batch or over time.
+4. `GET /api/v1/reports/exception-ageing` shows open exceptions by age bucket and assignee.
+5. `GET /api/v1/reports/exceptions/export?runId=…` downloads the run's exceptions as CSV, streamed for normal runs and through a background job for very large ones.
+6. Every report query is a single aggregate SQL statement, checked with `EXPLAIN (ANALYZE, BUFFERS)`.
+7. A test proves that the report totals agree with raw counts taken straight from the sample data.
+
+---
+
+## 2. Concepts to understand first
+
+### 2.1 OLTP queries and reporting queries are different workloads
+
+The rest of ReconFlow runs **OLTP** (online transaction processing) queries: fetch one exception by id, update its status, insert 5,000 rows. These touch few rows and use an index to find them.
+
+Reporting queries are **analytical**: count and sum across thousands or millions of rows and return a handful of numbers. The rules for these are different:
+
+| OLTP habit | Why it's wrong for reports |
+|---|---|
+| Load entities with JPA and loop over them in Java | Moves millions of rows over the network into heap, only to add them up. The database can add them up where the data lives. |
+| One query per row (N+1) | A report over 10,000 exceptions becomes 10,001 queries. |
+| `findAll()` then `stream().filter()` | Same problem, plus the filter can't use an index. |
+
+**Rule for this phase:** a report endpoint runs one, or at most a few, SQL statements that return the final aggregated numbers. Java only shapes the result into a response.
+
+### 2.2 Precomputed totals versus computed-on-read totals
+
+There are two ways to answer "what was matched in run X":
+
+- **Compute on read:** `SELECT count(*), sum(amount) FROM reconciliation_match JOIN transaction_record …` every time someone opens the report.
+- **Precompute on write:** the engine (M6) already writes `matched_count`, `matched_amount` and the other summary columns onto `reconciliation_run` when the run completes.
+
+A finished run never changes, so its totals can be computed once. Reading eleven columns from one row by primary key takes well under a millisecond, whatever the size of the run. Computing it on read means a join over potentially millions of rows each time.
+
+The cost of precomputing is that the two can drift apart if there's a bug. That's why M8.6 exists: a test recomputes the totals from the raw rows and checks they agree.
+
+Exception counts by status are **not** precomputed, because exceptions keep changing after the run finishes (assigned, resolved, reopened). These are computed on read, which is cheap because there are only ~2% as many exceptions as transactions and they're indexed by `run_id`.
+
+### 2.3 Double counting across overlapping runs
+
+A run reconciles one period, for example 1–7 October. Nothing stops someone from also running 5–10 October, or re-running 1–7 October after fixing a gateway file (a new idempotency key means a new run). Records dated 5–7 October now appear in up to three runs.
+
+If a date-range report simply adds up the precomputed totals of every run in the range, those records are counted two or three times. In a finance product, a report that overstates the matched amount is worse than no report.
+
+The fix is to decide, **for each calendar day, which run is authoritative**, and only count that run's results for that day. The rule used here is:
+
+> For each day, the authoritative run is the **most recently completed** run (for the same organization and currency) whose period contains that day.
+
+This needs totals per run **per day**, not just per run. §4.1 adds a small table for that. Because the engine (M6) already processes runs one day at a time and commits after each day, writing one summary row per day costs almost nothing.
+
+### 2.4 Module boundaries for a read-only module
+
+`reporting` needs data owned by `ingestion`, `reconciliation` and `exceptions`. There are three ways to get it:
+
+| Option | How | Trade-off |
+|---|---|---|
+| A. Call the other modules' Java APIs | `exceptionsApi.findByRun(runId)` then aggregate in Java | Respects module boundaries perfectly, but brings rows into heap — exactly what §2.1 forbids. |
+| B. Read-model SQL against their tables | `reporting` runs `JdbcClient` SQL that joins those tables directly | Fast, one query. Couples `reporting` to other modules' **schemas**, but not to their Java types. |
+| C. Event-fed read model | Other modules publish events; `reporting` maintains its own denormalized tables | Fully decoupled and fast, but a lot of machinery, plus eventual consistency to explain. |
+
+**Decision: option B.** It's the standard pattern for reporting in a modular monolith that shares one database.
+
+Spring Modulith (or ArchUnit, M2.9) verifies **Java-level** dependencies: `reporting` must not import classes from `exceptions.internal`, `reconciliation.internal`, and so on. SQL text isn't a Java dependency, so the boundary tests stay green. The coupling to other modules' table names is real, though, and it's made safe by three rules:
+
+1. `reporting` never writes to another module's tables. It's read-only, so it can't break another module's invariants.
+2. All SQL lives in one `*ReportQueries` class per report. If a column is renamed, there's one place to fix it.
+3. M8.6 runs every report query against the real migrated schema in CI. A rename that breaks a report fails the build, not production.
+
+Record this decision in `docs/architecture.md` (module dependency section) so a reviewer doesn't read it as a boundary violation.
+
+### 2.5 `JdbcClient` and record DTOs
+
+Spring Framework 6.1 added `JdbcClient`, a fluent wrapper around `JdbcTemplate`. It maps rows straight to Java records:
+
+```java
+record IssueCount(String errorCode, long rows) {}
+
+List<IssueCount> counts = jdbc.sql("""
+        SELECT error_code, count(*) AS rows
+          FROM import_row_error
+         WHERE organization_id = :orgId AND batch_id = :batchId
+         GROUP BY error_code
+         ORDER BY rows DESC
+        """)
+    .param("orgId", orgId)
+    .param("batchId", batchId)
+    .query(IssueCount.class)      // maps columns to record components by name
+    .list();
+```
+
+Column names are matched to record components after converting `snake_case` to `camelCase` (`error_code` → `errorCode`). Use `AS` aliases to make the mapping explicit.
+
+Why not JPA here: JPA is designed to load and track entities, which a report doesn't need. JPQL also lacks `FILTER (WHERE …)`, `width_bucket`, `date_trunc`, `DISTINCT ON` and window functions, all of which this phase uses.
+
+### 2.6 Reading an `EXPLAIN (ANALYZE, BUFFERS)` plan
+
+`EXPLAIN` shows the plan PostgreSQL *intends* to use. `EXPLAIN ANALYZE` actually runs the query and adds what *really* happened. `BUFFERS` adds how many 8 KB pages were read from cache (`shared hit`) or disk (`read`).
+
+An illustrative plan (the numbers are made up to show the shape, not measured):
+
+```
+Aggregate  (cost=1520.40..1520.41 rows=1 width=40) (actual time=4.812..4.813 rows=1 loops=1)
+  Buffers: shared hit=310
+  ->  Index Scan using exception_case_run_idx on exception_case
+        (cost=0.43..1490.12 rows=6055 width=24) (actual time=0.021..3.900 rows=5980 loops=1)
+        Index Cond: (run_id = '0192…'::uuid)
+        Filter: (organization_id = '0191…'::uuid)
+        Buffers: shared hit=310
+Planning Time: 0.210 ms
+Execution Time: 4.870 ms
+```
+
+How to read it:
+
+- **Read from the innermost (most indented) node outward.** Data flows upward: the index scan feeds the aggregate.
+- **`cost=a..b`** is the planner's estimate in arbitrary units. Use it only to compare plans for the same query.
+- **`rows=` estimate versus `actual … rows=`.** Here 6,055 estimated against 5,980 actual, which is close. If the estimate is off by 10× or more, the planner's statistics are stale or the data is skewed, and it may pick a bad join strategy. Run `ANALYZE <table>` and check again.
+- **`loops=`.** Actual time and rows are *per loop*. A node with `rows=10 loops=50000` produced 500,000 rows. This is how a hidden nested-loop explosion shows up.
+- **`Seq Scan` on a large table** is the main red flag. On a 1,000-row table it's fine and often faster than an index. On `transaction_record` it means a missing or unusable index.
+- **Partition pruning.** For queries on `transaction_record`, the plan should list only the monthly partitions in the date range. If it lists every `transaction_record_YYYY_MM`, the query's date predicate isn't one the planner can prune on, e.g. it wraps `transaction_date` in a function. `Subplans Removed: N` means pruning happened at execution time, which is also fine.
+- **`Buffers: read=` large** means pages came from disk. Run the query twice; the second run shows the cached behaviour. Report both in M9.6.
+- **`Sort Method: external merge  Disk: …`** means the sort spilled to disk because `work_mem` was too small for it.
+
+Always run `EXPLAIN ANALYZE` against a realistically sized database (the M9.5 generator). Plans on a 20-row test database are meaningless: the planner correctly chooses sequential scans on tiny tables.
+
+`EXPLAIN ANALYZE` really executes the statement. Never run it on an `INSERT`, `UPDATE` or `DELETE` you don't want applied, unless it's inside `BEGIN; … ROLLBACK;`.
+
+---
+
+## 3. Starting point
+
+When M7 is done, the following already exist:
+
+- `reconciliation_run` with precomputed summary columns (`matched_count`, `matched_amount`, `mismatch_count`, `mismatch_net_difference`, `unmatched_left_*`, `unmatched_right_*`, `duplicate_count`), written by the engine at completion, plus `last_completed_date` as the per-day checkpoint.
+- `reconciliation_match`, `exception_case` (with `run_id`, `type`, `reason_code`, `status`, `assigned_to`, `resolved_by`, `resolved_at`, `amount_difference`), `exception_case_record`, `exception_status_history`, `exception_note`.
+- `import_batch` and `import_row_error`.
+- The `job` table and worker (built in M5), which already has `EXPORT` as an allowed `type`.
+- `TenantContext` / `CurrentUser`, RLS with `SET LOCAL app.org_id` per transaction, permission-based `@PreAuthorize`, and the `ProblemDetail` error handler.
+- The `FileStorage` abstraction on S3-compatible storage (MinIO locally), from M5.8.
+
+Nothing in `reporting` exists yet beyond the empty package from M2.8.
+
+---
+
+## 4. Step by step
+
+Package layout for the module:
+
+```
+com.reconflow.paymentreconflow.reporting
+  ReportingController            all /api/v1/reports/** endpoints
+  reconciliation/                ReconciliationReportQueries, ReconciliationReport (records)
+  importquality/                 ImportQualityQueries, ImportQualityReport
+  ageing/                        ExceptionAgeingQueries, ExceptionAgeingReport
+  export/                        ExceptionCsvExporter, CsvCell, ExportJobHandler
+```
+
+Every query class is a `@Component` with a `JdbcClient` injected, and every public method is `@Transactional(readOnly = true)`.
+
+`readOnly = true` matters for three reasons:
+
+1. RLS relies on `SET LOCAL app.org_id`, which only lasts for the current transaction. Without a transaction, each statement runs in its own autocommit transaction, and the setting would not be applied. Check that the M3.5 RLS hook runs for read-only transactions too.
+2. PostgreSQL's JDBC driver sends `SET TRANSACTION READ ONLY`, so an accidental write fails loudly.
+3. If a read replica is added later (docs/scalability.md §8), read-only transactions are the ones a routing data source can send to it.
+
+### M8.1 Reconciliation report
+
+**What**
+
+`GET /api/v1/reports/reconciliation` in two modes:
+
+- `?runId={id}` — one run.
+- `?from=2026-10-01&to=2026-10-31&currency=AED` — a date range, combining the authoritative run for each day.
+
+Exactly one of the two modes must be used. Anything else is `400` with a `ProblemDetail`.
+
+Permission: `REPORT_READ`. The response includes resolver names, which is exception data, so additionally require `EXCEPTION_READ` (every role from VIEWER up holds both, per plans/authentication.plan §5, so this costs nothing today but stays correct if roles change).
+
+**Why**
+
+This is the endpoint the M8 exit criterion is about: one call answers the four questions.
+
+| Question | Section of the response |
+|---|---|
+| Which match? | `matched` — count and total |
+| Which don't? | `unmatchedLedger`, `unmatchedGateway`, `mismatches`, `duplicates` — counts and totals |
+| Why? | `exceptionsByReason` — counts by `type` and `reason_code` |
+| Who resolved them? | `resolution` — open, in review and resolved counts, plus counts per resolver |
+
+**How — the response**
+
+```java
+public record ReconciliationReport(
+        Scope scope,                       // RUN or DATE_RANGE, with runId or from/to
+        String currency,
+        CountAndAmount matched,
+        CountAndAmount unmatchedLedger,
+        CountAndAmount unmatchedGateway,
+        MismatchSummary mismatches,        // count + net difference
+        long duplicates,
+        List<ReasonCount> exceptionsByReason,
+        ResolutionSummary resolution,
+        List<RunRef> runsUsed) {}          // which run was authoritative for which days
+
+public record CountAndAmount(long count, BigDecimal amount) {}
+public record ReasonCount(String type, String reasonCode, long count, BigDecimal amountDifference) {}
+public record ResolutionSummary(long open, long inReview, long resolved, List<ResolverCount> byResolver) {}
+public record ResolverCount(UUID userId, String displayName, long resolved) {}
+```
+
+Amounts are `BigDecimal` and serialized as **JSON strings** (`"1000.0000"`), not numbers. JavaScript clients parse JSON numbers as 64-bit floats, which would silently corrupt large amounts. Configure this once for `BigDecimal` in the Jackson setup, if M2/M5 didn't already.
+
+**How — run mode**
+
+Two queries. First the precomputed run row, which is a primary-key lookup:
+
+```sql
+SELECT id, currency, period_start, period_end, status,
+       matched_count, matched_amount,
+       unmatched_left_count, unmatched_left_amount,
+       unmatched_right_count, unmatched_right_amount,
+       mismatch_count, mismatch_net_difference,
+       duplicate_count
+  FROM reconciliation_run
+ WHERE organization_id = :orgId AND id = :runId
+```
+
+No row → `404` (another tenant's run looks exactly like a missing one, M3.6). A run that isn't `COMPLETED` → `409` with a `ProblemDetail` explaining that the report is available when the run completes. Don't show half-written totals.
+
+Then one query for everything about the run's exceptions, using `FILTER` to compute several counts in a single pass:
+
+```sql
+SELECT e.type,
+       e.reason_code,
+       count(*)                                           AS total,
+       count(*) FILTER (WHERE e.status = 'OPEN')          AS open,
+       count(*) FILTER (WHERE e.status = 'IN_REVIEW')     AS in_review,
+       count(*) FILTER (WHERE e.status = 'RESOLVED')      AS resolved,
+       coalesce(sum(e.amount_difference), 0)              AS amount_difference
+  FROM exception_case e
+ WHERE e.organization_id = :orgId
+   AND e.run_id = :runId
+ GROUP BY e.type, e.reason_code
+ ORDER BY total DESC
+```
+
+And resolvers:
+
+```sql
+SELECT e.resolved_by AS user_id, u.display_name, count(*) AS resolved
+  FROM exception_case e
+  JOIN app_user u ON u.id = e.resolved_by
+ WHERE e.organization_id = :orgId
+   AND e.run_id = :runId
+   AND e.status = 'RESOLVED'
+ GROUP BY e.resolved_by, u.display_name
+ ORDER BY resolved DESC
+```
+
+Java adds up the per-reason rows to get the `open`, `inReview` and `resolved` totals. Index used: `exception_case_run_idx (run_id)`.
+
+What "exceptions of a run" means: `exception_case.run_id` is the run that **raised** the case. Because of the active-case unique index (`exception_case_active_uk`), re-running the same period doesn't raise a second active case for the same discrepancy; the existing case keeps its original `run_id`. So a later run's report can show fewer exceptions than its `mismatch_count`, because some were raised by an earlier run. That's correct, but it surprises people. Say it in `api-design.md` and add a `note` field to the response when the counts differ.
+
+**How — date-range mode, without double counting**
+
+Add the per-day summary table from §2.3. It's a new migration (use the next free version number; at the time of writing V1–V3 are applied, but M3–M7 will have added more):
+
+```sql
+-- One row per run per reconciled day, written by the engine in the same
+-- transaction that commits that day's matches and exceptions. Lets a
+-- date-range report pick one authoritative run per day.
+CREATE TABLE reconciliation_run_day (
+    run_id                  UUID          NOT NULL REFERENCES reconciliation_run (id),
+    organization_id         UUID          NOT NULL REFERENCES organization (id),
+    day                     DATE          NOT NULL,
+    currency                CHAR(3)       NOT NULL,
+    matched_count           INT           NOT NULL,
+    matched_amount          NUMERIC(19,4) NOT NULL,
+    mismatch_count          INT           NOT NULL,
+    mismatch_net_difference NUMERIC(19,4) NOT NULL,
+    unmatched_left_count    INT           NOT NULL,
+    unmatched_left_amount   NUMERIC(19,4) NOT NULL,
+    unmatched_right_count   INT           NOT NULL,
+    unmatched_right_amount  NUMERIC(19,4) NOT NULL,
+    duplicate_count         INT           NOT NULL,
+    PRIMARY KEY (run_id, day)
+);
+
+CREATE INDEX reconciliation_run_day_lookup_idx
+    ON reconciliation_run_day (organization_id, currency, day);
+
+-- RLS policy, same shape as every other tenant-owned table (M3.5).
+```
+
+Then change the engine's per-day commit in `reconciliation` (M6.9) to insert the day row alongside that day's results. This is a change to M6 code, so it's done here as part of M8.1, with an engine test asserting `sum(day rows) = run totals`. The run-level columns stay; they're what run mode reads.
+
+The date-range query picks, per day, the most recently completed run:
+
+```sql
+WITH authoritative AS (
+    SELECT DISTINCT ON (d.day) d.*, r.completed_at
+      FROM reconciliation_run_day d
+      JOIN reconciliation_run r ON r.id = d.run_id
+     WHERE d.organization_id = :orgId
+       AND d.currency        = :currency
+       AND d.day BETWEEN :from AND :to
+       AND r.status = 'COMPLETED'
+     ORDER BY d.day, r.completed_at DESC, r.id DESC   -- id breaks ties deterministically
+)
+SELECT sum(matched_count)            AS matched_count,
+       sum(matched_amount)           AS matched_amount,
+       sum(unmatched_left_count)     AS unmatched_left_count,
+       sum(unmatched_left_amount)    AS unmatched_left_amount,
+       sum(unmatched_right_count)    AS unmatched_right_count,
+       sum(unmatched_right_amount)   AS unmatched_right_amount,
+       sum(mismatch_count)           AS mismatch_count,
+       sum(mismatch_net_difference)  AS mismatch_net_difference,
+       sum(duplicate_count)          AS duplicate_count,
+       count(*)                      AS days_covered,
+       array_agg(DISTINCT run_id)    AS runs_used
+  FROM authoritative
+```
+
+`DISTINCT ON (day)` keeps the first row per day in the `ORDER BY` order, which is the latest completed run. This is a PostgreSQL extension and a classic interview "top-1-per-group" pattern; the portable alternative is `row_number() OVER (PARTITION BY day ORDER BY completed_at DESC) = 1`.
+
+Also return `daysCovered` versus `daysRequested`. A range with days no run covered is reported as partial (`"coverage": {"requested": 31, "covered": 28, "missingDays": [...]}`), never silently treated as zero activity.
+
+Exception counts in date-range mode come from the authoritative runs only: `WHERE e.run_id = ANY(:runsUsed)`.
+
+Limit the range to, for example, 366 days (`400` above that) so one request can't aggregate years of data.
+
+Currency is required in date-range mode. A run is pinned to one currency (V1 schema), and adding AED to USD gives a meaningless number.
+
+**Pitfalls**
+
+- Adding `matched_amount` across currencies. Always group or filter by currency.
+- `sum()` over zero rows returns `NULL`, not `0`. Wrap with `coalesce(…, 0)` or handle `null` in Java.
+- Comparing amounts in tests with `equals`: `new BigDecimal("10.0000").equals(new BigDecimal("10"))` is `false`. Use `compareTo`, or AssertJ's `isEqualByComparingTo`.
+- Reporting on a `RUNNING` run. Totals are only written at completion.
+
+**Done when**
+
+- Run mode returns all four sections for a completed run, `404` for another tenant's run and `409` for a run that isn't complete.
+- Date-range mode, over two overlapping runs, counts each day once, using the later run. A test covers exactly this case (§5).
+- `EXPLAIN (ANALYZE, BUFFERS)` for both modes on the 50k dataset shows index scans only, and the plan is pasted into `docs/benchmarks.md` or the PR.
+
+### M8.2 Import quality report
+
+**What**
+
+`GET /api/v1/reports/import-quality`:
+
+- `?batchId={id}` — error rows by `error_code` (and by column) for one batch, plus the batch's total, valid and error row counts.
+- `?from=…&to=…&granularity=day|week|month&sourceType=GATEWAY` — error rows by code over time, across batches.
+
+**Why**
+
+It tells the finance team whether a provider's files are getting worse ("since Tuesday, 3% of gateway rows fail `INVALID_CURRENCY`") and tells you which validation rules are noisy.
+
+**How — per batch**
+
+```sql
+SELECT error_code, column_name, count(*) AS rows
+  FROM import_row_error
+ WHERE organization_id = :orgId AND batch_id = :batchId
+ GROUP BY error_code, column_name
+ ORDER BY rows DESC
+```
+
+Uses the unique constraint's index, which leads with `batch_id`. Note that `count(*)` here counts **errors**, and one row can have several errors (one per bad column). Report "error rows" as `count(DISTINCT row_number)` and "errors" as `count(*)`, and label them clearly. Mixing the two up is the most common bug in this report.
+
+**How — over time**
+
+```sql
+SELECT date_trunc(:granularity, b.created_at AT TIME ZONE 'UTC') AS bucket,
+       e.error_code,
+       count(*)                       AS errors,
+       count(DISTINCT (e.batch_id, e.row_number)) AS error_rows
+  FROM import_batch b
+  JOIN import_row_error e ON e.batch_id = b.id
+ WHERE b.organization_id = :orgId
+   AND b.created_at >= :fromInclusive
+   AND b.created_at <  :toExclusive
+   AND (:sourceType IS NULL OR b.source_type = :sourceType)
+ GROUP BY bucket, e.error_code
+ ORDER BY bucket, errors DESC
+```
+
+And a denominator per bucket, so the client can show a rate instead of a raw count:
+
+```sql
+SELECT date_trunc(:granularity, created_at AT TIME ZONE 'UTC') AS bucket,
+       sum(total_rows) AS total_rows, sum(error_rows) AS error_rows
+  FROM import_batch
+ WHERE organization_id = :orgId AND created_at >= :fromInclusive AND created_at < :toExclusive
+ GROUP BY bucket
+```
+
+Notes:
+
+- Validate `granularity` against an enum in Java (`day`, `week`, `month`) before passing it. Never concatenate request input into SQL. Passing it as a bind parameter to `date_trunc` is fine, because it's a value, not SQL text.
+- `AT TIME ZONE 'UTC'` makes bucket boundaries UTC midnight regardless of the database session's time zone. Document that days are UTC days.
+- The range is half-open: `>= from AND < to`. A closed range with `BETWEEN` on timestamps either misses the last day's events or includes the next midnight's.
+- `import_batch_list_idx (organization_id, created_at DESC)` serves the batch filter. `import_row_error` is reached by batch id.
+- The `(:sourceType IS NULL OR …)` pattern is convenient but can produce a generic plan that ignores the index. If `EXPLAIN` shows that, build two query strings in Java instead.
+
+**Pitfalls**
+
+- Bucketing by **row date** instead of **upload date**. This report is about file quality, so it buckets by when the batch arrived (`import_batch.created_at`).
+- Failed batches (`FAILED` status) may have partial errors. Include them, but add `status` to the per-batch response so a reader can tell.
+
+**Done when**
+
+- Per-batch and over-time modes return the right numbers for the malformed sample CSV from M1.4.
+- The `errors` and `error rows` distinction is tested with a row that has two bad columns.
+
+### M8.3 Exception ageing
+
+**What**
+
+`GET /api/v1/reports/exception-ageing?type=&assignee=` — non-resolved exceptions (`OPEN` and `IN_REVIEW`) counted by age bucket and by assignee, with the amount at stake.
+
+Buckets: `0–1d`, `1–3d`, `3–7d`, `7–30d`, `30d+`.
+
+**Why**
+
+Finance teams work against SLAs ("no mismatch older than 7 days"). Ageing shows where work is stuck and with whom. It's also the input to the v2 SLA notifications.
+
+**How**
+
+`width_bucket(value, thresholds[])` returns the index of the bucket `value` falls into for an array of sorted lower bounds: `0` below the first bound, `1` between the first and second, and so on.
+
+```sql
+SELECT width_bucket(
+           extract(epoch FROM (now() - e.created_at)) / 86400.0,   -- age in days
+           ARRAY[1, 3, 7, 30]::numeric[])              AS bucket,  -- 0..4
+       e.assigned_to,
+       u.display_name                                  AS assignee_name,
+       count(*)                                        AS cases,
+       coalesce(sum(abs(e.amount_difference)), 0)     AS amount_at_stake
+  FROM exception_case e
+  LEFT JOIN app_user u ON u.id = e.assigned_to
+ WHERE e.organization_id = :orgId
+   AND e.status <> 'RESOLVED'
+ GROUP BY bucket, e.assigned_to, u.display_name
+ ORDER BY bucket, cases DESC
+```
+
+Java maps bucket `0` → `"0-1d"`, `1` → `"1-3d"`, `2` → `"3-7d"`, `3` → `"7-30d"`, `4` → `"30d+"`, and fills buckets that have no rows with zero, so the client always gets five buckets in order. Unassigned cases have `assigned_to = NULL` and appear as an "Unassigned" row, which is usually the most important row.
+
+The equivalent `CASE` expression is easier to read and is a fine alternative:
+
+```sql
+CASE WHEN now() - e.created_at < interval '1 day'   THEN '0-1d'
+     WHEN now() - e.created_at < interval '3 days'  THEN '1-3d'
+     WHEN now() - e.created_at < interval '7 days'  THEN '3-7d'
+     WHEN now() - e.created_at < interval '30 days' THEN '7-30d'
+     ELSE '30d+' END
+```
+
+Use whichever you can explain; `width_bucket` is shown because it's less familiar and comes up in interviews.
+
+**Decision: age is measured from `created_at`,** the moment the case was first raised. A reopened case keeps its original age, because the underlying discrepancy has existed that long. An alternative is "age since last reopened", which is available from `exception_status_history`; mention it in `api-design.md` as a deliberate choice.
+
+`amount_at_stake` uses `abs(amount_difference)`, which is only set for `AMOUNT_MISMATCH`. Missing-record cases have no difference; for them, the at-stake amount is the record's own amount. If the report needs that, join `exception_case_record` → `transaction_record`; check its plan carefully because it touches the partitioned table. For v1, report it for mismatches only and say so in the field name (`mismatchAmountAtStake`).
+
+Index: the existing `exception_case_list_idx (organization_id, status, created_at DESC)` serves `status <> 'RESOLVED'` poorly, because `<>` isn't a range the index can seek. If `EXPLAIN` shows a problem at volume, add a partial index (new migration):
+
+```sql
+CREATE INDEX exception_case_active_age_idx
+    ON exception_case (organization_id, created_at)
+    WHERE status <> 'RESOLVED';
+```
+
+Partial indexes are small (only active cases, ~2% of the table) and are a strong interview example.
+
+**Pitfalls**
+
+- `now()` is the transaction start time, so the whole report uses one consistent "now". That's what you want. Don't use `clock_timestamp()`.
+- Aggregating age with `avg()` hides the tail. Buckets show it; if you add a summary number, use the oldest age or p90, not the mean.
+
+**Done when**
+
+- A test creates cases with controlled `created_at` values (set by a clock or directly in the fixture) on each bucket boundary and asserts which bucket each lands in, including the exact boundaries (exactly 1 day goes to `1-3d`).
+- The unassigned row appears.
+
+### M8.4 CSV export of exceptions for a run
+
+**What**
+
+`GET /api/v1/reports/exceptions/export?runId={id}` returns `text/csv`, one row per exception, with both source records' key fields side by side, status, assignee and resolution.
+
+Permission: `EXCEPTION_READ`.
+
+**Why**
+
+Finance teams live in spreadsheets. An export lets them share or archive results without giving everyone an account.
+
+**How — decision: stream synchronously below a limit, background job above it**
+
+| Exceptions in the run | Behaviour |
+|---|---|
+| ≤ 50,000 | `200 OK`, streamed directly in the response |
+| > 50,000 | `202 Accepted` with a `job` of type `EXPORT`; the client polls and downloads the file from storage |
+
+Fifty thousand rows is a few MB of CSV and streams in seconds. Make the limit a property (`reconflow.export.sync-max-rows`). Count with `SELECT count(*) FROM exception_case WHERE organization_id = :orgId AND run_id = :runId` first, which is cheap via the `run_id` index.
+
+**Synchronous streaming.** The point of streaming is that memory use stays constant no matter how many rows there are. You never build the whole file as a `String` or `List`.
+
+```java
+@GetMapping(value = "/exceptions/export", produces = "text/csv")
+@PreAuthorize("hasAuthority('EXCEPTION_READ')")
+ResponseEntity<StreamingResponseBody> export(@RequestParam UUID runId) {
+    UUID orgId = tenant.organizationId();
+    long count = queries.countForRun(orgId, runId);          // 404 if run not found in org
+    if (count > props.syncMaxRows()) {
+        return ResponseEntity.accepted()...                   // enqueue EXPORT job, see below
+    }
+    StreamingResponseBody body = out -> exporter.write(orgId, runId, out);
+    return ResponseEntity.ok()
+        .header(CONTENT_DISPOSITION, "attachment; filename=\"exceptions-" + runId + ".csv\"")
+        .body(body);
+}
+```
+
+```java
+// ExceptionCsvExporter
+public void write(UUID orgId, UUID runId, OutputStream out) {
+    transactionTemplate.executeWithoutResult(tx -> {          // read-only tx, sets app.org_id for RLS
+        try (var writer = new BufferedWriter(new OutputStreamWriter(out, UTF_8));
+             var csv = CSVFormat.DEFAULT.builder().setHeader(HEADERS).get().print(writer)) {
+            writer.write('﻿');                           // UTF-8 BOM so Excel detects the encoding
+            jdbc.sql(EXPORT_SQL)
+                .param("orgId", orgId).param("runId", runId)
+                .withFetchSize(1000)                          // stream from the DB too, see below
+                .query((RowCallbackHandler) rs -> csv.printRecord(
+                        CsvCell.safe(rs.getString("discrepancy_key")),
+                        rs.getString("type"),
+                        ...))
+        }
+    });
+}
+```
+
+Key details:
+
+- **`StreamingResponseBody` runs on a different thread** after the controller returns (Spring MVC async). `@Transactional` on the controller doesn't cover it and the request-scoped `TenantContext` may already be gone. So capture `orgId` **before** creating the lambda (as above) and open the transaction **inside** the body with `TransactionTemplate`. This is the most common bug with streaming responses.
+- **Streaming from the database:** PostgreSQL's JDBC driver only uses a cursor (fetching `fetchSize` rows at a time) when autocommit is off and a fetch size is set. Inside a transaction, autocommit is off, and `withFetchSize(1000)` sets the size (check that `JdbcClient` exposes it in your Spring version; otherwise use `JdbcTemplate` with `setFetchSize`). Without this, the driver loads all rows into memory before returning the first one.
+- **`RowCallbackHandler`** processes each row as it arrives instead of collecting a list.
+- `CSVFormat…print(writer)` is Apache Commons CSV, already a dependency from M5.10. It handles quoting of commas, quotes and newlines.
+- **Async timeout:** set `spring.mvc.async.request-timeout` (for example 60 s) so a stalled client doesn't hold a DB connection forever.
+
+**CSV injection hook.** A cell starting with `=`, `+`, `-`, `@`, tab or carriage return is run as a formula by Excel. A gateway reference like `=HYPERLINK("http://evil",…)` would become a clickable link. M10.2 implements the escaping; M8 creates the hook so every cell already passes through it:
+
+```java
+/** Every exported cell goes through here. M10.2 implements the escaping. */
+final class CsvCell {
+    static String safe(String value) {
+        return value;   // M10.2: prefix with ' when value starts with = + - @ \t \r
+    }
+}
+```
+
+Add a test now that is `@Disabled("M10.2")` and asserts `safe("=1+1")` returns `"'=1+1"`, so M10.2 has a failing test waiting for it.
+
+Apply `safe(...)` to text cells that come from user or file input (references, notes, names). Numbers you format yourself are safe, but a negative amount like `-50.0000` starts with `-`. M10.2 needs to decide whether to escape it (which breaks numeric columns in Excel) or exempt formatted numeric columns. Note this in the M10 plan.
+
+**The background path (> limit).** Enqueue a `job` row with `type = 'EXPORT'` and `payload = {"runId": "…", "requestedBy": "…"}`, in the same transaction as an audit event `EXPORT_REQUESTED`. Return `202` with `Location: /api/v1/jobs/{jobId}` (or a dedicated `/api/v1/reports/exports/{id}` if M5 didn't expose jobs). The `ExportJobHandler` in the worker profile:
+
+1. Writes the CSV through the same `ExceptionCsvExporter` into a temporary file, then uploads it to `FileStorage` under `exports/{orgId}/{jobId}.csv`.
+2. Marks the job `DONE` with the storage key in the result.
+3. Download endpoint: `GET /api/v1/reports/exports/{jobId}/file` streams the file from storage after checking the job belongs to the caller's organization.
+
+Since jobs can be retried, writing to a key named after `jobId` makes the retry overwrite the same object instead of creating a second one. That's idempotency by construction.
+
+Exports are financial data leaving the system: emit an audit event `EXCEPTIONS_EXPORTED` (run id, row count) for both paths.
+
+**Pitfalls**
+
+- Building the CSV in a `StringBuilder` and returning it. Works in tests, runs out of memory in production.
+- Accessing `TenantContext` inside the streaming lambda.
+- Forgetting the `Content-Disposition` header, so the browser shows the CSV instead of downloading it.
+- Quoting CSV by hand. Use the library.
+
+**Done when**
+
+- A run with a handful of exceptions downloads as a valid CSV that opens correctly in a spreadsheet, including a reference containing a comma and a note containing a newline.
+- A test with the sync limit set to 2 and a run with 3 exceptions gets `202`, the worker produces the file, and the download returns the same content the sync path would.
+- Memory check: exporting 200k exceptions with `-Xmx256m` succeeds (manual or M9 benchmark).
+
+### M8.5 Aggregate SQL and plan checks
+
+**What**
+
+Every report query from M8.1–M8.4 is checked with `EXPLAIN (ANALYZE, BUFFERS)` against the M9.5 dataset (or a quick 50k-row equivalent if M9.5 isn't built yet), and the results are written down.
+
+**Why**
+
+A query that's fast on 20 test rows can take minutes on 50 million. The only way to know is to look at the plan on realistic data.
+
+**How**
+
+1. Load the dataset, then run `ANALYZE;` so the planner's statistics are fresh.
+2. For each query, run it in `psql` with real parameter values:
+
+   ```sql
+   EXPLAIN (ANALYZE, BUFFERS, SETTINGS)
+   SELECT ... ;
+   ```
+
+3. Check each plan against §2.6: no `Seq Scan` on `transaction_record`, `exception_case` or `import_row_error` at volume; estimates within roughly 10× of actuals; partition pruning on any `transaction_record` access; no sort spilling to disk.
+4. Record each query's execution time (cold and warm) and the key plan node in a table in `docs/benchmarks.md` under a "Report queries" heading.
+5. If a plan is bad, fix it with an index (new migration) or a rewrite, then re-check. Typical fixes in this phase: the partial index from M8.3, or splitting an `OR`-heavy optional filter into separate queries.
+
+Bind parameters and the generic plan: through JDBC, PostgreSQL may switch to a **generic plan** after five executions of the same prepared statement, which ignores the actual values. Plans from `psql` with literal values can therefore be better than what the app gets. To see the app's plan, use `PREPARE q(uuid, uuid) AS …; EXPLAIN ANALYZE EXECUTE q(…);` six or more times, or turn on `auto_explain` in the local Compose Postgres (`shared_preload_libraries=auto_explain`, `auto_explain.log_min_duration=200ms`).
+
+**Pitfalls**
+
+- Checking plans on an empty database.
+- Forgetting `ANALYZE` after bulk loading. The planner thinks tables are still empty.
+- Adding an index for every query. Each index slows down every insert into that table; `transaction_record` gets 1.5M inserts a day. Prefer indexes on the small tables (`exception_case`) and rely on the existing match index for the big one.
+
+**Done when**
+
+- Every report query has a recorded plan and timing on ≥ 50k transaction rows, with no sequential scans on large tables.
+
+### M8.6 Test: report totals reconcile against raw counts
+
+**What**
+
+An integration test that uploads the sample CSVs from M1.4, runs reconciliation, calls the report endpoints, and checks every number against an independent count computed straight from the raw tables.
+
+**Why**
+
+The report reads **precomputed** totals. If the engine has a bug in how it adds up its summary columns, the report shows confident but wrong numbers. This test compares the precomputed path with a from-scratch path. It's also what keeps the schema-coupled SQL from §2.4 honest.
+
+**How**
+
+```java
+class ReconciliationReportIT extends AbstractIntegrationTest {
+
+    @Test
+    void reportTotalsMatchRawCounts() {
+        var org = fixtures.orgWithUsers();
+        imports.uploadAndWait(org, "docs/samples/ledger-all-scenarios.csv", INTERNAL_LEDGER);
+        imports.uploadAndWait(org, "docs/samples/gateway-all-scenarios.csv", GATEWAY);
+        UUID runId = runs.startAndWait(org, period, "AED");
+
+        var report = api.as(org.viewer()).get("/api/v1/reports/reconciliation?runId=" + runId,
+                                              ReconciliationReport.class);
+
+        // Independent counts, written without reusing the engine or report code.
+        var raw = rawCounts(org.id(), runId);
+
+        assertThat(report.matched().count()).isEqualTo(raw.matchCount());
+        assertThat(report.matched().amount()).isEqualByComparingTo(raw.matchedLedgerAmount());
+        assertThat(report.unmatchedLedger().count()).isEqualTo(raw.missingInGatewayCases());
+        ...
+        // Conservation: every ledger record in the period is in exactly one place.
+        assertThat(report.matched().count()
+                 + report.mismatches().count()
+                 + report.unmatchedLedger().count()
+                 + raw.ledgerRecordsInDuplicateCases())
+            .isEqualTo(raw.ledgerRecordsInPeriod());
+    }
+}
+```
+
+`rawCounts` runs plain SQL such as `SELECT count(*) FROM reconciliation_match WHERE run_id = ?` and `SELECT sum(t.amount) FROM reconciliation_match m JOIN transaction_record t ON …`. Keep it deliberately simple and separate from the production query classes. If it reused them, the test would compare a query with itself.
+
+Also assert against **hard-coded expected values** for the sample files (the M1.4 samples are small and documented, e.g. "2 matched, 1 mismatch of 50.0000, …"). Raw counts catch drift between the precomputed and raw paths; hard-coded expectations catch bugs that affect both paths equally.
+
+Extra tests in this class:
+
+- **Overlapping runs:** run 1–7 Oct, then 5–10 Oct after changing one gateway amount on 6 Oct. Date-range report for 1–10 Oct uses run 1 for 1–4 Oct and run 2 for 5–10 Oct; the 6 Oct record is counted once, with run 2's result.
+- **Cross-tenant:** Organization B's viewer gets `404` for Organization A's `runId`, and B's date-range report doesn't include A's data (M3.9 rule: one cross-tenant test per endpoint).
+- **Authorization:** a user without `REPORT_READ` gets `403` (or, if every role has it, assert the matrix in `api-design.md`).
+
+**Done when**
+
+- The test passes in CI against Testcontainers PostgreSQL, for both the sample dataset and the overlapping-runs scenario.
+
+---
+
+## 5. Testing strategy
+
+| Level | What | Where |
+|---|---|---|
+| Unit | Bucket label mapping, `CsvCell.safe` (disabled until M10.2), request validation (exactly one mode, range limit, granularity enum) | `reporting/**/*Test.java` |
+| Query integration | Each `*ReportQueries` method against Testcontainers PostgreSQL with a hand-built fixture whose answer you can work out by hand | `reporting/**/*QueriesIT.java` |
+| API integration | M8.6: full flow from upload to report; overlapping runs; export sync and async paths | `ReconciliationReportIT`, `ExceptionExportIT` |
+| Tenancy and auth | `404` for another org's run/batch/export, `403` without the permission | Added to the M3.9 cross-tenant suite |
+| Performance | `EXPLAIN` checks and timings on the 50k dataset | Manual, recorded in `docs/benchmarks.md` (M8.5) |
+
+Fixture tip: create exceptions with explicit `created_at` values for ageing tests. Don't rely on `Thread.sleep` or the real clock.
+
+Remember the audit table can't be truncated (V1 trigger). Isolate tests with a fresh organization per test rather than cleaning tables.
+
+---
+
+## 6. Exit criteria checklist
+
+- [ ] One call to `GET /api/v1/reports/reconciliation?runId=` answers all four README questions for a run.
+- [ ] Date-range mode counts each day from exactly one run, with a test over overlapping runs.
+- [ ] Import quality report works per batch and over time, distinguishing errors from error rows.
+- [ ] Exception ageing returns five buckets, including an "Unassigned" row.
+- [ ] CSV export streams below the limit and uses an `EXPORT` job above it; every cell passes through `CsvCell.safe`.
+- [ ] Every report query is plain aggregate SQL via `JdbcClient`; no entities are loaded to compute a report.
+- [ ] Plans and timings for every report query on ≥ 50k rows are recorded.
+- [ ] M8.6 passes in CI.
+- [ ] `docs/api-design.md` documents the report endpoints, permissions, UTC day buckets, ageing from `created_at`, and the "exceptions belong to the run that raised them" rule.
+- [ ] `docs/architecture.md` records the read-model SQL decision for `reporting`.
+
+---
+
+## 7. Interview questions this phase prepares you for
+
+**Why compute report totals in SQL instead of in Java?**
+The database can aggregate where the data lives and return a few numbers, instead of sending millions of rows over the network into heap. It can also use indexes and parallel workers. Java is the right place for shaping the response, not for summing a table.
+
+**When would you precompute a total, and when compute it on read?**
+Precompute when the underlying data stops changing (a completed run) and the total is read often, because then a one-time cost replaces a repeated one. Compute on read when the data keeps changing (exception statuses) and the query is cheap through an index. Whenever you precompute, have a test or job that recomputes from source and compares, because the two can drift.
+
+**How do you avoid double counting when aggregating results from runs whose periods overlap?**
+Pick one authoritative source per unit of time, here the latest completed run per day, using `DISTINCT ON (day) … ORDER BY day, completed_at DESC`. That needs results stored per day, not only per run. Then sum the authoritative rows only, and report coverage gaps instead of treating them as zero.
+
+**How do you export a million rows as CSV without running out of memory?**
+Stream at both ends: a database cursor with a fetch size (in PostgreSQL that requires a transaction with autocommit off), a row callback that writes each row immediately, and `StreamingResponseBody` so the response is written as it's produced. Memory stays constant. For very large exports, move the work to a background job that writes to object storage, and return `202` with a link to poll.
+
+**What do you look for in an `EXPLAIN ANALYZE` output?**
+Sequential scans on large tables, large gaps between estimated and actual rows (stale statistics or skew), high `loops` counts on inner nodes of a nested loop, sorts spilling to disk, and for partitioned tables whether only the relevant partitions were scanned. I always check on realistic data volumes, because plans on small tables are different.
+
+**Doesn't the reporting module querying other modules' tables break your modular monolith?**
+It couples reporting to their schemas, but not to their Java code, and it never writes, so it can't break their invariants. That's a common, deliberate trade-off for read models in a shared database. I contain it by keeping all the SQL in a few classes and running every query against the migrated schema in CI, so a rename fails the build. If modules moved to separate databases, I'd switch to an event-fed read model.
+
+**What is CSV injection?**
+Spreadsheet apps treat a cell starting with `=`, `+`, `-` or `@` as a formula, so attacker-controlled text in an export can run formulas or create malicious links when an analyst opens it. The fix is to prefix such cells with a single quote when exporting. It's an export-time concern; the stored data stays untouched.
+
+---
+
+## 8. Common mistakes
+
+- Loading JPA entities and aggregating them in Java.
+- Summing amounts across currencies, or across overlapping runs.
+- Comparing `BigDecimal` with `equals` in tests.
+- Serializing money as JSON numbers.
+- Using `sum()` without handling `NULL` for empty sets.
+- Accessing request-scoped tenant context or relying on an outer `@Transactional` inside `StreamingResponseBody`.
+- Not setting a fetch size, so the "streaming" export loads everything into memory first.
+- Checking query plans on an empty database or without running `ANALYZE` first.
+- Bucketing time by the server's local time zone instead of UTC.
+- Using `BETWEEN` on timestamps instead of a half-open range.
+- Counting errors where the report says error rows.
+- Leaving out the cross-tenant test for a new report endpoint.

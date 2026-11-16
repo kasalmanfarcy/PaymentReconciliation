@@ -1,0 +1,1247 @@
+# Phase M2 — Project foundation
+
+**Status:** In progress (M2.1, M2.6, M2.7 done) · **Tasks:** TASKS.md M2.1–M2.16 · **Depends on:** M0 (repo, PR workflow), M1 (architecture.md module list, api-design.md error model) · **Date:** 2026-11-01
+
+This phase builds the scaffolding every feature will stand on: the database and object storage running locally, configuration per environment, module boundaries enforced by tests, one consistent error format, request IDs in every log line, formatting and coverage checks, and CI that runs it all on every pull request. No business feature ships in M2. What ships is the guarantee that when features arrive in M3–M8, they're built, tested and checked the same way every time.
+
+---
+
+## 1. Goal
+
+At the end of this phase:
+
+- `docker compose up -d` starts PostgreSQL 16 and MinIO with health checks and persistent volumes.
+- The application starts with `local`, `test` or `prod` configuration, and as an `api` node, a `worker` node, or both.
+- Flyway applies `V1__initial_schema.sql`, `V2__auth_hardening.sql` and `V3__refresh_token_constraints.sql`; Hibernate validates the entities against them.
+- Module packages exist and a test fails the build if one module reaches into another's internals.
+- Every error response is an RFC 9457 `ProblemDetail` with a `code` and `requestId`.
+- Every request has an `X-Request-Id`, echoed in the response and present in every log line; `prod` logs are JSON.
+- `./mvnw verify` runs unit tests, Testcontainers integration tests, the formatting check and a JaCoCo coverage report.
+- GitHub Actions runs `./mvnw verify` on every PR, and `main` requires it to pass.
+
+**The demo that proves it:**
+
+```bash
+docker compose up -d
+docker compose ps                         # postgres and minio: "healthy"
+SPRING_PROFILES_ACTIVE=local,api,worker ./mvnw spring-boot:run
+curl -s localhost:8080/actuator/health    # {"status":"UP", ...}
+curl -si localhost:8080/api/v1/nope | head -20
+#   HTTP/1.1 401 (or 404 once auth is in) with Content-Type: application/problem+json
+#   and an X-Request-Id header
+./mvnw verify                             # green, including Testcontainers tests
+```
+
+and a PR on GitHub shows a green `build` check that's required for merging.
+
+---
+
+## 2. Concepts to understand first
+
+### 2.1 Spring Boot auto-configuration and Boot 4's modular starters
+
+Spring Boot looks at the classpath and the configuration and creates beans for you: put a JDBC driver and `spring.datasource.url` on the classpath and you get a `DataSource`. In **Boot 4**, auto-configuration was split into many small modules, and each technology has its own starter. That's why `flyway-core` alone did nothing in this project: the `FlywayAutoConfiguration` lives in `spring-boot-flyway`, which `spring-boot-starter-flyway` brings in (the comment in `pom.xml` records this). Expect the same pattern for every technology in this phase: add the **starter**, not just the library. When unsure of a name, check the Boot 4 reference documentation's starter list.
+
+### 2.2 Schema ownership: Flyway versus Hibernate
+
+Two tools could create tables: Flyway (versioned SQL scripts) and Hibernate (`ddl-auto=create/update`). Exactly one must own the schema. Here **Flyway owns it**: the SQL is reviewed, versioned, repeatable and supports partitioning, partial indexes and triggers that Hibernate can't generate. Hibernate runs with `ddl-auto=validate`: at startup it compares each entity with the table and **fails the boot** on a mismatch, which catches mapping bugs before any request does.
+
+**Interview angle:** "Why not `ddl-auto=update` in production?" It can't drop or rename, it can't express constraints like partial unique indexes, it isn't reviewed, and it can make different changes on different environments.
+
+### 2.3 Open Session in View
+
+`spring.jpa.open-in-view=true` (Spring's default) keeps the Hibernate session open for the whole HTTP request, including JSON serialization. Lazy associations then load silently during serialization: N+1 queries outside any transaction, holding a DB connection for the full request. With it **off** (already set), lazy loading outside a transaction throws `LazyInitializationException`, which forces you to fetch exactly what each endpoint needs inside the service transaction. Loud failures beat silent slowness.
+
+### 2.4 Testcontainers and `@ServiceConnection`
+
+**Testcontainers** starts real dependencies (PostgreSQL 16, MinIO) in Docker for the duration of the tests. You test against the exact database engine you deploy, including partitioning, `SKIP LOCKED` and RLS, which H2 or an embedded database can't emulate. `@ServiceConnection` on a container bean tells Spring Boot to derive the connection details (URL, username, password) from the running container, replacing the `spring.datasource.*` properties.
+
+**Interview angle:** "Why not H2 for tests?" Because H2 isn't PostgreSQL. Partial indexes, `NULLS NOT DISTINCT`, JSONB, partitioning, row-level security and `FOR UPDATE SKIP LOCKED` would either fail or behave differently, so the tests would pass while production breaks.
+
+### 2.5 Configuration profiles
+
+A **profile** is a named set of configuration activated at startup (`SPRING_PROFILES_ACTIVE=prod`). `application.yml` holds the defaults; `application-<profile>.yml` overrides them. This project uses two independent dimensions:
+
+| Dimension | Profiles | Chooses |
+|---|---|---|
+| Environment | `local`, `test`, `prod` | Where it runs: logging format, secrets source, dev conveniences |
+| Role | `api`, `worker` | What it does: serve HTTP traffic, process background jobs, or both (local runs both) |
+
+Combine them: `prod,api` on the API nodes, `prod,worker` on the worker nodes, `local,api,worker` on your laptop. This is decision D1 in `docs/scalability.md` §3.1 (folded in here from scalability.md §9).
+
+**Rule:** secrets never live in committed files. Committed YAML references `${ENV_VAR}`; values come from the environment (or the gitignored `.env` locally).
+
+### 2.6 Module boundaries and Spring Modulith
+
+In a modular monolith (ADR 0002), each top-level package under `com.reconflow.paymentreconflow` is a **module**. **Spring Modulith** treats a module's top-level package as its public API and every sub-package as internal. `ApplicationModules.of(App.class).verify()` fails if module A uses an internal type of module B, or if modules form a cycle. A sub-package can be opened deliberately with `@NamedInterface`. That turns the dependency rules written in `docs/architecture.md` §4 into a test that breaks the build.
+
+### 2.7 RFC 9457 Problem Details
+
+A standard JSON shape for HTTP errors (`application/problem+json`) with `type`, `title`, `status`, `detail`, `instance`, plus any extension members. Spring has built-in support (`ProblemDetail`, `ErrorResponse`, `ResponseEntityExceptionHandler`). One consistent error shape lets clients handle errors generically, and the `code` member gives them a stable machine-readable value that doesn't change when the human-readable `title` is reworded.
+
+### 2.8 Correlation IDs and MDC
+
+A **request ID** identifies one HTTP request across every log line it produces, and the client gets it back in a response header, so "it failed" becomes "request `4f1c2a…` failed" and support can find the logs. **MDC** (Mapped Diagnostic Context) is a per-thread map that the logging framework adds to every log line written on that thread. A servlet filter puts the ID in the MDC at the start of the request and removes it at the end.
+
+**Interview angle:** MDC is thread-local, so it doesn't follow work handed to another thread (`@Async`, executors, the job worker). Copy it explicitly, or put the originating request ID in the job payload.
+
+### 2.9 Quality gates and CI
+
+A **quality gate** is an automated check that must pass before merging: compile, tests, formatting, (later) coverage thresholds and vulnerability scans. **CI** runs them on a clean machine for every PR, and branch protection (M0.4) makes passing mandatory. Formatting is automated (Spotless) so code review discusses design, never whitespace.
+
+---
+
+## 3. Starting point
+
+| Item | State |
+|---|---|
+| `pom.xml` | Boot parent 4.1.2, Java 25. Dependencies: `starter-validation`, `starter-webmvc`, `starter-data-jpa`, `starter-actuator`, `postgresql` (runtime), `starter-flyway`, `flyway-database-postgresql`, `devtools`; tests: `starter-validation-test`, `starter-webmvc-test`. **No** security, Testcontainers, Modulith, Spotless, JaCoCo |
+| `application.yml` | Single file. `.env` import, `DB_URL`/`DB_USER`/`DB_PASSWORD` placeholders, Hikari pool, `ddl-auto: validate` ✓, `open-in-view: false` ✓, `hibernate.jdbc.time_zone: UTC`, Flyway enabled, actuator `health,info`. **No profiles** |
+| Migrations | `V1__initial_schema.sql`, `V2__auth_hardening.sql`, `V3__refresh_token_constraints.sql` (the TASKS.md exit criterion says `V1__baseline.sql`; that's out of date) |
+| Java | `PaymentreconflowApplication.java` only |
+| Tests | `PaymentreconflowApplicationTests.contextLoads()`, needs a live database (fails on a fresh clone unless M0 §4.7 pulled Testcontainers forward) |
+| Docker | No `compose.yaml` |
+| CI | None |
+
+Tick M2.1 (done, using `spring-boot-starter-flyway` instead of `flyway-core`), M2.6 and M2.7 in TASKS.md.
+
+---
+
+## 4. Step by step
+
+Order: infrastructure first (so tests can run), then configuration, then code structure, then quality gates and CI. Each numbered task is one PR unless noted.
+
+### 4.1 M2.1 — Data dependencies (done)
+
+**What:** JPA, PostgreSQL driver, Flyway.
+
+**Already in place:** `spring-boot-starter-data-jpa`, `postgresql` (runtime), `spring-boot-starter-flyway`, `flyway-database-postgresql` (Flyway 10+ moved each database's support into its own module; without it Flyway fails with "Unsupported Database: PostgreSQL 16").
+
+**Done when:** already true. Tick it, with a note that the starter replaces `flyway-core`.
+
+### 4.2 M2.4 — `compose.yaml` with PostgreSQL and MinIO
+
+**What:** one file that starts every local dependency.
+
+**Why:** a new contributor runs one command instead of installing PostgreSQL and configuring `pg_hba.conf` (the README's current setup). MinIO is added here because `FileStorage` is S3-compatible from M5 (scalability.md §9, M2.4 change).
+
+**How:** create `compose.yaml` at the root:
+
+```yaml
+name: reconflow
+
+services:
+  postgres:
+    # Pin the minor version: "postgres:16" floats and can change under you.
+    image: postgres:16.4-alpine
+    environment:
+      POSTGRES_DB: paymentreconflow
+      POSTGRES_USER: ${DB_USER:?set DB_USER in .env}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+      # Require passwords even for local connections (see README "Local auth").
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z   # pin a release tag; check Docker Hub for the latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY in .env}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:?set S3_SECRET_KEY in .env}
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # web console
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot job: creates the bucket once MinIO is healthy, then exits.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 $${S3_ACCESS_KEY} $${S3_SECRET_KEY} &&
+      mc mb --ignore-existing local/$${S3_BUCKET}
+      "
+    environment:
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      S3_BUCKET: ${S3_BUCKET:-reconflow-imports}
+
+volumes:
+  postgres-data:
+  minio-data:
+```
+
+Docker Compose reads `.env` in the project directory automatically, the same file the app imports. Add to `.env.example`:
+
+```properties
+# Object storage (MinIO locally, S3 in production)
+S3_ENDPOINT=http://localhost:9000
+S3_ACCESS_KEY=reconflow
+S3_SECRET_KEY=change-me-at-least-8-chars
+S3_BUCKET=reconflow-imports
+S3_REGION=us-east-1
+```
+
+**Pitfalls:**
+
+- `$${VAR}` (double dollar) inside `command`/`entrypoint`/`healthcheck` passes a literal `$` to the container shell; a single `$` is interpolated by Compose from `.env` at parse time. Both work here, but know the difference.
+- **Named volumes** survive `docker compose down`. To wipe the database (e.g. after editing a migration during experiments, which you should never do to an applied one), run `docker compose down -v`.
+- `depends_on` with `condition: service_healthy` waits for the health check, not just for the container to start. Without the health check, the init job races MinIO.
+- `POSTGRES_*` environment variables only take effect on the **first** start with an empty volume. Changing the password later requires `down -v` or `ALTER ROLE`.
+- If you already run a Homebrew PostgreSQL on 5432, one of them fails to bind. Stop the Homebrew service (`brew services stop postgresql@16`) or map `5433:5432` and change `DB_URL`.
+
+**Optional:** Boot's `spring-boot-docker-compose` module can start `compose.yaml` automatically on `spring-boot:run`. It's convenient, but keep the explicit `docker compose up` in the README so the dependency is visible. Verify the Boot 4 artifact name if you add it.
+
+**Done when:** `docker compose up -d && docker compose ps` shows `postgres` and `minio` as `healthy`, `minio-init` exited with code 0, and `http://localhost:9001` shows the bucket.
+
+### 4.3 M2.3 — Testcontainers
+
+**What:** integration tests start their own PostgreSQL (and later MinIO) containers.
+
+**Why:** see §2.4. Also fixes the fresh-clone failure (M0 exit criterion).
+
+**How:** add to `pom.xml`:
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-testcontainers</artifactId>
+    <scope>test</scope>
+</dependency>
+<dependency>
+    <groupId>org.testcontainers</groupId>
+    <artifactId>testcontainers-junit-jupiter</artifactId>
+    <scope>test</scope>
+</dependency>
+<dependency>
+    <groupId>org.testcontainers</groupId>
+    <artifactId>testcontainers-postgresql</artifactId>
+    <scope>test</scope>
+</dependency>
+<!-- Added in M5 when FileStorage lands:
+<dependency>
+    <groupId>org.testcontainers</groupId>
+    <artifactId>testcontainers-minio</artifactId>
+    <scope>test</scope>
+</dependency>
+-->
+```
+
+Testcontainers 2.x renamed its modules (`postgresql` → `testcontainers-postgresql`) and moved container classes into per-module packages (`org.testcontainers.postgresql.PostgreSQLContainer`). Boot 4's dependency management pins the version, so no `<version>` tags. **Verify the exact artifact IDs and package names against the Boot 4 dependency versions page**; if Boot 4.1 still manages Testcontainers 1.x, the artifacts are `org.testcontainers:postgresql` and `org.testcontainers:junit-jupiter`.
+
+Create `src/test/java/com/reconflow/paymentreconflow/TestcontainersConfiguration.java`:
+
+```java
+package com.reconflow.paymentreconflow;
+
+import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.context.annotation.Bean;
+import org.testcontainers.postgresql.PostgreSQLContainer;
+import org.testcontainers.utility.DockerImageName;
+
+@TestConfiguration(proxyBeanMethods = false)
+public class TestcontainersConfiguration {
+
+    // Same image as compose.yaml, so tests run on the engine you develop against.
+    static final DockerImageName POSTGRES = DockerImageName.parse("postgres:16.4-alpine");
+
+    @Bean
+    @ServiceConnection
+    PostgreSQLContainer postgres() {
+        return new PostgreSQLContainer(POSTGRES);
+    }
+}
+```
+
+You can also run the app locally *against* Testcontainers, with no compose, through a test-scoped main class. Boot's "development-time services" feature:
+
+```java
+// src/test/java/com/reconflow/paymentreconflow/TestPaymentreconflowApplication.java
+public class TestPaymentreconflowApplication {
+    public static void main(String[] args) {
+        SpringApplication.from(PaymentreconflowApplication::main)
+                .with(TestcontainersConfiguration.class)
+                .run(args);
+    }
+}
+```
+
+Run with `./mvnw spring-boot:test-run`.
+
+**Pitfalls:**
+
+- Docker must be running. On macOS with Docker Desktop that's automatic; with Colima, export `DOCKER_HOST` and `TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock` (see the Testcontainers docs for Colima).
+- Every distinct Spring test context starts its own container. Different `@MockitoBean` sets or `@ActiveProfiles` per test class create different contexts. The base class in M2.16 keeps one shared context.
+- `${DB_USER}` with no default in `application.yml`: if startup complains it can't resolve the placeholder, the `test` profile (M2.5) supplies harmless defaults.
+
+**Done when:** with no `.env` and no local PostgreSQL, `./mvnw test` passes and logs `Successfully applied 3 migrations to schema "public"`.
+
+### 4.4 M2.5 — `application.yml` profiles
+
+**What:** split configuration into defaults plus environment and role overlays.
+
+**Why:** see §2.5.
+
+**How:** keep `src/main/resources/application.yml` for shared defaults, and add overlays.
+
+`application.yml` (shared; changes from today marked):
+
+```yaml
+spring:
+  application:
+    name: reconflow
+  config:
+    import: optional:file:.env[.properties]
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/paymentreconflow}
+    username: ${DB_USER:}          # empty default: the test profile and @ServiceConnection don't need it
+    password: ${DB_PASSWORD:}
+    hikari:
+      maximum-pool-size: ${DB_POOL_SIZE:10}
+      connection-timeout: 5000
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: false
+  mvc:
+    problemdetails:
+      enabled: true               # NEW: Spring MVC's own exceptions render as ProblemDetail
+  servlet:
+    multipart:
+      max-file-size: 50MB         # NEW: CSV contract limit (M1.3); enforced again in code (M10.3)
+      max-request-size: 51MB
+
+server:
+  port: ${PORT:8080}
+  shutdown: graceful              # NEW: finish in-flight requests on SIGTERM
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: when-authorized
+      probes:
+        enabled: true             # NEW: /actuator/health/liveness and /readiness (M9.11 builds on it)
+
+reconflow:
+  storage:
+    endpoint: ${S3_ENDPOINT:}
+    region: ${S3_REGION:us-east-1}
+    bucket: ${S3_BUCKET:reconflow-imports}
+    access-key: ${S3_ACCESS_KEY:}
+    secret-key: ${S3_SECRET_KEY:}
+  jobs:
+    worker:
+      enabled: false              # the worker profile turns it on
+
+logging:
+  level:
+    org.flywaydb: INFO
+```
+
+`application-local.yml`:
+
+```yaml
+logging:
+  level:
+    com.reconflow: DEBUG
+    org.hibernate.SQL: DEBUG     # see every SQL statement while developing
+management:
+  endpoint:
+    health:
+      show-details: always
+```
+
+`src/test/resources/application-test.yml` (in **test** resources, so it never ships):
+
+```yaml
+spring:
+  datasource:
+    username: test   # overridden by @ServiceConnection; present so placeholders resolve
+    password: test
+logging:
+  level:
+    org.testcontainers: INFO
+    com.github.dockerjava: WARN
+```
+
+`application-prod.yml`:
+
+```yaml
+spring:
+  datasource:
+    url: ${DB_URL}           # no defaults in prod: missing config fails at startup
+    username: ${DB_USER}
+    password: ${DB_PASSWORD}
+  config:
+    import: ""               # never read a .env file in production
+logging:
+  structured:
+    format:
+      console: ecs           # M2.12
+server:
+  error:
+    include-stacktrace: never
+```
+
+`application-api.yml` and `application-worker.yml`:
+
+```yaml
+# application-worker.yml
+reconflow:
+  jobs:
+    worker:
+      enabled: true
+      threads: 4
+```
+
+```yaml
+# application-api.yml
+# Nothing yet: API beans are on by default. Exists so the profile is explicit
+# and has a home for API-only settings (rate limits in M10.4).
+```
+
+**Decision: role switching uses a property, not `@Profile` annotations.** The job worker bean is created with `@ConditionalOnBooleanProperty("reconflow.jobs.worker.enabled")` (verify the annotation name in Boot 4; `@ConditionalOnProperty(name = "...", havingValue = "true")` works everywhere). The `worker` profile sets the property. That keeps the profile names in YAML only, where you can see them, rather than scattered across `@Profile("worker")` annotations. API nodes have the worker disabled; worker nodes still start the web server so `/actuator/health` works for the orchestrator, but the load balancer only routes to API nodes.
+
+Bind the `reconflow.*` properties to a typed record in `shared`:
+
+```java
+@ConfigurationProperties("reconflow.storage")
+@Validated
+public record StorageProperties(String endpoint, @NotBlank String region, @NotBlank String bucket,
+                                String accessKey, String secretKey) {}
+```
+
+and enable it with `@ConfigurationPropertiesScan` on the application class.
+
+**How to activate profiles:**
+
+| Where | How |
+|---|---|
+| Laptop | `SPRING_PROFILES_ACTIVE=local,api,worker ./mvnw spring-boot:run`, or `-Dspring-boot.run.profiles=local,api,worker` |
+| Tests | `@ActiveProfiles("test")` on the base class (M2.16) |
+| Production | `SPRING_PROFILES_ACTIVE=prod,api` / `prod,worker` set by the platform |
+
+**Pitfalls:**
+
+- Don't set `spring.profiles.active` inside a profile-specific file; Boot rejects it. Activate profiles from outside.
+- **No default profile that's convenient for development.** If `local` were the default, a production deploy that forgot `SPRING_PROFILES_ACTIVE` would run with DEBUG SQL logging and generated JWT keys (authentication.plan §7). With no default, it runs with the strict base config.
+- `${DB_USER:}` (empty default) in the base file plus `${DB_USER}` (no default) in `prod` means: lenient in tests, fail-fast in production.
+
+**Done when:** `SPRING_PROFILES_ACTIVE=local,api,worker ./mvnw spring-boot:run` starts against compose; `SPRING_PROFILES_ACTIVE=prod,api` with `DB_URL` unset fails immediately with a clear "Could not resolve placeholder 'DB_URL'".
+
+### 4.5 M2.6 / M2.7 — `ddl-auto=validate` and `open-in-view=false` (done)
+
+Both are already in `application.yml`. See §2.2 and §2.3 for the reasons, which you should be able to explain. Tick them.
+
+**One check to add:** a test that the settings stay that way, because someone (you, in six months) might flip them while debugging:
+
+```java
+class JpaSettingsTest extends AbstractIntegrationTest {
+    @Value("${spring.jpa.open-in-view}") boolean openInView;
+    @Value("${spring.jpa.hibernate.ddl-auto}") String ddlAuto;
+
+    @Test
+    void schemaIsOwnedByFlywayAndSessionsDoNotLeakIntoViews() {
+        assertThat(openInView).isFalse();
+        assertThat(ddlAuto).isEqualTo("validate");
+    }
+}
+```
+
+### 4.6 M2.2 — Actuator and Security
+
+**What:** actuator is already present. Add `spring-boot-starter-security`.
+
+**Why now:** so every endpoint written from M3 onward is secured by default, rather than retrofitting security onto open endpoints.
+
+**How:**
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-security</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-security-test</artifactId>  <!-- verify the Boot 4 test starter name; else spring-security-test -->
+    <scope>test</scope>
+</dependency>
+```
+
+**Warning — what happens the moment you add it:** Spring Boot's default security locks **every** endpoint, including `/actuator/health`, behind HTTP Basic with a generated user (`user` / a password printed in the log). Health checks from Docker, the load balancer and CI then get `401`. Until M3.3 builds real authentication, add a temporary filter chain:
+
+```java
+package com.reconflow.paymentreconflow.security.config;
+
+// TEMPORARY (M2.2): replaced by the real chain in M3.3 (authentication.plan §6).
+@Configuration
+@EnableWebSecurity
+class SecurityConfig {
+
+    @Bean
+    SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+            .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            .csrf(csrf -> csrf.disable())          // stateless API, no cookies yet
+            .httpBasic(basic -> basic.disable())
+            .formLogin(form -> form.disable())
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/actuator/health/**", "/actuator/info").permitAll()
+                .anyRequest().authenticated());    // everything else: 401 until M3
+        return http.build();
+    }
+
+    // Stops Boot generating and logging a default user.
+    @Bean
+    UserDetailsService noUsers() {
+        return username -> { throw new UsernameNotFoundException(username); };
+    }
+}
+```
+
+`anyRequest().authenticated()` with no login mechanism means every other path returns `401`. That's the correct default: deny until proven allowed. Make the `401` a `ProblemDetail` too, by registering an `AuthenticationEntryPoint` that writes one (M2.10 shows the shape).
+
+**Pitfalls:**
+
+- Don't `permitAll()` everything "for now". It always outlives "for now".
+- `show-details: when-authorized` on health means anonymous callers see only `{"status":"UP"}`. Good: component details (DB version, disk) are information an attacker would like.
+
+**Done when:** `curl -i localhost:8080/actuator/health` → `200`; `curl -i localhost:8080/api/v1/anything` → `401` with `application/problem+json`; no "Using generated security password" line in the log.
+
+### 4.7 M2.8 — Module packages
+
+**What:** one package per module, each with a `package-info.java` describing it.
+
+**Why:** the boundaries from `docs/architecture.md` §3 need somewhere to live before code arrives.
+
+**How:**
+
+```
+src/main/java/com/reconflow/paymentreconflow/
+├── PaymentreconflowApplication.java
+├── organization/package-info.java
+├── security/package-info.java
+├── ingestion/package-info.java
+├── ledger/package-info.java
+├── reconciliation/package-info.java
+├── exceptions/package-info.java
+├── reporting/package-info.java
+├── audit/package-info.java
+└── shared/
+    ├── package-info.java
+    ├── error/      ProblemCodes, ApiException and subclasses, GlobalExceptionHandler (M2.10)
+    ├── web/        RequestIdFilter (M2.11), PageResponse
+    ├── id/         Ids (UUIDv7)
+    ├── json/       Jackson configuration (money as strings)
+    ├── config/     typed @ConfigurationProperties records
+    └── job/        job queue (filled in M5)
+```
+
+Example `package-info.java`:
+
+```java
+/**
+ * Ingestion: file upload, storage, parsing, validation and normalization of
+ * CSV imports. Owns import_batch and import_row_error.
+ * Public API: this package. Everything in sub-packages is internal.
+ */
+@org.springframework.modulith.ApplicationModule(displayName = "Ingestion")
+package com.reconflow.paymentreconflow.ingestion;
+```
+
+**Shared building blocks to add in this task** (small, used everywhere from M3):
+
+*UUIDv7 IDs (ADR 0010).* The JDK has no UUIDv7 generator. Either use a library such as `com.github.f4b6a3:uuid-creator` (`UuidCreator.getTimeOrderedEpoch()`), or Hibernate's `@UuidGenerator(style = UuidGenerator.Style.VERSION_7)` (verify it exists in the Hibernate version Boot 4.1 ships). Prefer one static entry point so the choice lives in one place:
+
+```java
+package com.reconflow.paymentreconflow.shared.id;
+
+public final class Ids {
+    private Ids() {}
+
+    /** Time-ordered UUIDv7: unguessable enough to expose, index-friendly to insert. */
+    public static UUID newId() {
+        return UuidCreator.getTimeOrderedEpoch();
+    }
+}
+```
+
+Assigning IDs in the application (not on insert) means the ID is known before saving, so it can go in the audit event and the `Location` header in the same transaction, and Hibernate can batch inserts.
+
+*Money as JSON strings* (rule from `docs/reconciliation-rules.md` §8). In Boot 4, Jackson 3 lives under `tools.jackson`; register a customizer that serializes every `BigDecimal` as a plain string:
+
+```java
+package com.reconflow.paymentreconflow.shared.json;
+
+@Configuration(proxyBeanMethods = false)
+class JsonConfig {
+    // Verify the Boot 4 customizer type (JsonMapperBuilderCustomizer) and the
+    // Jackson 3 feature names against the docs; the intent is:
+    //   BigDecimal -> "1000.0000" (string, plain notation, never 1E+3)
+    @Bean
+    JsonMapperBuilderCustomizer moneyAsString() {
+        return builder -> builder
+                .addModule(new SimpleModule().addSerializer(BigDecimal.class, new ToStringSerializer() {
+                    @Override
+                    public void serialize(Object value, JsonGenerator gen, SerializationContext ctx) {
+                        gen.writeString(((BigDecimal) value).toPlainString());
+                    }
+                }));
+    }
+}
+```
+
+Test it with a `@JsonTest` slice: `{"amount": new BigDecimal("1E+3")}` serializes to `"1000"`.
+
+**Role profiles (scalability.md §9, M2.8 change):** the `api`/`worker` property switch from §4.4 is part of this task's structure: the (future) `JobWorker` in `shared.jobs` is the only bean conditional on `reconflow.jobs.worker.enabled`.
+
+**Pitfalls:**
+
+- Empty packages aren't committed by Git; the `package-info.java` files keep them.
+- Don't create `controller/`, `service/`, `repository/` packages at the root ("package by layer"). Package by **feature** (module), then by layer inside if useful.
+
+**Done when:** the tree above exists and the app still starts.
+
+### 4.8 M2.9 — Enforce module boundaries
+
+**What:** a test that fails when a module uses another's internals or modules form a cycle.
+
+**How:** add Spring Modulith (manage its version with its BOM; Modulith 2.x targets Boot 4; verify the exact version):
+
+```xml
+<dependencyManagement>
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.modulith</groupId>
+            <artifactId>spring-modulith-bom</artifactId>
+            <version>2.0.x</version> <!-- the release matching Boot 4.1; check the Modulith compatibility table -->
+            <type>pom</type>
+            <scope>import</scope>
+        </dependency>
+    </dependencies>
+</dependencyManagement>
+
+<!-- in <dependencies> -->
+<dependency>
+    <groupId>org.springframework.modulith</groupId>
+    <artifactId>spring-modulith-starter-core</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.springframework.modulith</groupId>
+    <artifactId>spring-modulith-starter-test</artifactId>
+    <scope>test</scope>
+</dependency>
+```
+
+`src/test/java/com/reconflow/paymentreconflow/ModularityTest.java`:
+
+```java
+class ModularityTest {
+
+    static final ApplicationModules modules = ApplicationModules.of(PaymentreconflowApplication.class);
+
+    @Test
+    void modulesRespectTheirBoundaries() {
+        modules.verify();   // no cycles, no access to another module's internal packages
+    }
+
+    @Test
+    void writeDocumentation() {
+        // Generates PlantUML/C4 diagrams of the actual module graph into target/spring-modulith-docs.
+        // Compare them with docs/architecture.md §4 when reviewing.
+        new Documenter(modules).writeDocumentation();
+    }
+}
+```
+
+`verify()` needs no Spring context and no database; it's a fast unit test.
+
+**Declaring the allowed dependencies** from `docs/architecture.md` §4 explicitly, so an *allowed-but-unplanned* dependency also fails:
+
+```java
+@ApplicationModule(allowedDependencies = { "ledger", "audit", "shared :: *", "security :: tenant" })
+package com.reconflow.paymentreconflow.ingestion;
+```
+
+- `shared` is used by everyone, including its sub-packages. Either mark it `@ApplicationModule(type = ApplicationModule.Type.OPEN)` (all sub-packages public), or expose each sub-package with `@NamedInterface`. Open is simpler and fine for a module of building blocks.
+- `security` exposes only a small user-directory API (membership and display-name lookups) as a named interface, e.g. `@NamedInterface("directory")` in `security/directory/package-info.java`. The tenant and identity **interfaces** (`TenantContext`, `CurrentUser`, `TenantScope`, `Permission`) live in `shared` and are implemented inside `security` (phase-M3 explains why: it avoids a `security → audit → security` cycle). Everything else, including `security.auth` and `security.token`, stays internal, which enforces the authentication.plan §6 rule.
+
+**ArchUnit, only for what Modulith can't express.** Add it (`com.tngtech.archunit:archunit-junit5`, test scope) when the first such rule appears. Candidates:
+
+- "No class outside `security` reads `SecurityContextHolder`" (M3.3i).
+- "No field or parameter of type `double`/`float` in any class whose name contains `Amount` or in entities" (money rule).
+- "Repository methods in tenant-owned modules declare an `organizationId` parameter" (M3.5).
+
+**Pitfalls:** `verify()` on an empty project passes trivially. Prove it works: temporarily make `ledger` import a class from `ingestion.internal`, run the test, see it fail, revert.
+
+**Done when:** `./mvnw test -Dtest=ModularityTest` passes, and the deliberate violation makes it fail.
+
+### 4.9 M2.10 — Global `ProblemDetail` error handling
+
+**What:** one `@RestControllerAdvice` that turns every exception into the error format in `docs/api-design.md` §3.
+
+**Why:** consistent errors for clients; no stack traces or SQL leaking to callers; a single place to log unexpected failures.
+
+**How:** first, a small exception hierarchy in `shared.error`:
+
+```java
+package com.reconflow.paymentreconflow.shared.error;
+
+/** Base for errors the API reports deliberately. code is the stable kebab-case identifier. */
+public abstract class ApiException extends RuntimeException {
+    private final HttpStatus status;
+    private final String code;
+    private final Map<String, Object> properties;
+
+    protected ApiException(HttpStatus status, String code, String detail, Map<String, Object> properties) {
+        super(detail);
+        this.status = status;
+        this.code = code;
+        this.properties = Map.copyOf(properties);
+    }
+    // getters
+}
+
+public final class NotFoundException extends ApiException {
+    public NotFoundException(String entity, UUID id) {
+        super(HttpStatus.NOT_FOUND, "not-found", entity + " " + id + " was not found", Map.of());
+    }
+}
+
+public final class ConflictException extends ApiException {
+    public ConflictException(String code, String detail, Map<String, Object> properties) {
+        super(HttpStatus.CONFLICT, code, detail, properties);
+    }
+}
+```
+
+Then the handler. Extending `ResponseEntityExceptionHandler` gives ProblemDetail rendering for all of Spring MVC's own exceptions (unsupported media type, missing parameter, malformed JSON, …); you override only where you want different output:
+
+```java
+package com.reconflow.paymentreconflow.shared.error;
+
+@RestControllerAdvice
+class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
+
+    private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
+    static final String TYPE_BASE = "https://reconflow.dev/problems/";
+
+    @ExceptionHandler(ApiException.class)
+    ProblemDetail handleApi(ApiException ex) {
+        ProblemDetail pd = problem(ex.getStatus(), ex.getCode(), ex.getMessage());
+        ex.getProperties().forEach(pd::setProperty);
+        return pd;
+    }
+
+    // Bean Validation on @RequestBody
+    @Override
+    protected ResponseEntity<Object> handleMethodArgumentNotValid(
+            MethodArgumentNotValidException ex, HttpHeaders headers, HttpStatusCode status, WebRequest request) {
+        ProblemDetail pd = problem(HttpStatus.BAD_REQUEST, "validation-failed", "The request is invalid.");
+        pd.setProperty("errors", ex.getBindingResult().getFieldErrors().stream()
+                .map(e -> Map.of("field", e.getField(),
+                                 "code", String.valueOf(e.getCode()),
+                                 "message", String.valueOf(e.getDefaultMessage())))
+                .toList());
+        return ResponseEntity.badRequest().body(pd);
+    }
+
+    // Optimistic locking failure that escaped the service layer (M7.8 maps it explicitly too)
+    @ExceptionHandler(ObjectOptimisticLockingFailureException.class)
+    ProblemDetail handleStale(ObjectOptimisticLockingFailureException ex) {
+        return problem(HttpStatus.CONFLICT, "stale-version", "The resource was changed by someone else. Reload and retry.");
+    }
+
+    // Last resort: log everything, reveal nothing.
+    @ExceptionHandler(Exception.class)
+    ProblemDetail handleUnexpected(Exception ex) {
+        log.error("Unhandled exception", ex);
+        return problem(HttpStatus.INTERNAL_SERVER_ERROR, "internal-error",
+                "An unexpected error occurred. Quote the requestId when reporting it.");
+    }
+
+    // Also applied to every ProblemDetail Spring MVC builds itself.
+    @Override
+    protected ResponseEntity<Object> createResponseEntity(Object body, HttpHeaders headers,
+                                                          HttpStatusCode status, WebRequest request) {
+        if (body instanceof ProblemDetail pd) enrich(pd, defaultCode(status));
+        return super.createResponseEntity(body, headers, status, request);
+    }
+
+    private ProblemDetail problem(HttpStatusCode status, String code, String detail) {
+        ProblemDetail pd = ProblemDetail.forStatusAndDetail(status, detail);
+        enrich(pd, code);
+        return pd;
+    }
+
+    private void enrich(ProblemDetail pd, String code) {
+        if (pd.getProperties() == null || !pd.getProperties().containsKey("code")) {
+            pd.setType(URI.create(TYPE_BASE + code));
+            pd.setProperty("code", code);
+        }
+        pd.setProperty("requestId", MDC.get(RequestIdFilter.MDC_KEY));
+    }
+
+    private static String defaultCode(HttpStatusCode status) {
+        return switch (status.value()) {
+            case 400 -> "bad-request";
+            case 404 -> "not-found";
+            case 405 -> "method-not-allowed";
+            case 413 -> "file-too-large";
+            case 415 -> "unsupported-media-type";
+            default -> "http-" + status.value();
+        };
+    }
+}
+```
+
+Security errors (`401`, `403`) happen in filters, *before* the controller advice can see them. Give the security config an `AuthenticationEntryPoint` and an `AccessDeniedHandler` that write the same JSON (use a shared `ProblemDetailWriter` that serializes a `ProblemDetail` to the response with `application/problem+json`).
+
+Add the error codes to a single class (`ProblemCodes` with `public static final String` constants, or an enum) so codes aren't typed as free strings in 40 places, and keep it in sync with the catalogue in `docs/api-design.md` §3.
+
+**Pitfalls:**
+
+- Never put `ex.getMessage()` of an unexpected exception in the response: it can contain SQL, table names or data.
+- A `DataIntegrityViolationException` from a unique constraint is often an *expected* conflict (duplicate file, duplicate active case). Don't map it globally to `409`: catch it where it happens, check which constraint fired, and throw a specific `ConflictException`. A global mapping would turn genuine bugs into misleading `409`s.
+- Make sure 404s for unknown URLs also get ProblemDetail (in Boot 4 / Spring 7 the `NoResourceFoundException` path is handled by `ResponseEntityExceptionHandler`; verify with a test).
+
+**Done when:** a `@WebMvcTest` slice with a dummy controller asserts `Content-Type: application/problem+json`, `type`, `code` and `requestId` for: a thrown `NotFoundException`, a validation failure (with `errors[]`), malformed JSON, an unknown URL, and a `RuntimeException` (body contains no exception message).
+
+### 4.10 M2.11 — Request correlation ID
+
+**What:** a filter that assigns each request an ID, puts it in the MDC and returns it in `X-Request-Id`.
+
+**How:**
+
+```java
+package com.reconflow.paymentreconflow.shared.web;
+
+@Component
+@Order(Ordered.HIGHEST_PRECEDENCE)   // before Spring Security, so even 401s carry the ID
+public class RequestIdFilter extends OncePerRequestFilter {
+
+    public static final String HEADER = "X-Request-Id";
+    public static final String MDC_KEY = "requestId";
+    // Accept a caller's ID only if it's short and harmless (it ends up in logs).
+    private static final Pattern SAFE = Pattern.compile("[A-Za-z0-9._-]{8,64}");
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
+            throws ServletException, IOException {
+        String incoming = request.getHeader(HEADER);
+        String requestId = (incoming != null && SAFE.matcher(incoming).matches())
+                ? incoming
+                : UUID.randomUUID().toString().replace("-", "").substring(0, 16);
+        MDC.put(MDC_KEY, requestId);
+        response.setHeader(HEADER, requestId);
+        try {
+            chain.doFilter(request, response);
+        } finally {
+            MDC.remove(MDC_KEY);   // threads are pooled: a leftover ID would label the next request
+        }
+    }
+}
+```
+
+Show the ID in local (non-JSON) logs too, in `application-local.yml`:
+
+```yaml
+logging:
+  pattern:
+    correlation: "[%X{requestId:-}] "
+```
+
+The same request ID is written to `audit_event.request_id` (M4.3) by reading the MDC, so an audit row links back to its logs.
+
+**Background jobs:** MDC is per thread (§2.8). When enqueueing a job (M5), store the request ID in the job payload; the worker puts it in the MDC while processing (and adds `jobId`), so logs from the worker can be traced to the upload that caused them.
+
+**Pitfalls:**
+
+- Validating the incoming header prevents log injection (a header containing newlines can forge log lines).
+- Spring Boot with Micrometer Tracing adds `traceId`/`spanId` to the MDC automatically. If you add tracing later (M9), you can use the trace ID as the request ID; until then this filter is simpler and has no dependencies.
+
+**Done when:** an integration test calls any URL, asserts the `X-Request-Id` header, asserts the same value is in the ProblemDetail's `requestId`, and asserts a valid incoming ID is echoed while `"bad\nvalue"` is replaced.
+
+### 4.11 M2.12 — Structured JSON logging in `prod`
+
+**What:** one JSON object per log line in production.
+
+**Why:** log platforms (Loki, Elasticsearch, CloudWatch) index JSON fields, so you can query `requestId = "4f1c…"` or `level = ERROR AND logger = …ingestion…`. Multi-line stack traces in plain text get split into separate events; in JSON they're one field.
+
+**How:** Spring Boot 3.4+ has structured logging built in; no Logback encoder dependency needed. `application-prod.yml` already contains:
+
+```yaml
+logging:
+  structured:
+    format:
+      console: ecs        # Elastic Common Schema; alternatives: logstash, gelf
+```
+
+MDC entries (like `requestId`) are included as fields automatically. Add static fields that identify the node:
+
+```yaml
+logging:
+  structured:
+    ecs:
+      service:
+        name: reconflow
+        environment: prod
+```
+
+(Verify the exact property names for service metadata in the Boot 4 logging docs.)
+
+Keep **human-readable** logs in `local`: JSON is hard to read in a terminal.
+
+**Pitfalls:** don't log request bodies or CSV rows. They contain references and amounts, which is financial data (M10.6 reviews this).
+
+**Done when:** `SPRING_PROFILES_ACTIVE=prod,api DB_URL=… DB_USER=… DB_PASSWORD=… java -jar target/*.jar` prints JSON lines, and a request's lines contain `"requestId"`.
+
+### 4.12 M2.16 — Base integration test class
+
+**What:** one abstract class that every integration test extends.
+
+**Why:** a single, shared Spring context and container for the whole test run (fast), and consistent setup (profile, MockMvc, helpers).
+
+**How:** `src/test/java/com/reconflow/paymentreconflow/support/AbstractIntegrationTest.java`:
+
+```java
+package com.reconflow.paymentreconflow.support;
+
+@SpringBootTest
+@AutoConfigureMockMvc
+@ActiveProfiles("test")
+@Import(TestcontainersConfiguration.class)
+public abstract class AbstractIntegrationTest {
+
+    @Autowired protected MockMvc mockMvc;
+    @Autowired protected JdbcTemplate jdbc;
+
+    // Helpers added as the domain grows, e.g. in M3:
+    //   protected TestOrg newOrganization() { ... }   // every test gets its own org
+}
+```
+
+Update the existing test:
+
+```java
+class PaymentreconflowApplicationTests extends AbstractIntegrationTest {
+    @Test
+    void contextLoadsAndMigrationsApply() {
+        Integer applied = jdbc.queryForObject(
+                "select count(*) from flyway_schema_history where success", Integer.class);
+        assertThat(applied).isGreaterThanOrEqualTo(3);
+    }
+}
+```
+
+**Test data isolation strategy (decide now, it affects every later test):**
+
+| Strategy | Problem here |
+|---|---|
+| `TRUNCATE` all tables between tests | `audit_event` has a trigger that **forbids TRUNCATE** (V1). Don't fight it |
+| `@Transactional` on tests (rollback after each) | Hides bugs: the code under test can't commit, so you can't test commit-time behaviour, multi-transaction flows, job workers or concurrency (M7.14) |
+| **Each test creates its own organization** and only queries within it | **Chosen.** Works naturally with multi-tenancy (every query is org-scoped anyway), tests can't see each other's data, data accumulates harmlessly in a throwaway container |
+
+So: never rely on a table being empty; always assert on data in *your* test's organization. Use `@Transactional` only for pure repository tests that don't need commits.
+
+**Container reuse:** Spring's test context cache keeps one context (and so one container) for every test class with the same configuration. Avoid per-class `@MockitoBean`, `@TestPropertySource` or different `@ActiveProfiles` unless needed; each variation starts a new context and a new container. For faster local runs you can enable Testcontainers' reuse (`testcontainers.reuse.enable=true` in `~/.testcontainers.properties` and `.withReuse(true)`), never in CI.
+
+**Naming convention:** unit tests `*Test.java` (Surefire, `test` phase); integration tests `*IT.java` (Failsafe, `integration-test` phase). Add the Failsafe plugin:
+
+```xml
+<plugin>
+    <groupId>org.apache.maven.plugins</groupId>
+    <artifactId>maven-failsafe-plugin</artifactId>
+    <executions>
+        <execution>
+            <goals>
+                <goal>integration-test</goal>
+                <goal>verify</goal>
+            </goals>
+        </execution>
+    </executions>
+</plugin>
+```
+
+Then `./mvnw test` is fast (no Docker), and `./mvnw verify` runs everything. Rename the context test to `PaymentreconflowApplicationIT`.
+
+**Done when:** two different `*IT` classes extending the base share one container (the log shows a single "Creating container for image: postgres:16.4-alpine").
+
+### 4.13 M2.13 — Formatting with Spotless
+
+**What:** an automatic formatter, checked in CI.
+
+**Why:** see §2.9.
+
+**How:** Palantir Java Format matches the `.editorconfig` from M0.6 (4-space indent, 120 columns):
+
+```xml
+<plugin>
+    <groupId>com.diffplug.spotless</groupId>
+    <artifactId>spotless-maven-plugin</artifactId>
+    <version><!-- latest release; must support Java 25 syntax --></version>
+    <configuration>
+        <java>
+            <palantirJavaFormat>
+                <version><!-- a release that supports Java 25 --></version>
+            </palantirJavaFormat>
+            <removeUnusedImports/>
+            <importOrder/>
+            <trimTrailingWhitespace/>
+            <endWithNewline/>
+        </java>
+        <pom>
+            <sortPom>
+                <expandEmptyElements>false</expandEmptyElements>
+            </sortPom>
+        </pom>
+    </configuration>
+    <executions>
+        <execution>
+            <goals><goal>check</goal></goals>
+            <phase>verify</phase>
+        </execution>
+    </executions>
+</plugin>
+```
+
+Workflow: `./mvnw spotless:apply` formats everything; `./mvnw verify` fails with a diff if anything is unformatted.
+
+Make the **first** Spotless PR contain only the plugin plus the result of `spotless:apply`, with no other changes, so formatting churn doesn't hide real changes in review.
+
+**Pitfalls:**
+
+- Formatter versions must understand Java 25 syntax; an old version fails to parse newer constructs. Pin versions explicitly.
+- Google Java Format (2-space indent) would contradict the `.editorconfig`; pick one style and make both agree.
+- Don't format SQL migration files automatically: changing an applied migration's whitespace changes its checksum and Flyway refuses to start.
+
+**Done when:** adding a badly indented line makes `./mvnw verify` fail; `./mvnw spotless:apply` fixes it.
+
+### 4.14 M2.14 — Coverage with JaCoCo
+
+**What:** a coverage report on every build, no threshold yet.
+
+**Why:** visibility first. A threshold set before you know your baseline either blocks everything or means nothing. Look at the report, then decide in M9 whether to enforce something (e.g. ≥ 80% line coverage on `reconciliation` and `ingestion`).
+
+**How:**
+
+```xml
+<plugin>
+    <groupId>org.jacoco</groupId>
+    <artifactId>jacoco-maven-plugin</artifactId>
+    <version><!-- 0.8.14 or later: older versions can't instrument Java 25 class files --></version>
+    <executions>
+        <execution>
+            <id>prepare-agent</id>
+            <goals><goal>prepare-agent</goal></goals>
+        </execution>
+        <execution>
+            <id>prepare-agent-it</id>
+            <goals><goal>prepare-agent-integration</goal></goals>
+        </execution>
+        <execution>
+            <id>report</id>
+            <phase>verify</phase>
+            <goals><goal>report</goal></goals>
+        </execution>
+        <execution>
+            <id>report-it</id>
+            <phase>verify</phase>
+            <goals><goal>report-integration</goal></goals>
+        </execution>
+    </executions>
+</plugin>
+```
+
+Reports: `target/site/jacoco/index.html` (unit) and `target/site/jacoco-it/index.html` (integration). A `merge` execution can combine them if you want one number.
+
+**Pitfalls:** if Surefire/Failsafe have their own `<argLine>`, write it as `@{argLine} -Xmx1g` so JaCoCo's agent argument isn't overwritten. Coverage measures what ran, not what was checked: a test with no assertions gives 100% coverage.
+
+**Done when:** `./mvnw verify` produces both reports.
+
+### 4.15 M2.15 — GitHub Actions CI
+
+**What:** a workflow that runs `./mvnw verify` on every PR and on pushes to `main`.
+
+**How:** `.github/workflows/ci.yml`:
+
+```yaml
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A newer push to the same PR cancels the older, still-running build.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build            # this exact name becomes the required status check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+
+      - name: Build, test, format check, coverage
+        # -B: batch mode (no colour/progress noise). Testcontainers uses the
+        # runner's Docker daemon; ubuntu-latest has it pre-installed.
+        run: ./mvnw -B -ntp verify
+
+      - name: Upload test reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            target/surefire-reports/
+            target/failsafe-reports/
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            target/site/jacoco/
+            target/site/jacoco-it/
+```
+
+After the first successful run on a PR, **go back to the M0.4 branch protection** and turn on "Require status checks to pass", selecting `build`, with "Require branches to be up to date before merging". (Or via `gh api`, setting `required_status_checks` to `{"strict": true, "contexts": ["build"]}`; see the M0 plan §4.6.)
+
+**Pitfalls:**
+
+- `./mvnw` must be executable in Git (`git ls-files -s mvnw` shows mode `100755`). If not: `git update-index --chmod=+x mvnw`.
+- No secrets are needed: tests use Testcontainers, not a shared database. Keep it that way; a CI that needs production-like secrets is a CI that leaks them.
+- Pin action versions (at least to a major tag like `@v4`; full commit SHAs are stricter and recommended once you add dependency scanning in M10.5).
+
+**Done when:** a PR shows a green `build` check; a PR with a failing test or unformatted code shows red and can't be merged.
+
+### 4.16 Update the README
+
+Replace the "Prepare the database" and "Test" sections:
+
+- Prerequisites: Java 25 and Docker. PostgreSQL no longer needs installing.
+- Run: `cp .env.example .env`, `docker compose up -d`, `SPRING_PROFILES_ACTIVE=local,api,worker ./mvnw spring-boot:run`.
+- Test: `./mvnw test` (unit, no Docker) and `./mvnw verify` (everything, Docker required).
+- Fix "Flyway applies V1 and V2" → V1–V3.
+
+---
+
+## 5. Testing strategy
+
+| Test | Type | Proves |
+|---|---|---|
+| `PaymentreconflowApplicationIT` | Integration (Testcontainers) | Context starts; Flyway applies V1–V3; Hibernate validation passes |
+| `JpaSettingsTest` | Integration | `validate` and `open-in-view=false` stay set |
+| `ModularityTest` | Unit (no Spring) | Module boundaries and allowed dependencies |
+| `GlobalExceptionHandlerTest` | `@WebMvcTest` slice with a test-only controller | Every error path renders ProblemDetail with `type`, `code`, `requestId`; no leak of internal messages |
+| `RequestIdFilterTest` | Unit (MockHttpServletRequest) + one integration assertion | Generation, echo of safe IDs, rejection of unsafe ones, MDC cleanup |
+| `SecurityConfigIT` | Integration | Health is public; everything else `401` as ProblemDetail |
+| `JsonConfigTest` | `@JsonTest` | `BigDecimal` serializes as a plain-notation string |
+| `IdsTest` | Unit | `Ids.newId()` is version 7 (`uuid.version() == 7`) and monotonic across 10,000 calls |
+
+Unit tests run in milliseconds and have no Docker; integration tests share one container. The full `./mvnw verify` should take well under two minutes at this stage. If it doesn't, look for extra Spring contexts in the log.
+
+---
+
+## 6. Exit criteria checklist
+
+- [ ] `docker compose up -d` → `docker compose ps` shows `postgres` and `minio` healthy; the bucket exists
+- [ ] `SPRING_PROFILES_ACTIVE=local,api,worker ./mvnw spring-boot:run` starts; log shows Flyway validated/applied `V1__initial_schema`, `V2__auth_hardening`, `V3__refresh_token_constraints`
+- [ ] `curl -s localhost:8080/actuator/health` → `{"status":"UP"...}`
+- [ ] `curl -si localhost:8080/api/v1/x` → `401`, `application/problem+json`, `X-Request-Id` header, `requestId` in body
+- [ ] `SPRING_PROFILES_ACTIVE=prod,api` without `DB_URL` fails fast; with it, logs are JSON
+- [ ] `./mvnw test` passes without Docker; `./mvnw verify` passes with Docker, including Spotless check and JaCoCo reports
+- [ ] `ModularityTest` fails on a deliberate boundary violation (try it once, revert)
+- [ ] GitHub Actions `build` is green on a PR and is a **required** check on `main`
+- [ ] README setup updated; TASKS.md M2.1–M2.16 ticked; exit criterion text corrected to `V1__initial_schema.sql`
+
+---
+
+## 7. Interview questions this phase prepares you for
+
+**Q: Who owns your database schema, Hibernate or migrations?**
+Flyway owns it: versioned SQL scripts reviewed like code, applied in order, with checksums so an applied migration can't be silently changed. Hibernate runs with `ddl-auto=validate`, so a mismatch between an entity and its table fails the startup instead of a request. The schema uses partitioning, partial unique indexes and triggers that Hibernate couldn't generate anyway.
+
+**Q: What does `spring.jpa.open-in-view` do and why disable it?**
+It keeps the persistence context open for the whole request, so lazy associations load during JSON serialization: hidden N+1 queries, outside any transaction, holding a connection for the full request. Disabling it makes lazy loading outside a transaction fail loudly, which forces each service method to fetch exactly what it needs.
+
+**Q: Why Testcontainers rather than H2?**
+Tests should run on the same database engine as production. The schema relies on PostgreSQL features (partitioning, partial indexes, `NULLS NOT DISTINCT`, JSONB, triggers, and later `SKIP LOCKED` and row-level security) that H2 doesn't have or emulates differently. With `@ServiceConnection` the setup is a few lines, and one container is shared across the whole test run.
+
+**Q: How do you keep tests isolated without truncating tables?**
+Each test creates its own organization and only queries inside it, which matches how the multi-tenant application works anyway. Truncating would also break on the audit table, which forbids it by design. Rolling back each test in a transaction would hide commit-time behaviour and make concurrency tests impossible.
+
+**Q: How do you trace one request through your logs?**
+A filter assigns a request ID (or accepts a safe one from the caller), puts it in the logging MDC, and returns it in `X-Request-Id`; every log line and every error body includes it, and audit events store it. Because MDC is thread-local, background jobs carry the originating request ID in their payload and restore it in the worker.
+
+**Q: How do you enforce architecture in a monolith?**
+Each module is a top-level package; Spring Modulith treats sub-packages as internal and fails a test if another module uses them or if modules form a cycle. Allowed dependencies are declared per module, so even a legal-but-unplanned dependency fails. ArchUnit covers specific rules like "no `double` in money code".
+
+**Q: What happens when you add Spring Security to a Spring Boot app?**
+Everything becomes protected by default, including actuator endpoints, with HTTP Basic and a generated password. You define a `SecurityFilterChain` that states explicitly what's public (here only health and info) and denies everything else until real authentication exists. Deny-by-default is the safe direction to err in.
+
+**Q: Why return errors as RFC 9457 Problem Details?**
+It's a standard shape (`type`, `title`, `status`, `detail`, `instance`) that clients and tools understand, with room for extension members. A stable `code` lets clients branch on errors without parsing English text, and `requestId` connects a user's error report to the server logs. A single handler also guarantees internal exception messages never leak.
+
+---
+
+## 8. Common mistakes
+
+- **Adding a library instead of its Boot 4 starter**, then wondering why nothing auto-configures (Flyway was the first instance).
+- **Floating image tags** (`postgres:latest`, `postgres:16`). A pinned tag makes "works today" mean "works next month".
+- **A convenient default profile.** Production then inherits development settings when someone forgets `SPRING_PROFILES_ACTIVE`.
+- **`permitAll()` while waiting for M3.** Deny by default; open paths one at a time.
+- **Mapping every `DataIntegrityViolationException` to 409 globally.** Real bugs then look like user conflicts.
+- **Leaking exception messages** in the generic 500 handler.
+- **Forgetting `MDC.remove`** in the filter: pooled threads carry the previous request's ID into the next one.
+- **Many slightly different test configurations**, each starting a new Spring context and a new container. Builds get slow without anyone noticing why.
+- **`TRUNCATE` in test cleanup.** The audit trigger rejects it, deliberately.
+- **Formatting and logic in one PR.** Reviewers can't see the logic change in a 3,000-line whitespace diff.
+- **Enabling a coverage threshold on day one.** Measure, then decide.
+- **Turning on the required status check before the workflow has run once.** GitHub won't list a check it hasn't seen.

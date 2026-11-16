@@ -1,0 +1,434 @@
+# Phase M4 — Audit foundation
+
+**Status:** Not started · **Tasks:** TASKS.md M4.1–M4.4 · **Depends on:** M2 (request-ID filter and MDC, Testcontainers base test), M3.1–M3.2 entities and the `shared` context interfaces from M3.4 · **Date:** 2026-11-01
+
+M4 is small, and it's built **before most of M3.3** (see phase-M3-organizations-users-tenancy.plan §4.0), because login events are the first things that need auditing. After this phase, any module can write an audit event with one call, and that event commits or rolls back together with the change it describes.
+
+---
+
+## 1. Goal
+
+- An `AuditEvent` entity mapped onto the existing `audit_event` table, with no code path that can update or delete one.
+- `AuditService.record(...)` that every module uses, which **refuses to run outside a transaction** and writes in the caller's transaction.
+- Tests proving that a rolled-back business change leaves no audit row, and that the database rejects `UPDATE`, `DELETE` and `TRUNCATE` on the table.
+
+---
+
+## 2. Concepts to understand first
+
+### 2.1 What an audit log is for
+
+An audit log answers *who did what, to which thing, when, and from where*, in a form nobody can quietly change afterwards. For ReconFlow it answers the README's fourth question — "who investigated it, and how was it resolved?" — and it's what a finance auditor or a security investigation reads.
+
+It is **not** an application log. Logs are for operators, can be sampled or dropped, and live outside the database. Audit events are business records: they must be complete, durable and consistent with the data.
+
+### 2.2 Why "same transaction" is the whole design
+
+Consider resolving an exception. Two writes: `exception_case.status = 'RESOLVED'` and an `EXCEPTION_RESOLVED` audit row.
+
+| Approach | Failure mode |
+|---|---|
+| Audit **after** commit (event listener, separate call) | App crashes between the two: the case is resolved and nobody knows who did it |
+| Audit **before**, in its own transaction (`REQUIRES_NEW`) | Business change rolls back: the log says it was resolved, the data says it wasn't |
+| Audit to a log file / Kafka | Dual write: the two systems can disagree, and you can't make them atomic without an outbox |
+| **Audit in the same transaction** | Both commit or neither does. The log can never disagree with the data |
+
+This is the *dual-write problem*. Its general solution is "write both in one database transaction" — here directly, and in M9.13 via the transactional outbox when events must also leave the database.
+
+### 2.3 `Propagation.MANDATORY`
+
+Spring's propagation options for `@Transactional`:
+
+| Propagation | If a transaction exists | If none exists |
+|---|---|---|
+| `REQUIRED` (default) | Join it | **Start a new one** |
+| `REQUIRES_NEW` | Suspend it, start a new one | Start a new one |
+| `MANDATORY` | Join it | **Throw `IllegalTransactionStateException`** |
+
+With `REQUIRED`, a caller who forgot `@Transactional` would get the audit row in a transaction of its own, *separate* from the business change — the exact bug from §2.2, and nothing would fail. `MANDATORY` turns that mistake into an immediate exception in the first test that exercises the path.
+
+The one legitimate "own transaction" case — refresh-token reuse detection (authentication.plan §4.3, transaction B) — still works: B is itself a transaction, and the audit joins it.
+
+### 2.4 Append-only enforcement in layers
+
+| Layer | Stops | Doesn't stop |
+|---|---|---|
+| No update/delete methods in code | Honest mistakes | Native SQL, a future developer adding one |
+| Hibernate `@Immutable` | Dirty-checking writing an accidental change | Native SQL |
+| **DB triggers (already in V1)** | Any `UPDATE`/`DELETE`/`TRUNCATE` from any client | The table owner or a superuser dropping the trigger |
+| `REVOKE UPDATE, DELETE, TRUNCATE` from the app role (M10.7) | A compromised application | A DBA |
+
+Each layer covers the one above it. The last gap — a DBA — is handled organizationally (separate duties, external log shipping) and is out of scope.
+
+### 2.5 Domain history vs audit log
+
+V1 already has **both** `exception_status_history` and `audit_event`, which looks like duplication. It isn't:
+
+| | `exception_status_history` | `audit_event` |
+|---|---|---|
+| Purpose | Product feature: show a case's timeline, keep the previous resolution after a reopen | Compliance: everything anyone did, across all entities |
+| Shape | Typed columns (`from_status`, `to_status`, `resolution_code`) | Generic (`action`, `entity_type`, `payload` JSONB) |
+| Queried by | The exception detail endpoint (M7.7) | The audit timeline endpoint (M7.13), auditors |
+
+Parsing JSONB payloads to rebuild a domain timeline is brittle; a typed table is easy to query and constrain. M7 writes both in the same transaction.
+
+---
+
+## 3. Starting point
+
+`V1__initial_schema.sql` already has the table, its indexes and the append-only triggers:
+
+```sql
+CREATE TABLE audit_event (
+    id               UUID        PRIMARY KEY,
+    organization_id  UUID        REFERENCES organization (id), -- NULL for platform events
+    actor_id         UUID        REFERENCES app_user (id),     -- NULL for system actions
+    action           TEXT        NOT NULL,
+    entity_type      TEXT        NOT NULL,
+    entity_id        UUID,
+    payload          JSONB       NOT NULL DEFAULT '{}',
+    request_id       TEXT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- indexes: (organization_id, entity_type, entity_id, created_at), (organization_id, actor_id, created_at)
+-- triggers: BEFORE UPDATE OR DELETE (row), BEFORE TRUNCATE (statement) → RAISE EXCEPTION
+```
+
+And the phase-M3 RLS migration adds `audit_read` / `audit_insert` policies (rows readable only by their own org; inserts must match the bound org, or be NULL with none bound).
+
+So:
+- **M4.1** = entity and read repository (no migration).
+- **M4.2** = mostly done in the database; what remains is the code side and tests.
+- **M4.3** and **M4.4** are new.
+
+No Java exists yet beyond the main class and whatever M2/M3.1–3.2 added.
+
+---
+
+## 4. Step by step
+
+### M4.1 — `AuditEvent` entity
+
+**What.** An immutable JPA entity for `audit_event`, plus enums for actions and entity types.
+
+**Why.** Typed actions stop `"EXCEPTION_RESOLVED"` / `"EXCEPTON_RESOLVED"` drift across modules, and an immutable entity removes the update path from code.
+
+**How.** `src/main/java/com/reconflow/paymentreconflow/audit/AuditEvent.java`:
+
+```java
+@Entity
+@Table(name = "audit_event")
+@Immutable                                   // org.hibernate.annotations: never dirty-checked, never updated
+public class AuditEvent {
+
+    @Id
+    private UUID id;
+
+    @Column(name = "organization_id", updatable = false)
+    private UUID organizationId;             // nullable: platform events
+
+    @Column(name = "actor_id", updatable = false)
+    private UUID actorId;                    // nullable: system actions
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false, updatable = false)
+    private AuditAction action;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "entity_type", nullable = false, updatable = false)
+    private AuditEntityType entityType;
+
+    @Column(name = "entity_id", updatable = false)
+    private UUID entityId;
+
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(nullable = false, updatable = false, columnDefinition = "jsonb")
+    private Map<String, Object> payload;
+
+    @Column(name = "request_id", updatable = false)
+    private String requestId;
+
+    @Column(name = "created_at", nullable = false, insertable = false, updatable = false)
+    private Instant createdAt;               // DB default now()
+
+    protected AuditEvent() {}
+
+    static AuditEvent of(UUID orgId, UUID actorId, AuditAction action, AuditEntityType type,
+                         UUID entityId, Map<String, Object> payload, String requestId) { ... }
+
+    // getters only
+}
+```
+
+JSON mapping: Hibernate maps `@JdbcTypeCode(SqlTypes.JSON)` through its format mapper, which looks for Jackson on the classpath. Boot 4 ships **Jackson 3** (`tools.jackson.*`). Check that the Hibernate version Boot 4.1 manages detects Jackson 3 (verify against the Boot 4 / Hibernate 7 docs). If it doesn't, either register a `FormatMapper` via `spring.jpa.properties.hibernate.type.json_format_mapper`, or keep it simple: store the payload as a pre-serialized `String` with `@ColumnTransformer(write = "?::jsonb")` and serialize with the app's `JsonMapper` in `AuditService`. Write the integration test first; it tells you which case you're in.
+
+Enums in `audit/`:
+
+```java
+public enum AuditEntityType { USER, MEMBERSHIP, ORGANIZATION, REFRESH_TOKEN_FAMILY,
+                              IMPORT_BATCH, RECONCILIATION_RUN, EXCEPTION_CASE }
+
+public enum AuditAction {
+    // M3 — authentication and membership
+    LOGIN_SUCCEEDED, LOGIN_FAILED, ACCOUNT_LOCKED, LOGOUT, PASSWORD_CHANGED,
+    REFRESH_TOKEN_REUSE, PASSWORD_RESET_BY_ADMIN,
+    MEMBER_CREATED, MEMBER_ROLE_CHANGED, MEMBER_DISABLED, ORGANIZATION_CREATED,
+    // M5 — imports
+    IMPORT_RECEIVED, IMPORT_COMPLETED, IMPORT_FAILED, IMPORT_RETRIED,
+    // M6 — reconciliation
+    RUN_STARTED, RUN_COMPLETED, RUN_FAILED,
+    // M7 — exceptions
+    EXCEPTION_CREATED, EXCEPTION_ASSIGNED, EXCEPTION_STATUS_CHANGED, EXCEPTION_NOTE_ADDED,
+    EXCEPTION_RESOLVED, EXCEPTION_REOPENED
+}
+```
+
+Rules for these enums: **never rename or remove a constant** — old rows store the name. Add new ones; deprecate in a comment. Later phases add their constants here as they need them; listing the planned ones now just shows the shape.
+
+Read repository (writes go through `AuditService`, §M4.3):
+
+```java
+public interface AuditEventRepository extends Repository<AuditEvent, UUID> {
+    List<AuditEvent> findByOrganizationIdAndEntityTypeAndEntityIdOrderByCreatedAtAscIdAsc(
+        UUID organizationId, AuditEntityType entityType, UUID entityId);   // M7.13 timeline, uses audit_event_entity_idx
+}
+```
+
+Extending `Repository` (not `JpaRepository` or `CrudRepository`) means there is no `delete`, `deleteAll` or `save` to call by accident.
+
+**Ordering.** `created_at DEFAULT now()` is the **transaction start time** in PostgreSQL, so several events in one transaction share a timestamp. Order by `(created_at, id)`: UUIDv7 IDs are time-ordered, so the tie-breaker follows insertion order (as long as the generator is monotonic within a millisecond — check the M2 ID generator's behaviour).
+
+**Pitfalls.**
+- `ddl-auto: validate` and `jsonb`: without `columnDefinition = "jsonb"` or the JSON type code, validation may complain about the type.
+- `Map<String, Object>` payloads with `BigDecimal` values: make sure Jackson writes them as plain numbers or strings consistently (`1000.00`, not `1E+3`). Prefer strings for money in payloads: `"amount": "1000.00"`.
+
+**Done when.** The app starts with `validate`; an integration test persists an event with a nested payload, reads it back, and the payload round-trips including a money string.
+
+---
+
+### M4.2 — Append-only
+
+**What.** Make updates and deletes impossible from code, and prove the database rejects them.
+
+**What's already done.** V1's two triggers raise `audit_event is append-only: <op> is not allowed` on any `UPDATE`, `DELETE` or `TRUNCATE`, from any client.
+
+**What remains.**
+
+1. **No code path.** `@Immutable` entity, `Repository` without write methods, and only `AuditService` (in the `audit` module) persists events. Add an architecture rule: no class outside `..audit..` references `AuditEvent` as a constructor call or passes it to `EntityManager.persist`. Spring Modulith already hides `audit` internals if `AuditEvent` sits in an internal package and only `AuditService`, `AuditAction`, `AuditEntityType` are the module's public API.
+2. **Database test** (below).
+3. **Role-level enforcement, deferred to M10.7.** Add to that task's notes now:
+   ```sql
+   REVOKE UPDATE, DELETE, TRUNCATE ON audit_event FROM reconflow_app;
+   ```
+   Why both triggers and REVOKE: the triggers stop *bugs*, but the table owner can `ALTER TABLE ... DISABLE TRIGGER`. Once the app connects as a non-owner role without those privileges, even a compromised application can't erase its tracks.
+
+**Retention note.** `DELETE` is blocked forever, so audit retention can't be a nightly delete. When it becomes necessary (docs/scalability.md estimates ~5 GB/year), the route is: partition `audit_event` by month in a future migration, archive old partitions to object storage, then `DETACH` and `DROP` the partition as a privileged role. Out of scope for v1; mention it in the database-design doc.
+
+**Pitfalls.**
+- Integration tests that `TRUNCATE` all tables between runs. They'll fail on this table — by design. Tests isolate by creating fresh organizations instead (phase-M3 plan §5).
+- "Correcting" an audit event. You never edit one; you append a new event that references the old one (`payload.correctsEventId`).
+
+**Done when.** The append-only test passes and the architecture rule is in place.
+
+---
+
+### M4.3 — `AuditService.record(...)`
+
+**What.** The single entry point for writing audit events.
+
+**How.** `audit/AuditService.java`:
+
+```java
+@Service
+public class AuditService {
+
+    private static final int MAX_PAYLOAD_BYTES = 8 * 1024;
+
+    private final EntityManager em;
+    private final TenantContext tenant;
+    private final CurrentUser currentUser;
+    private final JsonMapper json;                 // Jackson 3, for the size check
+
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void record(AuditEntry entry) {
+        UUID orgId = entry.organizationId()                       // explicit override (platform/system)
+                          .or(tenant::organizationIdIfPresent)    // normal case: the bound tenant
+                          .orElse(null);                          // platform events: NULL
+        UUID actorId = entry.actorId()
+                          .or(currentUser::idIfPresent)
+                          .orElse(null);                          // system actions: NULL
+        Map<String, Object> payload = entry.payload();
+        enforceSize(payload);
+
+        em.persist(AuditEvent.of(orgId, actorId, entry.action(), entry.entityType(),
+                                 entry.entityId(), payload, MDC.get("requestId")));
+    }
+}
+```
+
+The call site reads like a sentence:
+
+```java
+audit.record(AuditEntry.of(AuditAction.EXCEPTION_RESOLVED, AuditEntityType.EXCEPTION_CASE, c.getId())
+    .with("resolutionCode", code)
+    .with("fromStatus", "IN_REVIEW")
+    .with("version", c.getVersion()));
+```
+
+`AuditEntry` is a small immutable builder (record + `with` returning a copy) with optional `organizationId(...)` and `actorId(...)` overrides.
+
+Where each field comes from:
+
+| Field | Normal request | Worker job | Login / platform event |
+|---|---|---|---|
+| `organization_id` | `TenantContext` (bound by the filter) | `TenantScope` binds the job's org | NULL, or explicit override (e.g. the new org when a platform admin creates one, inside `tenantScope.call(newOrgId, ...)`) |
+| `actor_id` | `CurrentUser` | NULL (system) — put `triggeredBy` from the job in the payload | The user if known; NULL for an unknown email |
+| `request_id` | MDC `requestId` (M2.11 filter) | NULL, or put the job ID in the MDC when a worker starts a job, so worker events correlate too | MDC |
+
+The RLS `audit_insert` policy (phase-M3 plan, M3.5) checks `organization_id IS NOT DISTINCT FROM app_current_org()`. So an override org must match the bound tenant; to write an event for a different org, bind that org first with `TenantScope`. This is deliberate: nothing can write audit rows into another tenant's log.
+
+**What goes in the payload.**
+- Do: what changed (`from`/`to` values, the reason, the resolution code), the entity's version after the change, IP and user agent for auth events, counts and totals for imports/runs.
+- Don't: passwords, tokens (raw or hashed), full CSV rows, full transaction lists. For unknown-email login failures store a SHA-256 of the lowercased email, not the input (phase-M3 plan, M3.3h). M10.6 reviews payloads for PII.
+- Cap size (8 KB): an audit log that can be filled with megabytes per event is a storage DoS and makes the timeline unreadable. Over the cap → throw `IllegalArgumentException` (a programming error, so it *should* roll back the business change and fail loudly in tests).
+
+**Why `EntityManager.persist` and not `JdbcTemplate`.** `persist` joins the JPA persistence context: the insert is flushed with the business changes in Hibernate's order, in the same transaction. A `JdbcTemplate` insert also joins the transaction (same connection) and is faster for very high volume, because it skips the persistence context. At ReconFlow's ~50k events/day (docs/scalability.md) the difference doesn't matter; choose consistency with the rest of the code.
+
+**Pitfalls.**
+- **The thrown-exception rollback trap.** If a caller writes `LOGIN_FAILED` and then throws a `RuntimeException` to produce the 401, the audit row rolls back with everything else. Same-transaction auditing means *the caller* decides whether the event survives: failure paths that must be recorded have to commit (phase-M3 plan, M3.3b).
+- Calling `record` from a `@TransactionalEventListener(phase = AFTER_COMMIT)`: there's no transaction any more, so `MANDATORY` throws. That's correct — don't "fix" it with `REQUIRES_NEW`; move the audit into the transaction.
+- Self-invocation: `@Transactional(MANDATORY)` only works through the Spring proxy. Calling `record` from inside `AuditService` itself skips the check.
+- `record` must not swallow exceptions. If the audit insert fails, the business change must fail too; an un-audited financial change is worse than a failed one.
+
+**Done when.** A service in any module can call `audit.record(...)` inside its transaction; calling it without one throws `IllegalTransactionStateException`.
+
+---
+
+### M4.4 — Rollback test
+
+**What.** Prove the core property: a rolled-back business transaction leaves no audit row.
+
+**How.** `src/test/java/.../audit/AuditServiceIT.java`, extending `AbstractIntegrationTest`:
+
+```java
+@Test
+void rolledBackTransactionLeavesNoAuditRow() {
+    var org = fixtures.newOrganization();                 // fresh org, no TRUNCATE needed
+    var entityId = Ids.newId();
+
+    assertThatThrownBy(() -> tenantScope.call(org.getId(), () ->
+        tx.execute(status -> {
+            orgService.rename(org.getId(), "Renamed");     // a real business change
+            audit.record(AuditEntry.of(ORGANIZATION_CREATED, ORGANIZATION, entityId));
+            throw new IllegalStateException("boom");      // force rollback
+        })))
+        .isInstanceOf(IllegalStateException.class);
+
+    assertThat(countAuditRows(entityId)).isZero();
+    assertThat(orgs.findById(org.getId()).orElseThrow().getName()).isNotEqualTo("Renamed");
+}
+
+@Test
+void committedTransactionWritesExactlyOneRow() { ... count == 1, fields populated, request_id from MDC ... }
+
+@Test
+void recordOutsideTransactionIsRejected() {
+    assertThatThrownBy(() -> audit.record(AuditEntry.of(LOGOUT, USER, Ids.newId())))
+        .isInstanceOf(IllegalTransactionStateException.class);
+}
+
+@ParameterizedTest
+@ValueSource(strings = {
+    "UPDATE audit_event SET action = 'X' WHERE id = ?",
+    "DELETE FROM audit_event WHERE id = ?" })
+void databaseRejectsChanges(String sql) {
+    UUID id = insertOneEvent();
+    assertThatThrownBy(() -> jdbc.update(sql, id))
+        .hasMessageContaining("append-only");
+}
+
+@Test
+void databaseRejectsTruncate() {
+    assertThatThrownBy(() -> jdbc.execute("TRUNCATE audit_event"))
+        .hasMessageContaining("append-only");
+}
+```
+
+`countAuditRows` queries with plain JDBC as the test (superuser) connection, so RLS doesn't hide rows from the assertion. Use `TransactionTemplate` (`tx`) rather than `@Transactional` on the test method: a test-managed transaction rolls back at the end anyway, which would make the "committed" test meaningless.
+
+Also add, as documentation of *why* `MANDATORY` exists, a short test (or a comment in the ADR) showing that a `REQUIRES_NEW` audit write survives the rollback — the bug the design prevents.
+
+**Done when.** All five tests pass in CI.
+
+---
+
+## 5. Testing strategy
+
+| Test | Type | Proves |
+|---|---|---|
+| Round-trip of an event with nested payload and money string | Integration | JSONB mapping works with Jackson 3 |
+| Rollback leaves no row | Integration | Same-transaction atomicity (M4.4) |
+| Commit leaves exactly one row with org, actor, request ID filled | Integration | Field resolution from context and MDC |
+| `record` outside a transaction throws | Integration | `MANDATORY` is wired (not bypassed by self-invocation) |
+| `UPDATE`/`DELETE`/`TRUNCATE` raise | Integration (JDBC) | V1 triggers |
+| Payload over 8 KB throws | Unit | Size cap |
+| Worker context: `tenantScope.call(org, ...)` → event has that org, NULL actor | Integration | System events |
+| Nothing outside `audit` constructs or persists `AuditEvent` | Architecture | No write path elsewhere |
+
+Every later phase adds its own assertions ("resolving writes exactly one `EXCEPTION_RESOLVED` with these payload keys") in that phase's tests. A small `AuditAssertions` helper (`assertAudited(entityId, action).withPayload("resolutionCode", "BANK_DELAY")`) keeps those one line each.
+
+---
+
+## 6. Exit criteria checklist
+
+- [ ] `AuditEvent` entity validates against the existing table; `@Immutable`; read-only repository
+- [ ] `AuditAction` and `AuditEntityType` enums, with the "never rename" rule written in their Javadoc
+- [ ] `AuditService.record(...)` with `Propagation.MANDATORY`, org/actor/request ID resolution, size cap
+- [ ] Architecture rule: only the `audit` module writes audit events
+- [ ] Tests: rollback leaves no row; outside-transaction rejected; UPDATE/DELETE/TRUNCATE rejected
+- [ ] M10.7 notes include `REVOKE UPDATE, DELETE, TRUNCATE ON audit_event`
+- [ ] TASKS.md exit criteria: any module can emit audit events transactionally
+
+---
+
+## 7. Interview questions this phase prepares you for
+
+1. **Why write the audit event in the same transaction as the business change?**
+   So they commit or roll back together. Writing it afterwards loses events on a crash; writing it in a separate transaction records changes that later rolled back. Same-transaction is the only option where the log can't disagree with the data.
+
+2. **What's the dual-write problem, and how does the transactional outbox solve it?**
+   Writing to two systems (database and Kafka, say) can't be made atomic, so one can succeed while the other fails. The outbox writes the event to a table in the same database transaction, and a separate relay publishes it afterwards, giving at-least-once delivery that's consistent with the data. The audit table here is the same idea without the relay.
+
+3. **What does `Propagation.MANDATORY` do, and why use it here instead of the default?**
+   It joins an existing transaction and throws if there isn't one. The default `REQUIRED` would silently start a new transaction for a caller who forgot `@Transactional`, splitting the audit from the change. `MANDATORY` turns that into an immediate, testable failure.
+
+4. **How do you make a table append-only in PostgreSQL?**
+   `BEFORE UPDATE OR DELETE` row triggers and a `BEFORE TRUNCATE` statement trigger that raise, plus revoking `UPDATE`/`DELETE`/`TRUNCATE` from the application's role. Triggers catch bugs; the revoke stops a compromised app, since an owner could otherwise disable the triggers.
+
+5. **Why does ReconFlow have both `exception_status_history` and `audit_event`?**
+   Different readers. The history table is a typed product feature (the case timeline, keeping the previous resolution after a reopen). The audit log is a generic compliance record across every entity. Rebuilding a domain timeline from JSONB audit payloads would be brittle.
+
+6. **Two events in the same transaction have the same `created_at`. Why, and how do you order them?**
+   PostgreSQL's `now()` is the transaction start time, constant within a transaction. Order by `(created_at, id)`; with time-ordered UUIDv7 IDs the tie-breaker follows insertion order.
+
+7. **What should never go in an audit payload?**
+   Secrets (passwords, tokens), bulk data (whole CSV rows), and unnecessary personal data. The audit log is kept for years and read by many people, so anything in it has the longest exposure of any data in the system.
+
+8. **How would you implement retention on a table that forbids DELETE?**
+   Partition it by time, archive old partitions to cheap storage, then detach and drop whole partitions using a privileged role. That's also far cheaper than row deletes, which bloat the table and need vacuuming.
+
+---
+
+## 8. Common mistakes
+
+- Auditing from an `AFTER_COMMIT` event listener, or with `REQUIRES_NEW` "so the audit always gets written".
+- Throwing a runtime exception after auditing a failure that must be recorded (failed login), rolling the audit back.
+- Swallowing an exception from the audit insert so the business change "still succeeds".
+- Exposing `JpaRepository<AuditEvent, UUID>`, which brings `delete` and `save`-as-merge with it.
+- Building actions as free strings (`"exception resolved"`, `"EXCEPTION_RESOLVED"`, `"ExceptionResolved"`) across modules.
+- Renaming an action enum constant after events with the old name exist.
+- Putting the raw password, a refresh token, or a full CSV row in the payload.
+- Calling `audit.record` from inside `AuditService` (self-invocation bypasses `MANDATORY`).
+- `TRUNCATE` in test cleanup, then "fixing" the failing test by disabling the trigger.
+- Using `@Transactional` on the rollback test method, so the "commit" case never actually commits.
+- Assuming `created_at` alone orders events within a transaction.

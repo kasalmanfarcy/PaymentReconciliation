@@ -1,0 +1,1366 @@
+# Phase M5 — Transaction ingestion
+
+**Status:** Not started · **Tasks:** TASKS.md M5.1–M5.26 (+ job queue moved from M9.2) · **Depends on:** M2, M3, M4 · **Date:** 2026-11-01
+
+This phase takes a CSV file from an upload request to rows in `transaction_record` that reconciliation can trust. It is the largest phase because it is where most of the failure cases in projectoverview.md §6 live: duplicate uploads, crashes in the middle of a file, malformed rows, and retries.
+
+It also builds the background job queue. docs/scalability.md §2.3 showed that a 100k-row file takes 10–30 s to process, which is too long to hold an HTTP request open, so imports are asynchronous from v1. The queue that M9.2 originally deferred is therefore built here, and M6 reuses it for reconciliation runs.
+
+---
+
+## 1. Goal
+
+At the end of M5:
+
+1. An `UPLOADER` posts a ledger or gateway CSV to `POST /api/v1/imports` and gets `202 Accepted` with a batch ID within a second, whatever the file size.
+2. A worker picks the import up, streams the file, validates and normalizes every row, and stores the valid rows in `transaction_record`. Every bad row is recorded with its row number, column and reason.
+3. The batch ends in `COMPLETED`, `COMPLETED_WITH_ERRORS` or `FAILED`, and the client can see its progress and errors through `GET /api/v1/imports/{id}`.
+4. Uploading the same file twice is detected and returns `409` with the existing batch ID.
+5. Killing the worker at any point and letting it resume, or explicitly retrying a `FAILED` batch, ends in exactly the same rows as a clean run. There are never duplicate financial records.
+6. Normalized transactions can be searched with `GET /api/v1/transactions`.
+
+The single property to protect throughout is **exactly-once effects from at-least-once execution**. The worker *will* run some work twice (crashes, lease expiry, retries). The design makes running twice harmless instead of trying to make it impossible.
+
+---
+
+## 2. Concepts to understand first
+
+Read this section before writing code. Every design choice later refers back to one of these.
+
+### 2.1 Streaming instead of loading
+
+A 50 MB CSV with 500k rows becomes roughly 500k `CSVRecord` objects, 500k maps and 500k entities if you load it whole: several hundred MB of heap for one file, multiplied by every concurrent import. Streaming means you hold **one row (or one chunk) in memory at a time**: read a row, validate it, buffer it, and when the buffer reaches the chunk size, write it and clear it. Memory use is then proportional to the chunk size, not the file size.
+
+The rule that follows: **nothing in the import path may collect "all rows" into a collection.** That includes the within-file duplicate check (§4, M5.13), which is why it runs as SQL after insertion instead of as a Java `HashMap` over the whole file.
+
+### 2.2 Idempotency at three levels
+
+An operation is *idempotent* if doing it twice has the same effect as doing it once. Imports need it at three levels, each enforced by a database constraint rather than by a Java `if`:
+
+| Level | Question | Enforced by |
+|---|---|---|
+| File | Has this exact file already been imported for this org and source? | `UNIQUE (organization_id, source_type, content_hash)` on `import_batch` |
+| Row | Has this row of this batch already been inserted? | `UNIQUE (batch_id, source_row_number, transaction_date)` on `transaction_record` |
+| Error | Has this error already been recorded? | `UNIQUE NULLS NOT DISTINCT (batch_id, row_number, column_name, error_code)` on `import_row_error` |
+
+Why constraints and not checks in code: a check-then-insert (`SELECT` … `if (!exists) INSERT`) has a race window. Two requests can both see "not exists" and both insert. A unique constraint is checked atomically by the database, so exactly one insert wins regardless of timing. Code checks are still useful as a *fast path* that gives a friendlier response, but the constraint is the source of truth.
+
+### 2.3 The dual-write problem
+
+An upload touches two systems: object storage (the file) and PostgreSQL (the batch and its job). No transaction spans both. Whatever order you write them in, a crash between the two writes leaves one written and the other not. The design question is therefore **which half-written state is harmless**:
+
+| Order | Crash between the writes leaves | Consequence |
+|---|---|---|
+| DB first, then storage | A batch and job pointing at a file that doesn't exist | The job fails; the user sees a broken import they can't fix (the content hash is taken) |
+| **Storage first, then DB** | A file in storage that no batch references | Invisible to users; costs a few MB until a sweeper deletes it |
+
+We write the file first. An orphaned file is cheap and invisible; a dangling reference is a user-visible bug.
+
+The *other* dual write, "save the batch, then tell a worker", is avoided entirely: the job row is inserted **in the same PostgreSQL transaction** as the batch. Either both exist or neither does. This is called *transactional enqueueing*, and it's the main reason a DB-backed queue is simpler than publishing to Kafka after the commit (where a crash after commit and before publish loses the message; that's what the outbox pattern in M9.13 exists to fix).
+
+### 2.4 `SELECT … FOR UPDATE SKIP LOCKED`
+
+A queue in a table needs several workers to claim *different* jobs without blocking each other.
+
+- `FOR UPDATE` locks the selected row until the transaction ends, so no other transaction can claim it.
+- `SKIP LOCKED` makes other workers skip rows that are already locked instead of waiting for them.
+
+Together, N workers running the same claim query each get a different job, immediately. The claim transaction then flips the job to `RUNNING` with a lease and commits, which releases the row lock; from then on the *lease*, not the lock, says who owns the job.
+
+### 2.5 Leases, heartbeats and fencing
+
+A worker can die without telling anyone (OOM kill, node loss). A **lease** is a time-limited ownership claim: `lease_until = now() + 2 min`. A live worker extends it every 30 s (a **heartbeat**). A **sweeper** finds `RUNNING` jobs whose lease has expired and puts them back in the queue, so another worker resumes them.
+
+The subtle failure is the *zombie*: a worker that was paused (long GC, network partition) past its lease, whose job has been handed to someone else, and which then wakes up and keeps writing. **Fencing** stops it: every chunk commit includes `UPDATE job … WHERE id = ? AND locked_by = ? AND status = 'RUNNING'` in the same transaction as the data. If the job was reassigned, that update matches zero rows, the worker throws, and the chunk's data rolls back with it. The zombie can never commit.
+
+### 2.6 Chunked commits and checkpoints
+
+Committing every row is slow (one fsync per row). Committing once per file means a crash at row 499,999 throws away all the work, and a single huge transaction holds locks and bloats WAL. The middle ground is **one transaction per chunk of 5,000 rows**, and in that same transaction, recording how far you got: `import_batch.last_committed_row`.
+
+Because the rows and the checkpoint commit atomically, the checkpoint is always exactly right: after a crash, everything at or below `last_committed_row` is in the database and nothing above it is. A resumed worker skips rows up to the checkpoint and continues. The row-level unique constraint is a second line of defence, not the primary mechanism.
+
+### 2.7 Partitioning, the partition key and pruning
+
+`transaction_record` is partitioned by month on `transaction_date` (docs/scalability.md §5.1). Three consequences matter in this phase:
+
+1. **Every unique constraint must include the partition key.** PostgreSQL enforces uniqueness per partition, so a constraint can only be global if the key determines the partition. That is why the row-idempotency key is `(batch_id, source_row_number, transaction_date)` rather than `(batch_id, source_row_number)`. The gap this leaves is covered in M5.5.
+2. **A row needs a partition to land in.** A row whose month has no partition goes into `transaction_record_default`. Once the default partition holds rows for a month, creating that month's partition fails. So partitions must exist *before* rows arrive (M5.3).
+3. **Partition pruning.** When a query's `WHERE` constrains `transaction_date`, the planner skips partitions whose range can't match. A query for 2026-10-01..2026-10-31 touches one partition instead of sixteen. A query with no date filter touches all of them. This is why `GET /api/v1/transactions` requires a date range (M5.19).
+
+### 2.8 Errors are data, not exceptions
+
+A malformed row is an expected business outcome, not a program failure. The validator returns a list of errors for a row; it never throws for bad input. The row is either inserted (no errors) or recorded in `import_row_error` (one row per problem), and processing continues. Exceptions are reserved for conditions that make the *whole file* unprocessable (wrong encoding, unreadable storage, a lost lease).
+
+This keeps the diagnostic promise from projectoverview.md §6: "one malformed row doesn't erase the entire file's diagnostic information".
+
+### 2.9 Transient versus permanent failure
+
+Retrying only helps if the next attempt can behave differently.
+
+| Kind | Examples | Action |
+|---|---|---|
+| Transient | DB connection refused, lock timeout, deadlock, storage 503, socket timeout | Retry with exponential backoff, up to `max_attempts` |
+| Permanent | Invalid UTF-8, row limit exceeded, file missing from storage, a bug (`NullPointerException`) | Fail the batch now with a reason. Retrying would produce the same result five times |
+
+Bugs are classified as permanent on purpose: retrying a deterministic bug wastes attempts and delays the error report. Once the bug is fixed, an operator uses the explicit retry endpoint (M5.20).
+
+---
+
+## 3. Starting point
+
+The schema for this phase was written ahead of time in `V1__initial_schema.sql`. What exists, and what's missing:
+
+| Task | Already in V1 | Still to do |
+|---|---|---|
+| M5.1 `import_batch` | Table with source type, status (CHECK), file name and size, `content_hash CHAR(64)`, `storage_key`, total/valid/error counts, `last_committed_row` checkpoint, `failure_reason`, `uploaded_by`, timestamps | JPA entity, repository, status enum with transitions |
+| M5.2 `import_row_error` | Table with row number, column, error code, message, raw row, and an idempotency unique key | Entity, repository, error code enum |
+| M5.3 `transaction_record` | Monthly-partitioned table, `NUMERIC(19,4)` amount, `raw_values JSONB`, `is_duplicate_in_source`, `create_transaction_record_partition()` function, partitions from 12 months back to 3 months ahead **of the date the migration ran**, and a default partition | Entity (read side) with composite key, a JDBC writer, partition maintenance |
+| M5.4 duplicate file | `import_batch_content_uk` unique index | Map the violation to `409` |
+| M5.5 retry safety | `UNIQUE (batch_id, source_row_number, transaction_date)` | Resume and retry logic that doesn't depend on that key alone (see M5.5) |
+| M5.6 indexes | `(organization_id, source_type, transaction_date, normalized_reference)` and `(organization_id, batch_id)` | Verify with `EXPLAIN` (see gap below) |
+| Job queue | `job` table with status, attempts, `run_after`, `locked_by`, `lease_until`, and claim, fairness and lease indexes | All the code |
+
+**Gaps to know about:**
+
+1. **M5.6 asked for two indexes; V1 has one combined index** that leads with `(organization_id, source_type, transaction_date)`. It serves the matching join and date-range searches well. A search by `reference` across a wide date range without `source_type` can only use the `organization_id` prefix. Don't add an index speculatively: write the query, run `EXPLAIN (ANALYZE, BUFFERS)` on realistic data in M9.7, and add `(organization_id, normalized_reference)` in a new migration only if the plan shows the need.
+2. **The initial partition window is fixed to when V1 ran.** On a database migrated months ago, the "3 months ahead" has already passed. The maintenance job in M5.3 fixes this; don't rely on V1's window.
+3. **No RLS yet on these tables.** M3.5 adds the policies. This phase must set `app.org_id` in the worker for every transaction, or every query returns zero rows once RLS is on (§4, M5.15 worker section).
+4. **`import_batch` has no `version` column.** Concurrency on a batch is handled with a row lock (`SELECT … FOR UPDATE`) during transitions, not optimistic locking. Batch transitions are rare and short, so a lock is simpler and correct.
+5. **`job` should not be under RLS.** The claim query must see every organization's queued jobs. Confirm M3.5 leaves `job` out of the RLS policies, and keep all access to it inside `shared.jobs`.
+
+### 3.1 Dependencies to add (`pom.xml`)
+
+| Artifact | Why |
+|---|---|
+| `org.apache.commons:commons-csv` | RFC 4180 parsing with quotes, embedded commas and embedded newlines. Never split lines on `,` yourself |
+| `commons-io:commons-io` | `BOMInputStream` to strip a UTF-8 byte-order mark (Excel adds one) |
+| `software.amazon.awssdk:s3` | S3 API client; works against MinIO locally and S3 in production |
+| `org.testcontainers:minio` (test) | Real object storage in integration tests |
+
+Pin versions through properties; Boot's dependency management doesn't cover all of them.
+
+### 3.2 Package layout
+
+```
+ingestion/                      ← owns import_batch, import_row_error
+  api/            ImportController, ImportResponse, ImportErrorResponse, ImportAcceptedResponse
+  application/    ImportReceiver (upload), ImportProcessor (worker), ImportRetryService,
+                  ImportJobHandler, ImportProperties
+  domain/         ImportBatch, ImportBatchStatus, ImportRowError, SourceType
+  csv/            CsvContract, ColumnMapping, CsvReaderFactory
+  validation/     RowValidator, RowErrorCode, FieldError
+  normalization/  Normalizer, StatusMapping, TransactionTypeMapping, ReferenceNormalizer
+  storage/        FileStorage, S3FileStorage, OrphanFileSweeper
+ledger/                         ← owns transaction_record
+  api/            TransactionController (GET /transactions), TransactionResponse
+  application/    TransactionRecordWriter (public), TransactionSearch, PartitionManager
+  domain/         TransactionRecord, TransactionRecordId
+shared/
+  jobs/           JobQueue, JobClaimer, JobRunner, JobHandler, JobLeaseSweeper,
+                  JobHeartbeat, JobFailure (Transient/Permanent)
+```
+
+`ingestion` depends on `ledger`'s public API (`TransactionRecordWriter`) to write records; `ledger` never depends on `ingestion`. `transaction_record` belongs to `ledger` because reconciliation (M6) reads it and must not depend on how rows arrived. The Modulith tests from M2.9 enforce this direction.
+
+The generic queue lives in `shared.jobs` with a `JobHandler` interface. `ingestion` registers the `IMPORT` handler; M6 registers `RECONCILE`. The queue knows nothing about imports.
+
+### 3.3 Configuration
+
+```yaml
+spring:
+  servlet:
+    multipart:
+      max-file-size: 50MB
+      max-request-size: 51MB        # file plus the sourceType form field
+      file-size-threshold: 1MB      # larger uploads are buffered to a temp file, not heap
+  datasource:
+    hikari:
+      data-source-properties:
+        reWriteBatchedInserts: true # pgjdbc turns a JDBC batch into multi-row INSERTs
+  jpa:
+    properties:
+      hibernate:
+        jdbc:
+          batch_size: 500
+        order_inserts: true
+        order_updates: true
+
+reconflow:
+  import:
+    max-rows: 500000
+    chunk-size: 5000
+    max-stored-errors: 10000        # per batch; error_rows still counts every bad row
+    oldest-transaction-date: P2Y    # rows older than this are DATE_OUT_OF_RANGE
+    newest-transaction-date: P31D   # rows further in the future are DATE_OUT_OF_RANGE
+  storage:
+    endpoint: ${S3_ENDPOINT:http://localhost:9000}
+    region: ${S3_REGION:us-east-1}
+    bucket: ${S3_BUCKET:reconflow-imports}
+    access-key: ${S3_ACCESS_KEY}
+    secret-key: ${S3_SECRET_KEY}
+  jobs:
+    poll-interval: 1s
+    threads: 4
+    lease: 2m
+    heartbeat: 30s
+    per-org-max-running: 2
+    max-backoff: 10m
+```
+
+Bind each block to a `@ConfigurationProperties` record (`ImportProperties`, `StorageProperties`, `JobProperties`) with `@Validated` so a typo fails at startup instead of at the first upload. The `S3_*` variables are already in `.env.example` from M2.4.
+
+---
+
+## 4. Step by step
+
+The tasks are listed in TASKS.md order, but build them in this order, because each step is testable on its own:
+
+1. M5.1–M5.6 entities and the ledger writer
+2. M5.8 file storage
+3. Job queue (`shared.jobs`)
+4. M5.10–M5.13 parser, validator, normalizer, duplicate flagging (pure unit-testable code)
+5. M5.7, M5.9 upload endpoint
+6. M5.14–M5.16 the worker's processing loop
+7. M5.17–M5.20 read and retry endpoints
+8. M5.21–M5.26 tests (write each alongside its feature, then fill gaps)
+
+---
+
+### M5.1 — `import_batch` entity
+
+**What.** A JPA entity and repository for `import_batch`, plus the `SourceType` enum (`INTERNAL_LEDGER`, `GATEWAY`).
+
+**Why.** The batch is the unit of work the user sees: its status, its counts, and the pointer to the original file.
+
+**How.**
+
+```java
+@Entity
+@Table(name = "import_batch")
+public class ImportBatch {
+    @Id private UUID id;                                   // UUIDv7 from the shared generator
+    @Column(nullable = false) private UUID organizationId;
+    @Enumerated(EnumType.STRING) private SourceType sourceType;
+    @Enumerated(EnumType.STRING) private ImportBatchStatus status;
+    private String fileName;
+    private long fileSizeBytes;
+    @JdbcTypeCode(SqlTypes.CHAR) @Column(length = 64) private String contentHash;
+    private String storageKey;
+    private int totalRows, validRows, errorRows, lastCommittedRow;
+    private String failureReason;
+    private UUID uploadedBy;
+    private Instant startedAt, completedAt;
+    @CreationTimestamp private Instant createdAt;
+    @UpdateTimestamp private Instant updatedAt;
+
+    protected ImportBatch() {}                             // for JPA
+
+    public static ImportBatch received(UUID id, UUID orgId, SourceType type, String fileName,
+                                       long size, String hash, String storageKey, UUID uploadedBy) { … }
+
+    public void transitionTo(ImportBatchStatus next, Instant now) { … }   // M5.15
+}
+```
+
+Repository methods always take `organizationId` (M3.5):
+
+```java
+interface ImportBatchRepository extends JpaRepository<ImportBatch, UUID> {
+    Optional<ImportBatch> findByIdAndOrganizationId(UUID id, UUID orgId);
+
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select b from ImportBatch b where b.id = :id and b.organizationId = :orgId")
+    Optional<ImportBatch> lockByIdAndOrganizationId(UUID id, UUID orgId);
+
+    Optional<ImportBatch> findByOrganizationIdAndSourceTypeAndContentHash(UUID orgId, SourceType t, String hash);
+
+    Page<ImportBatch> findByOrganizationId(UUID orgId, Pageable pageable);
+}
+```
+
+**Pitfalls.**
+
+- **`CHAR(n)` columns fail `ddl-auto: validate`.** Hibernate maps `String` to `varchar` and reports "found [bpchar], but expecting [varchar]". Mark them with `@JdbcTypeCode(SqlTypes.CHAR)` (or `columnDefinition = "char(64)"`). The same applies to `currency CHAR(3)` in M5.3.
+- No public setters. State changes go through named methods (`transitionTo`, `recordChunk`, `resetForRetry`), so there is one place to enforce rules.
+- `findById` without the org is a tenant leak waiting to happen. Don't expose it from a service.
+
+**Done when.** The context starts with `ddl-auto: validate` against Testcontainers PostgreSQL, and a repository test saves and reloads a batch.
+
+---
+
+### M5.2 — `import_row_error` entity
+
+**What.** Entity, repository and the `RowErrorCode` enum.
+
+**Why.** Users must be able to see exactly which row failed and why, and fix their file.
+
+**How.** Error codes, each with a fixed message template:
+
+| Code | Meaning |
+|---|---|
+| `MISSING_REQUIRED_FIELD` | A required column is blank |
+| `COLUMN_COUNT_MISMATCH` | The row has more or fewer fields than the header |
+| `INVALID_AMOUNT` | Not a plain decimal (`1,000.00`, `$5`, `1e3`, `abc`) |
+| `AMOUNT_TOO_MANY_DECIMALS` | More than 4 decimal places |
+| `AMOUNT_OUT_OF_RANGE` | More than 15 integer digits (doesn't fit `NUMERIC(19,4)`) |
+| `AMOUNT_NOT_POSITIVE` | Zero or negative. Direction comes from `transaction_type`, per M1.8 |
+| `INVALID_CURRENCY` | Not an ISO 4217 code |
+| `INVALID_DATE` | `transaction_date` is not `yyyy-MM-dd` |
+| `DATE_OUT_OF_RANGE` | Outside the configured window |
+| `INVALID_TIMESTAMP` | `transaction_at` is not ISO 8601 with an offset |
+| `UNKNOWN_STATUS` | Not in the status mapping table |
+| `UNKNOWN_TRANSACTION_TYPE` | Not in the type mapping table |
+| `REFERENCE_TOO_LONG` | More than 128 characters after normalization |
+
+Write errors with plain JDBC alongside the records (M5.14); the JPA entity is for reading them back in M5.17.
+
+**Pitfalls.**
+
+- **Cap stored errors.** A 500k-row file with every row wrong and three errors per row would write 1.5M error rows. Store up to `max-stored-errors` (10,000) per batch, but keep counting `error_rows` for every bad row. The response says how many errors were stored versus how many rows had errors.
+- `raw_row` should be the row as the user would recognize it. `CSVRecord` doesn't keep the original text, so re-serialize its values with the same `CSVFormat` (`format.format(record.values())`). Document that it's a re-serialization, not the byte-exact line.
+- Never put a stack trace or exception class name in `message`. It's shown to the user.
+
+**Done when.** Inserting the same `(batch, row, column, code)` twice with `ON CONFLICT DO NOTHING` leaves one row (including when `column_name` is `NULL`).
+
+---
+
+### M5.3 — `transaction_record` entity, writer and partitions
+
+**What.** A read-side entity, a JDBC-based writer in `ledger`, and partition management.
+
+**Why.** Reads (M5.19, M6) are naturally entity- or projection-shaped. Writes are bulk and performance-critical, so they skip the ORM.
+
+**How — entity.** The primary key is `(id, transaction_date)`, so the entity needs a composite ID:
+
+```java
+@Embeddable
+public record TransactionRecordId(UUID id, LocalDate transactionDate) implements Serializable {}
+
+@Entity @Table(name = "transaction_record")
+@Immutable                                   // Hibernate never issues UPDATEs for it
+public class TransactionRecord {
+    @EmbeddedId private TransactionRecordId key;
+    private UUID organizationId;
+    private UUID batchId;
+    @Enumerated(EnumType.STRING) private SourceType sourceType;
+    private int sourceRowNumber;
+    private String rawReference, normalizedReference;
+    @Column(precision = 19, scale = 4) private BigDecimal amount;
+    @JdbcTypeCode(SqlTypes.CHAR) @Column(length = 3) private String currency;
+    @Enumerated(EnumType.STRING) private TransactionType transactionType;
+    @Enumerated(EnumType.STRING) private TransactionStatus status;
+    private Instant transactionAt;
+    private boolean isDuplicateInSource;
+    @JdbcTypeCode(SqlTypes.JSON) private Map<String, String> rawValues;
+    private Instant createdAt;
+}
+```
+
+`@Immutable` documents and enforces the rule that imported financial records are never edited. The one flag that changes after insert (`is_duplicate_in_source`) is set by a SQL `UPDATE` in the writer, not through the entity.
+
+**How — writer.** The public API of `ledger` for ingestion:
+
+```java
+public interface TransactionRecordWriter {
+    void ensurePartitions(Set<YearMonth> months);
+    int insert(UUID orgId, List<NewTransactionRecord> rows);           // within the caller's transaction
+    int markDuplicatesInBatch(UUID orgId, UUID batchId);               // M5.13
+    int deleteBatch(UUID orgId, UUID batchId);                         // M5.20 only
+}
+```
+
+Implementation with `JdbcTemplate.batchUpdate` (`JdbcClient` has no batch API):
+
+```java
+private static final String INSERT = """
+    INSERT INTO transaction_record
+      (id, organization_id, batch_id, source_type, source_row_number, raw_reference,
+       normalized_reference, amount, currency, transaction_type, status,
+       transaction_date, transaction_at, raw_values)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb)
+    ON CONFLICT (batch_id, source_row_number, transaction_date) DO NOTHING
+    """;
+
+jdbc.batchUpdate(INSERT, rows, 500, (ps, r) -> {
+    ps.setObject(1, r.id());
+    ps.setObject(2, orgId);
+    …
+    ps.setBigDecimal(8, r.amount());
+    ps.setObject(12, r.transactionDate());                    // LocalDate → DATE
+    ps.setObject(13, r.transactionAt() == null ? null
+                     : r.transactionAt().atOffset(ZoneOffset.UTC));
+    ps.setString(14, json.writeValueAsString(r.rawValues())); // Jackson 3 ObjectMapper
+});
+```
+
+Why JDBC batching instead of `repository.saveAll(entities)`:
+
+| | `saveAll` | `JdbcTemplate.batchUpdate` |
+|---|---|---|
+| Objects per row | Entity, plus a persistence-context entry and a snapshot for dirty checking | A small record |
+| Memory across a chunk | Grows until you `flush()` and `clear()` | Constant |
+| `ON CONFLICT DO NOTHING` | Not expressible | Native SQL |
+| Partitioned composite key, JSONB cast | Possible but fiddly | Plain SQL |
+
+`saveAll` *can* be made to batch (with `batch_size`, `order_inserts`, assigned IDs and periodic `clear()`), and the YAML in §3.3 sets those up for the smaller entities. For the hot path, JDBC is simpler and its behaviour is obvious from the code. With `reWriteBatchedInserts=true`, pgjdbc sends each batch of 500 as a few multi-row `INSERT`s, which is roughly an order of magnitude faster than 500 single-row statements. `COPY` is faster still but can't do `ON CONFLICT`; consider it only if M9.6's benchmark says inserts are the bottleneck.
+
+UUIDv7 IDs are generated in Java, so there is no sequence round-trip per row. Their time-ordering also keeps the primary-key B-tree append-mostly, which keeps inserts cheap and the index compact (random UUIDv4 would scatter writes across the whole index).
+
+**How — partitions.** Rows whose month has no partition land in `transaction_record_default`. Once the default holds rows for a month, `CREATE TABLE … PARTITION OF` for that month fails, because PostgreSQL won't create a partition that would leave matching rows in the default. So partitions must exist before inserting:
+
+```java
+public void ensurePartitions(Set<YearMonth> months) {
+    for (YearMonth m : months) {
+        if (known.contains(m)) continue;                    // ConcurrentHashMap-backed set
+        tx.executeWithoutResult(s ->                       // REQUIRES_NEW: its own short transaction
+            jdbc.queryForObject("SELECT create_transaction_record_partition(?)", Object.class, m.atDay(1)));
+        known.add(m);
+    }
+}
+```
+
+The import processor calls `ensurePartitions` for the distinct months in each chunk **before** opening the chunk's transaction.
+
+Add a daily `PartitionMaintenanceJob` (`@Scheduled`, worker profile) that calls the function for the current month through 3 months ahead, and checks the default partition:
+
+```sql
+SELECT EXISTS (SELECT 1 FROM transaction_record_default);
+```
+
+If that returns `true`, log at `ERROR` and (after M9.9) raise a metric that alerts. Fixing it means moving the rows out manually; it should never happen if validation and `ensurePartitions` work.
+
+**Pitfalls.**
+
+- **Don't create partitions inside the chunk transaction.** `CREATE TABLE … PARTITION OF` takes a strong lock on the parent table. Held for the length of a 5,000-row insert, it would block every query on `transaction_record`, including other tenants' imports and reads. Hence its own short transaction, and the in-memory cache so it runs once per month per JVM.
+- The validator's date window (`oldest-transaction-date`, `newest-transaction-date`) stops a typo like `2062-10-01` from creating a partition decades ahead.
+- **Later, in M10.7:** the application DB role won't have `CREATE` privilege. Make the function `SECURITY DEFINER`, owned by the migration role, in that milestone's migration.
+- Use `LocalDate` for `transaction_date`, never `java.util.Date` or a timestamp. It's a calendar date with no time zone.
+
+**Done when.** Inserting 10 rows across three months creates any missing partitions, the rows land in the right monthly partitions (`SELECT tableoid::regclass, count(*) … GROUP BY 1`), and the default partition stays empty.
+
+---
+
+### M5.4 — Duplicate-file constraint
+
+**What.** Map a violation of `import_batch_content_uk` to `409 Conflict` with the existing batch ID.
+
+**Why.** Finance users re-upload files by accident all the time. Importing the same settlement file twice would double every gateway amount and wreck the reconciliation.
+
+**How.** The constraint already exists. The mapping is in M5.9, which covers both the fast-path check and the race.
+
+**Pitfalls.** The key includes `source_type`, so the same bytes uploaded once as a ledger and once as a gateway file are both accepted. That's intentional (it's almost certainly a mistake, but it's a different import), and it should be documented in the ADR.
+
+**Done when.** Covered by M5.23.
+
+---
+
+### M5.5 — Row-level retry safety
+
+**What.** Guarantee that resuming or retrying a batch never inserts a source row twice.
+
+**Why.** At-least-once execution (§2.5) means some chunks *will* be processed twice.
+
+**How.** Three layers:
+
+1. **Checkpoint (primary).** Rows and `last_committed_row` commit in one transaction (§2.6). A resumed worker skips every record with `recordNumber <= last_committed_row`.
+2. **Unique key (guard).** `ON CONFLICT (batch_id, source_row_number, transaction_date) DO NOTHING` absorbs any overlap the checkpoint missed.
+3. **Clean slate for explicit retries.** `POST /imports/{id}/retry` deletes the batch's records and errors before re-queueing (M5.20), so a retry never mixes rows from two attempts.
+
+**The caveat to understand.** Because the unique key includes `transaction_date` (§2.7), it only catches a duplicate if the row parses to the *same* date both times. If the same source row were parsed to a different date on a second attempt (a normalizer change deployed between attempts, or a time-zone bug), the constraint wouldn't fire and the row would exist twice. That's why the key is a guard, not the mechanism, and why explicit retries start from a clean slate rather than relying on `ON CONFLICT`.
+
+**Pitfalls.** Don't "fix" this by adding a unique index on `(batch_id, source_row_number)` alone. PostgreSQL rejects it on a partitioned table. A global uniqueness check would need a separate unpartitioned table of `(batch_id, source_row_number)` keys, which costs a second insert per row. That's a legitimate option if the risk above becomes real; record it in the ADR as considered and rejected for v1.
+
+**Done when.** M5.25 passes, including the variant that kills the worker after the commit and before the next chunk.
+
+---
+
+### M5.6 — Match-query indexes
+
+**What.** Confirm the indexes from V1 serve the queries this phase and M6 run.
+
+**How.** Load a realistic volume (the M9.5 generator, or a quick `generate_series` script for now) and run:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM transaction_record
+WHERE organization_id = :org AND source_type = 'GATEWAY'
+  AND transaction_date BETWEEN '2026-10-01' AND '2026-10-31'
+ORDER BY transaction_date, id
+LIMIT 51;
+```
+
+Expect: only the October partition scanned, and an index scan on the `…_match_idx` child index. Paste the plan into the PR description.
+
+**Pitfalls.** Plans on an empty table are meaningless; the planner picks sequential scans for tiny tables. Test with at least ~100k rows per partition.
+
+**Done when.** The plans for the M5.19 search shapes are recorded, and either they use an index or there's a note saying which index M9.7 should evaluate.
+
+---
+
+### M5.7 — `POST /api/v1/imports`
+
+**What.** Accept a multipart upload, check it cheaply and synchronously, store it, create the batch and its job, and return `202`.
+
+**Why.** Everything that can be rejected without reading the whole file is rejected *before* the user walks away, so they get immediate feedback for wrong headers. Everything that needs the whole file runs in the background.
+
+**How — the contract.**
+
+```
+POST /api/v1/imports
+Content-Type: multipart/form-data
+Authorization: Bearer …
+X-Organization-Id: …
+
+  file=@gateway-settlement-2026-10.csv
+  sourceType=GATEWAY
+
+202 Accepted
+Location: /api/v1/imports/01933b0e-…
+{ "batchId": "01933b0e-…", "status": "RECEIVED" }
+```
+
+**How — the CSV contract (from M1.3; if M1.3 differs, M1.3 wins).**
+
+Format: UTF-8 (a leading BOM is stripped), comma-separated, RFC 4180 quoting, header row required, header names matched case-insensitively after trimming, unknown extra columns allowed (kept in `raw_values`), duplicate header names rejected. Dates `yyyy-MM-dd`; timestamps ISO 8601 with offset; amounts with a `.` decimal point and no thousands separators. Max 50 MB and 500k data rows.
+
+Columns per source, mapped to canonical names in `ColumnMapping`:
+
+| Canonical field | Ledger header | Gateway header | Required |
+|---|---|---|---|
+| `reference` | `reference` | `merchant_reference` | yes |
+| `amount` | `amount` | `gross_amount` | yes |
+| `currency` | `currency` | `currency` | yes |
+| `status` | `status` | `settlement_status` | yes |
+| `transaction_date` | `transaction_date` | `payment_date` | yes |
+| `transaction_type` | `transaction_type` | `txn_type` | no (defaults to `PAYMENT`) |
+| `transaction_at` | `transaction_at` | `created_at` | no |
+| — | `description`, others | `gateway_txn_id`, `fee`, others | kept in `raw_values` only |
+
+Per-source mappings live in code for v1. Per-organization configurable mappings are v2 scope (TASKS.md "Later").
+
+**How — the controller.**
+
+```java
+@PostMapping(path = "/api/v1/imports", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+@PreAuthorize("hasAuthority('IMPORT_CREATE')")
+public ResponseEntity<ImportAcceptedResponse> upload(@RequestPart("file") MultipartFile file,
+                                                     @RequestParam SourceType sourceType) {
+    ImportBatch batch = importReceiver.receive(file, sourceType);
+    return ResponseEntity.accepted()
+            .location(URI.create("/api/v1/imports/" + batch.getId()))
+            .body(new ImportAcceptedResponse(batch.getId(), batch.getStatus()));
+}
+```
+
+**How — `ImportReceiver.receive`, in order:**
+
+1. **Cheap request checks.** File present and non-empty (`EMPTY_FILE`); name ends in `.csv` (`UNSUPPORTED_FILE_TYPE`). Size is already capped by `spring.servlet.multipart.max-file-size`.
+2. **Pass 1 over the buffered upload** (the container has already written it to a temp file; §3.3 `file-size-threshold`):
+   - Compute SHA-256 over every byte:
+     ```java
+     MessageDigest md = MessageDigest.getInstance("SHA-256");
+     try (InputStream in = new DigestInputStream(file.getInputStream(), md)) {
+         in.transferTo(OutputStream.nullOutputStream());
+     }
+     String hash = HexFormat.of().formatHex(md.digest());
+     ```
+   - Open a second stream and read only the header and the first data record through `CsvReaderFactory` (BOM stripping and strict UTF-8, as in M5.10). Missing required columns → `400 missing-columns` listing them. No data record → `400 no-data-rows`. Invalid UTF-8 in the header → `400 invalid-encoding`.
+3. **Duplicate fast path** (M5.9): look up the hash; if found, `409` without uploading anything.
+4. **Upload to storage** at `{orgId}/imports/{batchId}/original.csv`. The batch ID is generated here (UUIDv7) so the key is known before the row exists.
+5. **One DB transaction:** insert the batch (`RECEIVED`), insert the job (`IMPORT`, payload `{"batchId": "…"}`), and `auditService.record(IMPORT_RECEIVED, …)`.
+6. **On a unique violation** in step 5 (a concurrent duplicate upload won the race): delete the just-uploaded object (best effort), look up the winning batch, return `409`.
+
+**Problem types** (all RFC 9457, `type = https://reconflow.dev/problems/<code>`, with `code` and `requestId`):
+
+| HTTP | Type | When |
+|---|---|---|
+| 400 | `empty-file` | Zero bytes, or no header row |
+| 400 | `no-data-rows` | Header only |
+| 400 | `missing-columns` | Extension field `missingColumns: [...]` |
+| 400 | `duplicate-columns` | Header names repeat |
+| 400 | `invalid-encoding` | Header isn't valid UTF-8 |
+| 400 | `unsupported-file-type` | Not `.csv` |
+| 409 | `duplicate-import` | Extension field `existingBatchId` |
+| 413 | `file-too-large` | `MaxUploadSizeExceededException` |
+
+(Use `422` for the content errors instead of `400` if `api-design.md` chose that convention in M1.11. Be consistent across the API.)
+
+**Pitfalls.**
+
+- **Don't trust `Content-Type`.** Browsers send `text/csv`, `text/plain`, `application/octet-stream`, and Windows with Excel installed sends `application/vnd.ms-excel` for `.csv` files. Check the extension and *parse the header*; that's the real test.
+- **Don't read the file into a `byte[]`** (`file.getBytes()`). That's 50 MB of heap per concurrent upload. Stream it.
+- `file.getOriginalFilename()` is user input: store it for display only, never use it in a path or storage key (path traversal: `../../etc/passwd`). The key uses only server-generated IDs.
+- **Tomcat and oversized uploads.** When a request exceeds the limit, Tomcat may stop reading and reset the connection, so the client sees a connection error instead of your `413`. Check `server.tomcat.max-swallow-size` against the Boot 4 docs and test with a 60 MB file. M10.3 hardens this further.
+- Uploads don't take an `Idempotency-Key` header: the content hash already makes them idempotent. A client that retries a timed-out upload gets `409` with the batch ID it was trying to create, which is exactly the information it needs.
+
+**Done when.** A valid file returns `202` with a `Location` header, one `import_batch` row in `RECEIVED`, one `QUEUED` job and one `IMPORT_RECEIVED` audit event, and the file is in MinIO. Each problem type above has a test.
+
+---
+
+### M5.8 — File storage
+
+**What.** A `FileStorage` abstraction with an S3-compatible implementation, MinIO locally and in tests.
+
+**Why.** The original file is the audit evidence and the input for reprocessing. With two or more instances, the API node that received the upload and the worker that processes it are different machines, so the local disk won't do (docs/scalability.md D3).
+
+**How.**
+
+```java
+public interface FileStorage {
+    void put(String key, InputStream content, long size, String contentType);
+    void download(String key, Path target);      // to a local temp file
+    void delete(String key);
+    boolean exists(String key);
+}
+```
+
+`S3FileStorage` uses AWS SDK v2:
+
+```java
+S3Client.builder()
+    .endpointOverride(URI.create(props.endpoint()))
+    .region(Region.of(props.region()))
+    .forcePathStyle(true)                       // MinIO needs path-style URLs
+    .credentialsProvider(StaticCredentialsProvider.create(
+        AwsBasicCredentials.create(props.accessKey(), props.secretKey())))
+    .build();
+
+s3.putObject(PutObjectRequest.builder().bucket(bucket).key(key).contentType(contentType).build(),
+             RequestBody.fromInputStream(content, size));
+```
+
+The worker **downloads the object to a local temp file and parses from disk**, rather than parsing straight from the S3 stream. A 50 MB temp file is cheap, while an HTTP stream held open for the minutes an import can take is fragile: a network blip would fail the job halfway, and S3 closes idle connections. Delete the temp file in a `finally`.
+
+Bucket setup: the M2.4 `compose.yaml` creates the bucket with a one-shot `minio/mc` container. Don't create buckets from application code in production.
+
+**Orphan sweeper.** Files uploaded in M5.7 step 4 whose DB transaction then failed are orphans (§2.3). `OrphanFileSweeper` runs daily in the worker profile, per organization (so `app.org_id` can be set), lists objects under `{orgId}/imports/` older than 24 hours, and deletes any whose key doesn't appear in `import_batch.storage_key`. The 24-hour delay means it never races an upload in progress.
+
+**Pitfalls.**
+
+- Credentials come from environment variables only (M2.5).
+- Storage keys must not contain user input (see M5.7).
+- Don't delete a batch's original file when a batch fails. It's the evidence and the input for retry.
+
+**Done when.** An integration test with the MinIO Testcontainer puts, downloads and deletes an object, and the sweeper test deletes an unreferenced object older than the threshold while keeping a referenced one.
+
+---
+
+### Job queue (moved in from M9.2)
+
+**What.** A generic DB-backed queue in `shared.jobs`: enqueue, claim, run, heartbeat, sweep, retry with backoff.
+
+**Why.** Imports must be asynchronous (§1), and the queue must be durable (a restart doesn't lose work), fair across tenants, and recover from crashed workers.
+
+**How — the handler contract.**
+
+```java
+public interface JobHandler {
+    String type();                                   // "IMPORT"
+    void handle(Job job, JobContext ctx);            // throw TransientJobFailure or PermanentJobFailure
+    void onPermanentFailure(Job job, String reason); // e.g. mark the batch FAILED; runs in its own transaction
+}
+
+public interface JobContext {
+    void fence();                                    // call inside each chunk transaction (§2.5)
+}
+```
+
+**How — enqueue** (inside the caller's transaction; `Propagation.MANDATORY` so it can't be called outside one):
+
+```sql
+INSERT INTO job (id, organization_id, type, payload) VALUES (?, ?, ?, ?::jsonb);
+```
+
+**How — claim** (one statement, its own short transaction):
+
+```sql
+UPDATE job SET status = 'RUNNING', locked_by = :workerId,
+               lease_until = now() + :lease, attempts = attempts + 1, updated_at = now()
+WHERE id = (
+    SELECT j.id FROM job j
+    WHERE j.status = 'QUEUED' AND j.run_after <= now()
+      AND (SELECT count(*) FROM job r
+           WHERE r.organization_id = j.organization_id AND r.status = 'RUNNING') < :perOrgMax
+    ORDER BY j.created_at
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1)
+RETURNING *;
+```
+
+`workerId` is `hostname + ":" + pid + ":" + threadName`, so `locked_by` identifies exactly who holds a job.
+
+The per-org cap (2) stops one tenant with 30 files from occupying every worker (the noisy-neighbour problem, docs/scalability.md §4.2). It's a **soft** cap: two workers claiming at the same instant can both count 1 running and both claim, giving 3. That's acceptable; the goal is fairness, not a hard limit. If a hard limit is ever needed, take `pg_advisory_xact_lock(hashtext(organization_id::text))` in the claim. Mention this trade-off in an interview; it shows you know `SKIP LOCKED` locks rows, not predicates.
+
+**How — the runner.** `JobPoller` (`@Scheduled(fixedDelay = poll-interval)`) claims while a bounded executor (`threads: 4`) has free capacity, and submits each job:
+
+```java
+void run(Job job) {
+    MDC.put("jobId", …); MDC.put("orgId", …);
+    tenantContext.runAs(job.organizationId(), () -> {          // see "Tenancy in the worker" below
+        try {
+            handlerFor(job.type()).handle(job, contextFor(job));
+            markDone(job);
+        } catch (TransientJobFailure | TransientDataAccessException | SdkClientException e) {
+            if (job.attempts() >= job.maxAttempts()) failPermanently(job, "RETRIES_EXHAUSTED: " + e.getMessage());
+            else reschedule(job, backoff(job.attempts()), e);
+        } catch (LeaseLostException e) {
+            log.warn("lease lost; another worker owns the job now");   // do nothing else
+        } catch (Exception e) {                                       // permanent, including bugs
+            failPermanently(job, e.getMessage());
+        }
+    });
+}
+```
+
+`reschedule` sets `status = 'QUEUED'`, `run_after = now() + min(2^attempts × 10 s, max-backoff) ± 20 % jitter`, clears `locked_by` and `lease_until`, and stores `last_error`. Every status write includes `AND locked_by = :workerId` so a worker can only change jobs it still owns.
+
+Jitter matters: without it, every job that failed during a 30-second DB outage retries at the same instant when the DB comes back, and knocks it over again (a *thundering herd*).
+
+**How — heartbeat.** `JobHeartbeat` (`@Scheduled(fixedDelay = 30s)`) extends the lease for every job this JVM is running:
+
+```sql
+UPDATE job SET lease_until = now() + :lease WHERE id = ANY(:ids) AND locked_by = :workerId AND status = 'RUNNING';
+```
+
+**How — fencing.** `JobContext.fence()` runs inside each chunk transaction:
+
+```sql
+UPDATE job SET lease_until = now() + :lease WHERE id = :id AND locked_by = :workerId AND status = 'RUNNING';
+-- 0 rows → throw LeaseLostException, and the whole chunk rolls back
+```
+
+**How — lease sweeper.** `JobLeaseSweeper` (`@Scheduled(fixedDelay = 30s)`) handles jobs whose worker died:
+
+```sql
+-- re-queue those with attempts left
+UPDATE job SET status = 'QUEUED', locked_by = NULL, lease_until = NULL, run_after = now(),
+               last_error = 'lease expired', updated_at = now()
+WHERE status = 'RUNNING' AND lease_until < now() AND attempts < max_attempts;
+```
+
+Jobs with no attempts left are selected `FOR UPDATE SKIP LOCKED`, and for each one the sweeper calls the handler's `onPermanentFailure` and sets the job to `FAILED` in one transaction. Several worker nodes can run the sweeper at once safely: the statements are idempotent and `SKIP LOCKED` keeps them from fighting.
+
+**How — graceful shutdown.** Implement `SmartLifecycle.stop()` on the poller: stop claiming, let in-flight jobs finish their current chunk (bounded by `spring.lifecycle.timeout-per-shutdown-phase`), then release their leases (`QUEUED`, `run_after = now()`, `attempts = attempts - 1` so a deploy doesn't burn an attempt). Another worker resumes from the checkpoint immediately instead of waiting 2 minutes for the lease to expire.
+
+**How — profiles.** Mark the poller, heartbeat, sweepers and maintenance jobs `@Profile("worker")`. The `local` profile includes both (`spring.profiles.group.local: api, worker`), so one `spring-boot:run` does everything. In the `test` profile, disable scheduling and drive jobs explicitly with `JobRunner.runAllQueued()` so tests are deterministic.
+
+**How — tenancy in the worker.** There is no HTTP request in a worker thread, so a request-scoped `TenantContext` bean (M3.4) doesn't exist there. Every worker transaction still needs `app.org_id` set for RLS. Whatever M3.4 built must therefore offer a programmatic `runAs(orgId, Runnable)`. Java 25's `ScopedValue` is a good fit (bound for the duration of a call, inherited by nothing else, impossible to leak into the next job the way a forgotten `ThreadLocal.remove()` can). The same transaction hook that M3.5 uses for requests (`SELECT set_config('app.org_id', :orgId, true)` at transaction start) then works unchanged in the worker. If M3.4 used a request-scoped bean only, extend it here rather than bypassing RLS for workers.
+
+**Pitfalls.**
+
+- Never run the claim in the same transaction as the work. The row lock would be held for the whole import, and `SKIP LOCKED` would hide the job from the sweeper, so a dead worker's job could never be recovered.
+- Don't use `@Async` for this. Its tasks live in memory and vanish on restart.
+- Size the Hikari pool for worker threads plus the scheduled jobs (docs/scalability.md §2.5).
+
+**Done when.** Tests show: two concurrent claimers never get the same job; a job whose lease expires is re-queued and completes; a zombie whose lease was taken gets `LeaseLostException` and commits nothing; transient failures back off with increasing `run_after`; permanent failures go straight to `FAILED`; a third job for an org with two running isn't claimed while another org's job is.
+
+---
+
+### M5.9 — Duplicate-file policy
+
+**What.** Implement the M1.12 ADR: **reject** a duplicate file with `409` and the existing batch ID. A `FAILED` batch is reprocessed with `POST /imports/{id}/retry` (M5.20), never by uploading the file again.
+
+**Why.** The constraint key forbids a second batch with the same hash, so "re-import" must mean "reprocess the same batch". That keeps one batch per file, one audit trail per file, and no question of which of two batches is authoritative.
+
+**How.**
+
+```java
+// fast path, before uploading
+repo.findByOrganizationIdAndSourceTypeAndContentHash(orgId, type, hash)
+    .ifPresent(existing -> { throw new DuplicateImportException(existing.getId()); });
+
+// ... upload, then the transaction:
+try {
+    tx.executeWithoutResult(s -> { repo.saveAndFlush(batch); jobQueue.enqueue(…); audit.record(…); });
+} catch (DataIntegrityViolationException e) {
+    if (!isConstraint(e, "import_batch_content_uk")) throw e;
+    storage.deleteQuietly(storageKey);
+    UUID winner = repo.findByOrganizationIdAndSourceTypeAndContentHash(orgId, type, hash).orElseThrow().getId();
+    throw new DuplicateImportException(winner);
+}
+```
+
+`saveAndFlush` matters: without the flush, the `INSERT` happens at commit, outside the `try`'s view of which statement failed. Detect the constraint by name: unwrap to `org.postgresql.util.PSQLException`, check SQL state `23505` and `getServerErrorMessage().getConstraint()`. Don't match on message text, which changes between versions and locales.
+
+The response:
+
+```json
+{
+  "type": "https://reconflow.dev/problems/duplicate-import",
+  "title": "File already imported",
+  "status": 409,
+  "detail": "This file was already imported as a GATEWAY file for this organization.",
+  "code": "DUPLICATE_IMPORT",
+  "existingBatchId": "01933b0e-…",
+  "requestId": "…"
+}
+```
+
+**Pitfalls.**
+
+- The pre-check alone is a race (§2.2). The constraint alone works but wastes an upload. Use both.
+- After the transaction rolls back, the persistence context is unusable. Do the winner lookup in a new transaction (the code above runs it outside `tx`).
+
+**Done when.** M5.23 passes, including the concurrent variant.
+
+---
+
+### M5.10 — Streaming CSV parser
+
+**What.** `CsvReaderFactory` turns a file on disk into a stream of records, with strict UTF-8, BOM stripping and the header mapped to canonical fields.
+
+**How.**
+
+```java
+public CsvRows open(Path file, SourceType type) throws IOException {
+    InputStream bom = BOMInputStream.builder().setInputStream(Files.newInputStream(file)).get();
+    Reader reader = new InputStreamReader(bom, StandardCharsets.UTF_8.newDecoder()
+            .onMalformedInput(CodingErrorAction.REPORT)          // fail, don't silently insert U+FFFD
+            .onUnmappableCharacter(CodingErrorAction.REPORT));
+    CSVParser parser = CSVFormat.RFC4180.builder()
+            .setHeader()                                         // first record is the header
+            .setSkipHeaderRecord(true)
+            .setIgnoreEmptyLines(true)
+            .setDuplicateHeaderMode(DuplicateHeaderMode.DISALLOW)
+            .get()                                               // build() in older commons-csv; check your version
+            .parse(reader);
+    ColumnMapping mapping = ColumnMapping.resolve(type, parser.getHeaderNames());   // trims and lower-cases names
+    return new CsvRows(parser, mapping);                         // Iterable<ParsedRow>, AutoCloseable
+}
+```
+
+`ParsedRow` carries the record number, the raw values by header name (for `raw_values`), the canonical fields looked up by index through the mapping, and whether the field count matched the header (`record.isConsistent()`).
+
+**Why these choices.**
+
+- **RFC 4180 parsing,** because real files contain `"ACME, Inc."` and quoted newlines. Splitting on `,` is the classic bug.
+- **Strict decoding,** because the default decoder replaces bad bytes with `�` and you would import corrupted references without any error. A Latin-1 file that sneaks through would then never match its ledger counterpart.
+- **Our own header mapping by index** instead of `setIgnoreHeaderCase`/trim options, so the raw header text is kept intact for `raw_values` while the lookup is forgiving.
+
+**Pitfalls.**
+
+- **Row numbers are records, not lines.** A quoted field with a newline makes one record span two lines. `import_row_error.row_number` is documented as "1-based data row, header excluded"; use `CSVRecord.getRecordNumber()` and assert in a unit test that the first data row is `1` with your parser settings.
+- An invalid byte throws `UncheckedIOException` / `MalformedInputException` mid-iteration. Catch it at the processor level and fail the batch permanently with `INVALID_ENCODING` and the row number it reached; you can't attribute it to a column.
+- Close the parser (try-with-resources). Leaked file handles on a worker accumulate until the OS limit.
+
+**Done when.** Unit tests pass for: BOM stripped; quoted comma; quoted newline (one record, numbered correctly); header in different case and with spaces; duplicate header rejected; invalid UTF-8 throws; empty lines skipped; extra unknown column kept in raw values.
+
+---
+
+### M5.11 — Row validator
+
+**What.** `RowValidator.validate(ParsedRow, SourceType) → List<FieldError>`: every check from `reconciliation-rules.md`, collecting all errors per row.
+
+**Why.** One pass that reports every problem lets users fix a file in one round instead of five.
+
+**How — the checks, in order per field:**
+
+| Field | Rule | Error |
+|---|---|---|
+| any | Field count equals header count | `COLUMN_COUNT_MISMATCH` (stop: field positions can't be trusted) |
+| required fields | Non-blank after trim | `MISSING_REQUIRED_FIELD` |
+| `amount` | Matches `^\d{1,15}(\.\d{1,4})?$` after trim | `INVALID_AMOUNT`, `AMOUNT_TOO_MANY_DECIMALS`, `AMOUNT_OUT_OF_RANGE` |
+| `amount` | `> 0` | `AMOUNT_NOT_POSITIVE` |
+| `currency` | Upper-cased, `Currency.getInstance(code)` succeeds | `INVALID_CURRENCY` |
+| `transaction_date` | `LocalDate.parse(s)` (ISO) | `INVALID_DATE` |
+| `transaction_date` | Within `[today − oldest, today + newest]` | `DATE_OUT_OF_RANGE` |
+| `transaction_at` | If present, `OffsetDateTime.parse(s)` | `INVALID_TIMESTAMP` |
+| `status` | In `StatusMapping` | `UNKNOWN_STATUS` |
+| `transaction_type` | If present, in `TransactionTypeMapping` | `UNKNOWN_TRANSACTION_TYPE` |
+| `reference` | ≤ 128 chars after normalization | `REFERENCE_TOO_LONG` |
+
+Parse the amount once, to the stored scale:
+
+```java
+BigDecimal amount = new BigDecimal(raw.trim());           // after the regex check, never from a double
+amount = amount.setScale(4, RoundingMode.UNNECESSARY);    // throws if precision would be lost; regex already ensures it won't
+```
+
+The regex rejects a leading `-`/`+`, exponents (`1E+3`, which `new BigDecimal` would otherwise accept), thousands separators and currency symbols. `RoundingMode.UNNECESSARY` turns "this would silently round" into an exception; we never round financial input, we reject it.
+
+The validator returns a `ValidatedRow` (the typed values) only when the error list is empty, so the normalizer never sees half-valid data.
+
+**Pitfalls.**
+
+- `Currency.getInstance` throws `IllegalArgumentException` for unknown codes. Catch that specific exception; don't let it escape.
+- Never `Double.parseDouble` anywhere near amounts. `0.1 + 0.2 != 0.3` in binary floating point.
+- The date window uses the clock: inject a `Clock` so tests are deterministic.
+- Whether amounts can be negative is an M1.8 decision. This plan assumes "positive, direction from `transaction_type`". If M1.8 decided otherwise, change the regex and this table, and document it.
+
+**Done when.** One unit test per rule (M5.21), plus a test that a row with three bad fields gets three errors.
+
+---
+
+### M5.12 — Normalizer
+
+**What.** `Normalizer.normalize(ValidatedRow, SourceType) → NewTransactionRecord`: canonical values for matching, with the raw values preserved.
+
+**Why.** Matching compares normalized fields; investigators and auditors need the original. Keeping both means a normalization bug can be fixed and replayed later from `raw_values` instead of being baked in forever.
+
+**How — the rules.** `docs/reconciliation-rules.md` §1 (written in M1.5, rules N1–N11 in phase-M1 §4.5) is the single source of truth. The normalizer implements it; it never invents rules of its own. If the two disagree, the doc wins and the code is the bug.
+
+| Field | Rule IDs | Normalization | Example |
+|---|---|---|---|
+| `normalized_reference` | N1–N4 | Trim leading/trailing whitespace (incl. U+00A0), NFKC-normalize, upper-case with `Locale.ROOT`. **Internal characters are kept**: `PAY-101` and `PAY 101` stay different | `" pay-101 "` → `PAY-101` |
+| `raw_reference` | N11 | Exactly as in the file, untrimmed | `" pay-101 "` |
+| `currency` | N5 | Trim, upper-case `Locale.ROOT`, valid ISO 4217 | `aed` → `AED` |
+| `amount` | N6 | `new BigDecimal(String)`, > 4 decimals rejected (M5.11), scale 4 | `1000` → `1000.0000` |
+| `transaction_at` | N7 | Parsed as `OffsetDateTime`, stored as a UTC instant | `2026-10-05T23:30:00+04:00` → `2026-10-05T19:30:00Z` |
+| `transaction_date` | N7, N8 | If `transaction_at` is present: its **UTC** date. If only a date is given (ledger only): used as is, `transaction_at` NULL | `2026-10-01T02:00+04:00` → `2026-09-30` |
+| `status` | N9 | Through `StatusMapping`, case-insensitive; unknown → row error `UNKNOWN_STATUS` | `captured` → `SUCCESS` |
+| `transaction_type` | N10 | Upper-case; must be `PAYMENT`, `REFUND`, `CHARGEBACK` or `FEE`; blank → `PAYMENT`; anything else → row error | `refund` → `REFUND` |
+| `raw_values` | N11 | Every column of the row, original header → original string | `{"merchant_reference":" pay-101 ", …}` |
+
+```java
+static String normalizeReference(String raw) {
+    String s = Normalizer.normalize(raw, Normalizer.Form.NFKC);   // also turns U+00A0 into a plain space
+    return s.strip().toUpperCase(Locale.ROOT);                     // strip() is Unicode-aware, unlike trim()
+}
+```
+
+`StatusMapping` is the table in phase-M1 §4.5 (N9), held in one class. Source-specific synonyms (a gateway that writes `sale` instead of `PAYMENT`) are **not** added here: they belong to per-organization column mappings (phase-v2 §3.7).
+
+**Pitfalls.**
+
+- **`toUpperCase()` without a locale** uses the JVM default. On a Turkish-locale machine, `"pay-101i".toUpperCase()` produces a dotted `İ`, and the reference no longer matches. Always `Locale.ROOT`.
+- **NFKC** turns full-width characters (`ＰＡＹ１０１`, common in files exported from some systems) and non-breaking spaces into their plain forms. Without it, visually identical references don't match.
+- Don't strip hyphens or leading zeros unless `reconciliation-rules.md` says so. Over-normalizing creates false matches, which are worse than missed ones: a false match hides a discrepancy, while a missed match at least surfaces as an exception.
+- When `transaction_at` is present, `transaction_date` is **derived** from it in UTC (N7), so a payment at 02:00 Dubai time on 1 October is dated 30 September. That's deliberate: both sources then use one clock and the same partition. A ledger row that supplies both columns and disagrees is not "corrected" silently: the file's `transaction_date` is ignored when `transaction_at` exists, and `raw_values` keeps the original.
+- `String.trim()` only removes characters ≤ U+0020; `strip()` removes all Unicode whitespace. Use `strip()`.
+
+**Done when.** One unit test per rule (M5.21), including the Turkish-locale case (`Locale.setDefault(new Locale("tr"))` in the test) and the full-width case.
+
+---
+
+### M5.13 — Within-file duplicate detection
+
+**What.** Flag every row in a batch that shares `(normalized_reference, transaction_type, amount, currency)` with another row of the same batch, setting `is_duplicate_in_source = true` on **all** copies. Drop none.
+
+**Why.** projectoverview.md §5: "Don't arbitrarily select one duplicate and discard the rest." A repeated row in a gateway file might be a genuine double charge or an export bug; only a human can tell. M6 turns flagged rows into `DUPLICATE_IN_SOURCE` exceptions.
+
+**How.** Not in Java. A full-file check needs to know about every row before flagging any, which breaks the streaming rule (§2.1): a `HashMap` of every key in a 500k-row file is tens of MB per import. Instead, once all chunks are committed, one set-based statement in the finalize transaction:
+
+```sql
+UPDATE transaction_record t
+SET    is_duplicate_in_source = true
+WHERE  t.organization_id = :orgId
+  AND  t.batch_id = :batchId
+  AND  (t.normalized_reference, t.transaction_type, t.amount, t.currency) IN (
+         SELECT normalized_reference, transaction_type, amount, currency
+         FROM   transaction_record
+         WHERE  organization_id = :orgId AND batch_id = :batchId
+         GROUP  BY normalized_reference, transaction_type, amount, currency
+         HAVING count(*) > 1);
+```
+
+Why this is memory-safe: PostgreSQL does the grouping with a hash or sort that spills to disk when it exceeds `work_mem`. The JVM holds nothing. It uses the `(organization_id, batch_id)` index on each partition.
+
+**Pitfalls.**
+
+- `amount` is `NUMERIC`, so `1000.0000 = 1000.0000` compares numerically in SQL. In Java, the equivalent comparison must be `compareTo`, never `equals` (`new BigDecimal("1000.0").equals(new BigDecimal("1000.00"))` is `false`).
+- Duplicates **across** batches (the same row in yesterday's and today's file) are not this task. M6.8 handles several candidates for one reference within a run's period.
+- The same reference with *different* amounts is not a within-file duplicate by this key. It will surface in M6 as several candidates for one reference. That's by design; record it in `reconciliation-rules.md`.
+
+**Done when.** A file with `PAY-104` twice (same amount) has both rows flagged and both persisted; a file with no repeats flags nothing.
+
+---
+
+### M5.14 — Batch inserts, chunked
+
+**What.** The worker's processing loop: stream, validate, normalize, and commit 5,000 rows at a time with the checkpoint.
+
+**How — `ImportProcessor.process(job, ctx)`:**
+
+```java
+ImportBatch batch = begin(job);                   // tx: lock batch; RECEIVED → PROCESSING, or resume if PROCESSING,
+                                                  //     or return early if already terminal (job is a harmless repeat)
+if (batch.isTerminal()) return;
+
+Path file = Files.createTempFile("import-", ".csv");
+try {
+    storage.download(batch.getStorageKey(), file);
+    try (CsvRows rows = csv.open(file, batch.getSourceType())) {
+        Chunk chunk = new Chunk(props.chunkSize());
+        int rowNumber = 0;
+        for (ParsedRow row : rows) {
+            rowNumber = row.number();
+            if (rowNumber > props.maxRows()) throw new PermanentJobFailure("ROW_LIMIT_EXCEEDED");
+            if (rowNumber <= batch.getLastCommittedRow()) continue;     // resume: already committed
+            List<FieldError> errors = validator.validate(row, batch.getSourceType());
+            if (errors.isEmpty()) chunk.addValid(normalizer.normalize(row.validated(), batch.getSourceType()));
+            else                  chunk.addErrors(row, errors);
+            testHook.afterRow(rowNumber);                                // M5.25 crash injection; no-op in prod
+            if (chunk.isFull()) { commitChunk(batch, chunk, rowNumber, ctx); chunk.clear(); }
+        }
+        if (!chunk.isEmpty()) commitChunk(batch, chunk, rowNumber, ctx);
+        finish(batch, rowNumber);                                       // M5.15
+    }
+} finally {
+    Files.deleteIfExists(file);
+}
+```
+
+`commitChunk`, in its own transaction:
+
+```java
+writer.ensurePartitions(chunk.months());          // first, in separate short transactions (M5.3)
+tx.executeWithoutResult(s -> {
+    ctx.fence();                                  // lease check, §2.5
+    writer.insert(orgId, chunk.validRows());
+    errorWriter.insert(orgId, batchId, chunk.errorsUpTo(remainingErrorBudget));
+    batchRepo.recordChunk(orgId, batchId, lastRowNumber, chunk.validCount(), chunk.errorRowCount());
+});
+```
+
+`recordChunk` is a single SQL update so it doesn't depend on a stale entity:
+
+```sql
+UPDATE import_batch
+SET last_committed_row = :lastRow, total_rows = :lastRow,
+    valid_rows = valid_rows + :valid, error_rows = error_rows + :errorRows, updated_at = now()
+WHERE id = :batchId AND organization_id = :orgId AND status = 'PROCESSING';
+```
+
+Because the counters and the rows commit together, they are exact after any crash. The finalize step (M5.15) asserts `valid_rows = (SELECT count(*) FROM transaction_record WHERE batch_id = …)` and logs at `ERROR` if not; it should never fire.
+
+**Why 5,000 rows.** Large enough that commit overhead is negligible (one fsync per 5,000 rows), small enough that a crash loses at most a few seconds of work and a transaction holds a few MB of WAL. It's a tunable (`chunk-size`); M9.6 measures whether a different size is better.
+
+**Pitfalls.**
+
+- **Don't wrap `process` in `@Transactional`.** That makes the whole file one transaction and defeats chunking. Use `TransactionTemplate` per chunk so the boundaries are visible in the code.
+- Calling a `@Transactional` method on `this` from the same class bypasses the proxy and silently runs without a transaction. Another reason to prefer `TransactionTemplate` here.
+- If you use JPA anywhere in the loop, `clear()` the persistence context per chunk, or every entity stays referenced and heap grows with the file.
+- The `rowNumber > maxRows` check fails the batch after committing earlier chunks. Those rows stay until a retry deletes them, which is why M6 must only read records from completed batches (M5.15).
+
+**Done when.** A 50k-row file imports with constant heap (watch it in a test with `-Xmx256m`) and 10 chunk commits visible in the logs.
+
+---
+
+### M5.15 — Status transitions in one place
+
+**What.** All batch status changes go through `ImportBatchStatus` and `ImportBatch.transitionTo`.
+
+**Why.** If any code can write `status`, eventually some path will produce an impossible state (a `COMPLETED` batch going back to `PROCESSING`). One method means one place to read, test and audit.
+
+**How.**
+
+```java
+public enum ImportBatchStatus {
+    RECEIVED, PROCESSING, COMPLETED, COMPLETED_WITH_ERRORS, FAILED;
+
+    private static final Map<ImportBatchStatus, Set<ImportBatchStatus>> ALLOWED = Map.of(
+        RECEIVED,              EnumSet.of(PROCESSING, FAILED),
+        PROCESSING,            EnumSet.of(COMPLETED, COMPLETED_WITH_ERRORS, FAILED),
+        FAILED,                EnumSet.of(RECEIVED),              // explicit retry only (M5.20)
+        COMPLETED,             EnumSet.noneOf(ImportBatchStatus.class),
+        COMPLETED_WITH_ERRORS, EnumSet.noneOf(ImportBatchStatus.class));
+
+    public boolean canTransitionTo(ImportBatchStatus next) { return ALLOWED.get(this).contains(next); }
+    public boolean isTerminal() { return this == COMPLETED || this == COMPLETED_WITH_ERRORS || this == FAILED; }
+}
+```
+
+```java
+public void transitionTo(ImportBatchStatus next, Instant now) {
+    if (!status.canTransitionTo(next))
+        throw new InvalidStateTransitionException("IMPORT_BATCH", id, status, next);
+    switch (next) {
+        case PROCESSING -> startedAt = now;
+        case COMPLETED, COMPLETED_WITH_ERRORS, FAILED -> completedAt = now;
+        case RECEIVED -> { }
+    }
+    status = next;
+}
+```
+
+Every transition happens with the batch row locked (`lockByIdAndOrganizationId`) in a transaction that also writes the audit event.
+
+Outcomes:
+
+| Situation | Final status |
+|---|---|
+| Every row valid | `COMPLETED` |
+| At least one row invalid (including *every* row invalid) | `COMPLETED_WITH_ERRORS` |
+| The file as a whole couldn't be processed (encoding, row limit, missing object, retries exhausted, bug) | `FAILED` with `failure_reason` |
+
+A file where every row is invalid is `COMPLETED_WITH_ERRORS` with `valid_rows = 0`, not `FAILED`: processing worked, and the report of what's wrong is complete. `FAILED` means "we couldn't finish reading it", which is a different message to the user.
+
+`finish(batch, totalRows)` in one transaction: lock the batch; run the duplicate `UPDATE` (M5.13); set `total_rows`; transition to `COMPLETED` or `COMPLETED_WITH_ERRORS`; `audit.record(IMPORT_COMPLETED, …)`; mark the job `DONE` (with the fence). If the fence fails, everything rolls back and the other worker that owns the job will finish it.
+
+**Rule for other phases:** reconciliation (M6) and transaction search (M5.19) only see records whose batch is `COMPLETED` or `COMPLETED_WITH_ERRORS`. Rows from a `PROCESSING` or `FAILED` batch are not yet (or no longer) accepted records.
+
+**Pitfalls.**
+
+- A resumed job finds the batch in `PROCESSING`. That isn't a transition; `begin` just continues. Don't add `PROCESSING → PROCESSING` to the map to make it "work".
+- A repeated job finding a terminal batch must return quietly and mark itself `DONE`. That's at-least-once delivery being harmless.
+
+**Done when.** A parameterized unit test covers every pair of statuses (25 cases): allowed ones succeed, others throw.
+
+---
+
+### M5.16 — Audit events
+
+**What.** Emit `IMPORT_RECEIVED`, `IMPORT_COMPLETED`, `IMPORT_FAILED` and `IMPORT_RETRY_REQUESTED`, each with `entity_type = IMPORT_BATCH`.
+
+**How.** Through `AuditService.record(...)` (M4.3), whose `Propagation.MANDATORY` guarantees it joins the transaction that changes the batch. If the business change rolls back, so does its audit row (M4.4).
+
+| Action | Actor | Payload |
+|---|---|---|
+| `IMPORT_RECEIVED` | The uploader | `fileName`, `sourceType`, `sizeBytes`, `contentHash` |
+| `IMPORT_COMPLETED` | `NULL` (system) | `status`, `totalRows`, `validRows`, `errorRows`, `durationMs` |
+| `IMPORT_FAILED` | `NULL` (system) | `failureReason`, `attempts`, `lastCommittedRow` |
+| `IMPORT_RETRY_REQUESTED` | The user who retried | `previousFailureReason`, `reason` (if given) |
+
+`request_id` is the HTTP request ID for the first and last; for system events, put the job ID in the payload so the timeline links back to the job.
+
+**Pitfalls.** Don't put row contents or references in audit payloads. They're financial data, and audit rows live forever and are never deleted (M10.6).
+
+**Done when.** Each transition test also asserts its audit row, and the rollback test from M4.4 covers an import transition.
+
+---
+
+### M5.17 — `GET /api/v1/imports/{id}`
+
+**What.** Batch status and counts, plus row errors with pagination.
+
+**How.** Two endpoints, so the summary stays cheap to poll and errors page independently:
+
+```
+GET /api/v1/imports/{id}                              IMPORT_READ
+200 {
+  "batchId": "…", "sourceType": "GATEWAY", "status": "COMPLETED_WITH_ERRORS",
+  "fileName": "gateway-2026-10.csv", "sizeBytes": 18234,
+  "totalRows": 1200, "validRows": 1187, "errorRows": 13, "storedErrors": 13,
+  "failureReason": null, "uploadedBy": "…",
+  "createdAt": "…", "startedAt": "…", "completedAt": "…",
+  "_links": { "errors": "/api/v1/imports/…/errors" }
+}
+
+GET /api/v1/imports/{id}/errors?page=0&size=50        IMPORT_READ
+200 { "content": [ { "rowNumber": 17, "column": "amount", "code": "INVALID_AMOUNT",
+                     "message": "Amount '1,000.00' is not a plain decimal", "rawRow": "…" } ],
+      "page": 0, "size": 50, "totalElements": 13 }
+```
+
+Errors are sorted by `row_number, column_name` (served by the unique index, which leads with `batch_id`).
+
+While a batch is processing, clients poll the summary. Return `Retry-After: 2` on non-terminal statuses to tell them how often.
+
+**Pitfalls.** Another tenant's batch ID returns `404`, not `403` (M3.6). The lookup is `findByIdAndOrganizationId`, so this falls out naturally.
+
+**Done when.** Tests cover a completed batch, an in-progress batch (with `Retry-After`), error paging, and the cross-tenant `404` (M3.9).
+
+---
+
+### M5.18 — `GET /api/v1/imports`
+
+**What.** List the org's batches, newest first, paginated.
+
+**How.** `findByOrganizationId(orgId, PageRequest.of(page, size, Sort.by(DESC, "createdAt")))`, served by `import_batch_list_idx (organization_id, created_at DESC)`. Optional filters: `status`, `sourceType`. Set `spring.data.web.pageable.max-page-size: 200` (and `default-page-size: 50`, per phase-M1's api-design §4) globally so no endpoint can be asked for a million rows (M9.8).
+
+**Pitfalls.** Return a DTO, never the entity. Entities leak internal fields (`storageKey`, `contentHash`) and couple the API to the schema.
+
+**Done when.** Paging, sorting, the max page size, and cross-tenant isolation are tested.
+
+---
+
+### M5.19 — `GET /api/v1/transactions`
+
+**What.** Search normalized records by source, date range, reference, currency and batch.
+
+**How.**
+
+```
+GET /api/v1/transactions?dateFrom=2026-10-01&dateTo=2026-10-31&sourceType=GATEWAY
+                        &reference=pay-103&currency=AED&batchId=…&sort=transactionDate,asc&page=0&size=50
+```
+
+- `dateFrom`/`dateTo` are **required**, with a maximum span of 366 days (`400` otherwise). This guarantees partition pruning (§2.7): without a date filter, every query scans every partition.
+- `reference` is normalized with the same `ReferenceNormalizer` before comparing to `normalized_reference`, so searching `pay 103` finds `PAY103`.
+- `sort` is whitelisted (`transactionDate`, `amount`, `createdAt`). Never pass a user-supplied sort field into SQL.
+- Only records from `COMPLETED`/`COMPLETED_WITH_ERRORS` batches (M5.15), via a join to `import_batch`.
+
+Build the query with `JdbcClient` and an explicit `WHERE` builder (or JPA Specifications on the entity). Return a **slice**: fetch `size + 1` rows, return `size`, and set `hasNext` from whether the extra row came back. No `totalElements`.
+
+Why no total count: `count(*)` over a month of a large tenant's records means scanning millions of index entries for a number nobody needs to page through results. A slice costs the same as the page itself. If `api-design.md` (M1.11) defines a common page envelope, use it with `totalElements` omitted for this endpoint and document why.
+
+Check the plan:
+
+```sql
+EXPLAIN SELECT … FROM transaction_record t JOIN import_batch b ON b.id = t.batch_id
+WHERE t.organization_id = :org AND t.transaction_date BETWEEN '2026-10-01' AND '2026-10-31' …
+```
+
+The output should list only `transaction_record_2026_10`. With a JDBC prepared statement, PostgreSQL may use a generic plan after five executions and prune at *execution* time instead ("Subplans Removed: 15" in `EXPLAIN ANALYZE`). Both are fine.
+
+**Pitfalls.**
+
+- Offset pagination gets slower with depth (`OFFSET 100000` still reads 100k rows). That's fine for v1's UI. Keyset pagination (`WHERE (transaction_date, id) > (:lastDate, :lastId)`) is the fix if deep paging matters; know it for interviews.
+- Don't return `raw_values` in the list. It's large. Put it in a detail endpoint if needed.
+
+**Done when.** Each filter is tested, the date-range rule returns `400`, a record from a `FAILED` batch doesn't appear, the `EXPLAIN` output is in the PR, and the cross-tenant test passes.
+
+---
+
+### M5.20 — `POST /api/v1/imports/{id}/retry`
+
+**What.** Explicitly reprocess a `FAILED` batch from scratch, with an audit event.
+
+**Why.** Retries after a transient failure that exhausted its attempts, or after a bug fix. The uploaded file is still in storage and the hash is taken, so re-uploading isn't possible (M5.9).
+
+**How.** `IMPORT_CREATE`, optional body `{ "reason": "…" }`. In **one transaction**:
+
+1. Lock the batch (`lockByIdAndOrganizationId`). Not found → `404`.
+2. Status must be `FAILED`, else `409` with type `import-not-retryable` and the current status.
+3. `writer.deleteBatch(orgId, batchId)` and delete its `import_row_error` rows.
+4. Reset `last_committed_row`, `total_rows`, `valid_rows`, `error_rows`, `failure_reason`, `started_at`, `completed_at`.
+5. `transitionTo(RECEIVED)`.
+6. Enqueue a new `IMPORT` job.
+7. `audit.record(IMPORT_RETRY_REQUESTED, …)`.
+
+Return `202` with the batch, like the upload.
+
+Why delete and start over, rather than resume from the checkpoint: a retry usually follows a code fix, and the fixed code might validate or normalize rows differently. Mixing rows from the old and new code in one batch would be inconsistent, and the row-level unique key can't catch every overlap (M5.5). Deleting is acceptable here because the rows were never part of an accepted batch (M5.15): no reconciliation has used them. The original file and the audit trail are untouched.
+
+**Pitfalls.**
+
+- Two users clicking retry at once: the row lock serializes them, and the second sees `RECEIVED` and gets `409`. Test it.
+- If, against the M5.15 rule, a match ever referenced these rows, the delete would fail on the foreign key. That error is the correct outcome (`409`), not something to work around.
+- The old job stays `FAILED` for history. The new job is a new row.
+
+**Done when.** A batch that failed after two chunks can be retried and ends with the same counts and rows as a clean import; retrying a `COMPLETED` batch returns `409`; the concurrent-retry test passes.
+
+---
+
+## 5. Testing strategy
+
+### 5.1 Layers
+
+| Layer | What | Tools | Speed |
+|---|---|---|---|
+| Unit | Validator rules, normalizer rules, status transitions, amount parsing, column mapping, backoff calculation | JUnit 5, AssertJ, no Spring | ms |
+| Slice | Controller request/response mapping and ProblemDetail shapes | `@WebMvcTest` with mocked services | ~1 s |
+| Integration | Upload → worker → DB end to end; constraints; partitions; queue semantics | `@SpringBootTest` with the M2.16 base class, PostgreSQL and MinIO Testcontainers | seconds |
+
+### 5.2 Making the worker testable
+
+- **No scheduler in tests.** Disable `@Scheduled` in the `test` profile and expose `JobRunner.runAllQueued()`, which claims and runs jobs synchronously on the test thread until the queue is empty. Tests then read: upload, `runAllQueued()`, assert.
+- **Small chunks.** Set `reconflow.import.chunk-size: 100` in tests so a 1,000-row fixture spans 10 chunks.
+- **Crash injection.** An `ImportTestHook` interface with a no-op production bean. A test configuration replaces it with one that throws after row N. The processor calls `afterRow(n)` (M5.14).
+- **Controllable clock.** Inject `Clock` everywhere time matters (date window, lease expiry, backoff), and use a mutable test clock to expire leases without sleeping.
+- **Data isolation.** Each test creates its own organization (random UUID) instead of truncating tables. `audit_event` can't be truncated (its trigger blocks it), and per-test orgs also exercise tenant scoping for free.
+
+### 5.3 The tasks' tests
+
+**M5.21 — validator and normalizer unit tests.** One test per row in the M5.11 and M5.12 tables, named after the rule (`rejects_amount_with_thousands_separator`, `uppercases_reference_with_root_locale`). Use `@ParameterizedTest` with `@CsvSource` for the lists of good and bad inputs. Include: `1000`, `1000.5`, `1000.1234` valid; `1000.12345`, `1,000.00`, `1e3`, `-5`, `0`, `""`, a 16-digit integer invalid; `aed` → `AED`; `XYZ` invalid; full-width reference; Turkish locale; NBSP inside a reference; each status and type mapping; `transaction_at` with `+04:00` converted to UTC.
+
+**M5.22 — sample CSVs produce expected counts.** For each file in `docs/samples/` (M1.4), a table of expected outcomes kept next to it (e.g. `docs/samples/expected.yaml`: file → status, total, valid, error rows, error codes by row, flagged duplicates). One parameterized integration test uploads each file, runs the queue, and compares. When someone adds a sample, they add its expectations, and the test covers it.
+
+**M5.23 — uploading the same file twice.**
+
+- Sequential: second upload → `409`, `existingBatchId` equals the first; still one batch, one job, and no new object in MinIO.
+- Concurrent: two threads upload the same bytes behind a `CountDownLatch` → exactly one `202` and one `409`; one batch; the loser's uploaded object is deleted.
+- Same bytes as the other source type → `202` (different key).
+- Same bytes in another organization → `202`.
+
+**M5.24 — malformed rows.** A 10-row file with rows 3 and 7 bad (one bad amount, one missing currency and bad date) → `COMPLETED_WITH_ERRORS`, `total 10 / valid 8 / error 2`, 8 records with the right `source_row_number`s, 3 error rows (row 7 has two), `GET /imports/{id}/errors` returns them in row order. Also: every row bad → `COMPLETED_WITH_ERRORS` with `valid 0`.
+
+**M5.25 — crash and resume, no duplicates.** With chunk size 100 and a 1,000-row file:
+
+1. Hook throws a `RuntimeException` after row 350 → the chunk being built (301–350) is never committed. Assert `last_committed_row = 300` and 300 rows (minus errors) in the DB.
+2. Remove the hook; let the job be retried (or expire its lease and run the sweeper).
+3. Assert: final counts equal a clean import of the same file into another org; `SELECT source_row_number, count(*) … GROUP BY 1 HAVING count(*) > 1` returns nothing; exactly one `IMPORT_COMPLETED` audit event.
+
+Variants: crash right after a commit (row 300 exactly); crash in `finish` after the duplicate update (the transaction rolls back and is redone); zombie worker (expire the lease, let a second runner claim and finish, then let the first commit a chunk → `LeaseLostException`, no extra rows). Then the explicit retry path: force a permanent failure after 2 chunks → `FAILED` with 200 rows present → `POST /retry` → same final state as clean.
+
+**M5.26 — rejected uploads.** Wrong headers → `400 missing-columns` with the list; zero-byte file → `400 empty-file`; header only → `400 no-data-rows`; 51 MB file → `413 file-too-large`; `.xlsx` → `400 unsupported-file-type`; Latin-1 header bytes → `400 invalid-encoding`. Each asserts the full ProblemDetail (`type`, `status`, `code`, `requestId`) and that **no** batch, job or object was created.
+
+### 5.4 Also test
+
+- Queue semantics (see the job queue's **Done when**).
+- Authorization: `VIEWER` and `INVESTIGATOR` get `403` on upload and retry; all roles can read (permission matrix in plans/authentication.plan §5).
+- Cross-tenant (M3.9): org B can't read, list, retry or search org A's batches and transactions; each returns `404` or an empty list.
+- Partitions: a row dated in a month with no partition creates it; the default partition stays empty.
+
+---
+
+## 6. Exit criteria checklist
+
+From TASKS.md: *both sample files can be uploaded and the normalized transactions inspected through the API, and every failure case in projectoverview.md §6 that relates to imports has a passing test.*
+
+- [ ] Entities for `import_batch`, `import_row_error`, `transaction_record` validate against the schema (`ddl-auto: validate`)
+- [ ] `FileStorage` on MinIO works locally (`docker compose up`) and in tests
+- [ ] Job queue: claim with `SKIP LOCKED`, per-org cap, lease, heartbeat, fencing, sweeper, backoff, graceful shutdown
+- [ ] `POST /imports` returns `202` + `Location`; batch, job and audit event created in one transaction
+- [ ] Duplicate file → `409` with `existingBatchId`, including under concurrency (§6 "same file uploaded twice")
+- [ ] Streaming parser, validator, normalizer, duplicate flagging, each with unit tests per rule
+- [ ] Chunked commits with checkpoint; crash and resume produce no duplicates (§6 "crashes halfway through an import")
+- [ ] Malformed rows → `COMPLETED_WITH_ERRORS`, valid rows persisted, every bad row reported (§6 "invalid rows")
+- [ ] Status transitions only through `ImportBatchStatus`/`transitionTo`; every transition audited
+- [ ] `GET /imports/{id}`, `/errors`, `GET /imports`, `GET /transactions`, `POST /imports/{id}/retry` implemented, paginated, authorized, cross-tenant tested
+- [ ] Partition maintenance job running; default partition empty
+- [ ] Demo: upload `docs/samples/ledger.csv` and `docs/samples/gateway.csv`, see both batches complete, search the records via `GET /transactions`
+- [ ] `api-design.md` and `reconciliation-rules.md` updated for anything this phase decided (CSV columns, error codes, slice pagination on `/transactions`)
+
+---
+
+## 7. Interview questions this phase prepares you for
+
+**How do you stop the same file being imported twice?**
+Hash the file content (SHA-256) and put a unique constraint on `(organization_id, source_type, content_hash)`. A pre-check gives a fast, friendly `409`, but the constraint is the real guarantee, because two concurrent uploads can both pass a pre-check. The violation is caught and mapped to the same `409` with the existing batch's ID.
+
+**Your import crashes at row 300,000 of 500,000. What happens?**
+Rows are committed in chunks of 5,000 together with a checkpoint (`last_committed_row`) in the same transaction, so the database holds exactly rows 1–300,000 and knows it. The job's lease expires, the sweeper re-queues it, and the next worker skips to row 300,001. A unique key on `(batch_id, source_row_number, transaction_date)` with `ON CONFLICT DO NOTHING` guards against any overlap. The result is identical to a run that never crashed: at-least-once execution, exactly-once effects.
+
+**Why not just use Kafka for the job queue?**
+At our volume (hundreds of jobs an hour) PostgreSQL handles it trivially, and a DB queue lets the job be inserted in the same transaction as the batch, so a job can't exist without its batch or vice versa. With Kafka, you'd publish after commit and could lose the message on a crash, which needs the outbox pattern to fix. I'd switch when measurements show the claim query becoming a hot spot (docs/scalability.md §8).
+
+**How does `SKIP LOCKED` work, and what doesn't it give you?**
+`FOR UPDATE` locks the selected row; `SKIP LOCKED` makes other transactions skip locked rows instead of waiting, so concurrent workers each claim a different job without contention. It locks rows, not conditions, so a "max 2 running per tenant" check can be exceeded when two workers claim simultaneously. That's fine for fairness; a hard limit would need an advisory lock per tenant.
+
+**What's a lease, and what's fencing?**
+A lease is time-limited ownership a worker must keep renewing; if the worker dies, the lease expires and someone else takes over. Fencing handles the worker that *didn't* die but paused past its lease: every write includes a check that it still owns the job, in the same transaction, so a stale worker's writes fail and roll back instead of corrupting data.
+
+**Why stream the file instead of reading it into memory?**
+Memory has to be bounded by the chunk size, not the file size, or a few concurrent large uploads exhaust the heap. That's also why the within-file duplicate check is a SQL `GROUP BY … HAVING count(*) > 1` after insertion: the database spills to disk if needed, while a Java `HashMap` of every row's key would grow with the file.
+
+**Why JDBC batch inserts instead of `saveAll`?**
+`saveAll` creates an entity and a persistence-context snapshot per row, so memory grows until you flush and clear, and it can't express `ON CONFLICT DO NOTHING`. `JdbcTemplate.batchUpdate` with `reWriteBatchedInserts` sends multi-row inserts with constant memory. Application-generated UUIDv7 IDs mean no sequence round-trips, and their time-ordering keeps the B-tree append-mostly.
+
+**Why `202 Accepted` instead of `201 Created` for an upload?**
+`201` means the resource is created and complete. The batch row exists, but the import (the thing the client cares about) hasn't happened yet, and may take 30 seconds. `202` with a `Location` header says "accepted for processing; poll here", which matches reality and doesn't hold an HTTP connection open for the whole import.
+
+**What does partitioning buy you, and what does it cost?**
+Smaller per-partition indexes, cheap retention (`DETACH PARTITION` instead of a huge `DELETE`), and partition pruning for date-filtered queries. The costs: every unique constraint must include the partition key (so uniqueness on `(batch_id, source_row_number)` alone isn't enforceable), foreign keys into the table must carry the date, partitions must be created ahead of the data, and queries without the partition key scan everything.
+
+**How do you handle money in the import?**
+Parse with `new BigDecimal(String)` after a strict regex (no exponents, separators or symbols), set scale 4 with `RoundingMode.UNNECESSARY` so anything that would round is rejected rather than silently changed, and store it as `NUMERIC(19,4)`. Compare with `compareTo`, never `equals`, because `1000.0` and `1000.00` are `equals`-different.
+
+**Why record row errors instead of failing the file?**
+A bad row is expected input, not a system failure. Failing the whole file on row 17 tells the user about one problem; collecting every error tells them about all of them in one pass. The batch ends in `COMPLETED_WITH_ERRORS` with the valid rows stored and every bad row listed with its column and reason. `FAILED` is reserved for "couldn't read the file at all".
+
+**Offset or keyset pagination?**
+Offset is simple and supports "jump to page N", but `OFFSET 100000` still reads and discards 100,000 rows, so deep pages get slow. Keyset (`WHERE (date, id) > (:lastDate, :lastId) ORDER BY date, id LIMIT n`) stays fast at any depth but only supports next/previous. I use offset with a capped page size for v1 and would move the transactions search to keyset if deep paging became a real use case.
+
+---
+
+## 8. Common mistakes
+
+1. **`@Transactional` on the whole import.** One giant transaction: no checkpoint, a crash loses everything, and long-held locks. Use one transaction per chunk.
+2. **Check-then-insert for duplicates without a constraint.** Works in every test, fails under concurrency.
+3. **Writing to the DB before the file is stored.** Leaves batches that point at nothing. Store first; sweep orphans.
+4. **Publishing the job after the commit, outside the transaction.** A crash in between loses the job. Insert the job in the same transaction.
+5. **`file.getBytes()` or collecting rows into a `List`.** Heap grows with file size.
+6. **Splitting lines on commas.** Breaks on quoted commas and newlines. Use a real CSV parser.
+7. **Default charset decoding.** Silently turns bad bytes into `�`. Use a strict decoder.
+8. **`toUpperCase()` without `Locale.ROOT`.** Breaks on Turkish-locale machines.
+9. **`double` for amounts, or `BigDecimal.equals` for comparison.** Use `BigDecimal` from a `String` and `compareTo`.
+10. **Rounding input amounts.** Reject them instead; you don't get to change a financial value.
+11. **Dropping one of two duplicate rows.** Flag both and let a human decide.
+12. **Retrying everything.** Validation failures and bugs fail the same way every time. Retry only transient errors, with backoff and jitter.
+13. **Claiming and processing in the same transaction.** The row lock is held for minutes and a dead worker's job can never be recovered.
+14. **Forgetting `app.org_id` in the worker.** With RLS on, every query silently returns nothing.
+15. **Creating partitions inside the insert transaction.** The parent-table lock blocks every reader for the length of the chunk.
+16. **Queries on `transaction_record` without a date range.** No partition pruning; every partition is scanned.
+17. **Trusting `Content-Type` or the original file name.** Both are client-controlled. Check content; never use the name in a path.
+18. **Returning entities from controllers.** Leaks internal fields and couples the API to the schema.

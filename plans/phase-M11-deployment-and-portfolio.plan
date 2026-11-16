@@ -1,0 +1,946 @@
+# Phase M11 — Deployment and portfolio
+
+**Status:** Not started · **Tasks:** TASKS.md M11.1–M11.12 · **Depends on:** M0–M10 (everything; M11 packages what exists) · **Date:** 2026-11-01
+
+M11 turns a working codebase into something a stranger can run, a host can deploy, and an interviewer can understand in five minutes. It has two halves: **packaging and deployment** (M11.1–M11.5), and **documentation and demo** (M11.6–M11.12). The second half is not decoration. For a portfolio project it's how most people will ever experience the work.
+
+---
+
+## 1. Goal
+
+When M11 is finished:
+
+- `git clone` → `./scripts/demo.sh` starts the whole stack and walks through upload → run → exceptions → resolve → report, printing each step and asserting the expected numbers.
+- Every merge to `main` builds an image, tags it with the commit SHA and pushes it to GitHub Container Registry.
+- The app runs on a public host against a managed PostgreSQL 16, with migrations applied by a separate, auditable step.
+- The README, OpenAPI spec, Bruno collection, architecture doc and trade-offs write-up all describe the code as built.
+- A short GIF or video in the README shows the flow.
+
+---
+
+## 2. Concepts to understand first
+
+### 2.1 Images, layers and why build order matters
+
+A Docker image is a stack of read-only layers; each instruction in a Dockerfile creates one. When you rebuild, Docker reuses every layer up to the first one whose inputs changed. So you order instructions from *least* to *most* frequently changing: OS → JDK → Maven dependencies → your code. A Spring Boot fat jar is one 80 MB file that changes every build; extracting it into layers (dependencies, loader, snapshot dependencies, application) means a code change only re-uploads the few-hundred-KB application layer.
+
+### 2.2 Multi-stage builds
+
+The build needs a JDK, Maven and the source; the runtime needs a JRE and the compiled app. A multi-stage Dockerfile builds in one stage and copies only the output into a small runtime stage. The final image doesn't contain the compiler, the source or the Maven cache, which makes it smaller and gives an attacker fewer tools.
+
+### 2.3 JVM in containers
+
+The JVM sizes its heap from the memory it can see. Modern JVMs read the container's cgroup limit, but the default maximum heap is only 25% of it. `-XX:MaxRAMPercentage=75` uses most of the container's memory while leaving room for metaspace, thread stacks, direct buffers and the code cache. Never hard-code `-Xmx` in the image: the right value depends on where it runs.
+
+### 2.4 Twelve-factor configuration
+
+The same image runs everywhere; only the environment differs. Config and secrets come from environment variables or mounted files, never from the image. The image is identified by an immutable tag (the git SHA), so you always know exactly what's running and can roll back to the previous SHA.
+
+### 2.5 Schema migrations and deploys
+
+The dangerous moment in a deploy is when the database schema and the running code disagree. During a rolling deploy, **old and new code run at the same time against the same schema**, so each migration must work with both versions. The technique is **expand/contract**: first add (expand) in a way old code tolerates, deploy the new code, then remove (contract) the old structure in a later release. Flyway Community has no "undo"; rollback means deploying the previous image, which works only if the schema change was backwards-compatible.
+
+### 2.6 Liveness vs readiness
+
+- **Liveness:** "is the process stuck?" If it fails, the platform restarts the container. It must not depend on the database, or a DB outage restarts every instance in a loop.
+- **Readiness:** "can I take traffic right now?" If it fails, the platform stops routing requests to the instance but leaves it running. It *should* include the database.
+
+M9.11 set up these groups. M11 wires them to the platform.
+
+---
+
+## 3. Starting point
+
+Assumed from earlier phases:
+
+- One jar, profiles `api` / `worker` (bean selection) and `local` / `test` / `prod` (config). A `demo` seeding profile exists or is added here (see M11.2).
+- `compose.yaml` with PostgreSQL 16, MinIO, Keycloak (M2.4, M10.1).
+- Flyway migrations, the two DB roles and `infra/db/bootstrap-roles.sql` (M10.7).
+- CI workflow running build, tests and format checks (M2.15); dependency scanning (M10.5).
+- Liveness/readiness groups and Prometheus endpoint (M9.10–M9.11).
+- Sample CSVs (M1.4), the dataset generator (M9.5), benchmarks (M9.6).
+
+**Order:** M11.1 → M11.2 → M11.5 (decide how migrations run before deploying anything) → M11.3 → M11.4 → M11.7 → M11.9 → M11.8 → M11.6 → M11.10 → M11.11 → M11.12. The README is near the end because it describes everything else.
+
+---
+
+## 4. Step by step
+
+### M11.1 — Multi-stage Dockerfile, non-root
+
+**What.** A `Dockerfile` that builds the jar, extracts it into layers and runs it as a non-root user on a JRE-only image, plus a `.dockerignore`.
+
+**Why.** Reproducible builds (anyone can build the image without Java installed), fast rebuilds (layers), a small attack surface (no JDK, no shell tools beyond the base image), and no root (a container escape starts with fewer privileges).
+
+**How.**
+
+```dockerfile
+# Dockerfile
+# syntax=docker/dockerfile:1.7
+
+# ---- build stage --------------------------------------------------------
+FROM eclipse-temurin:25-jdk AS build
+WORKDIR /workspace
+
+# Dependencies first: this layer is reused until pom.xml changes.
+COPY .mvn/ .mvn/
+COPY mvnw pom.xml ./
+RUN --mount=type=cache,target=/root/.m2 ./mvnw -B -q dependency:go-offline
+
+COPY src/ src/
+# Tests ran in CI against Testcontainers; Docker-in-Docker here would be slow and fragile.
+RUN --mount=type=cache,target=/root/.m2 ./mvnw -B -q package -DskipTests \
+ && cp target/*.jar app.jar
+
+# Split the fat jar into layers that change at different rates.
+RUN java -Djarmode=tools -jar app.jar extract --layers --launcher --destination extracted
+
+# ---- runtime stage ------------------------------------------------------
+FROM eclipse-temurin:25-jre AS runtime
+
+# curl is only for the HEALTHCHECK below; platforms with their own HTTP checks don't need it.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --system --gid 10001 reconflow \
+ && useradd  --system --uid 10001 --gid reconflow --no-create-home --shell /usr/sbin/nologin reconflow
+
+WORKDIR /app
+# Least to most frequently changing, so a code-only change re-ships only the last layer.
+COPY --from=build /workspace/extracted/dependencies/          ./
+COPY --from=build /workspace/extracted/spring-boot-loader/    ./
+COPY --from=build /workspace/extracted/snapshot-dependencies/ ./
+COPY --from=build /workspace/extracted/application/           ./
+
+USER 10001:10001
+
+ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError -Djava.security.egd=file:/dev/urandom"
+EXPOSE 8080 8081
+
+HEALTHCHECK --interval=15s --timeout=3s --start-period=60s --retries=4 \
+  CMD curl -fsS http://localhost:8081/actuator/health/liveness || exit 1
+
+ENTRYPOINT ["java", "org.springframework.boot.loader.launch.JarLauncher"]
+```
+
+Notes, each worth being able to explain:
+
+- `extract --layers --launcher` is the Boot 3.3+ replacement for the older `-Djarmode=layertools`. With `--launcher`, the extracted tree keeps the loader so you start it with `JarLauncher`. Verify the command and the directory names against the Boot 4 "Container Images" docs, and run `ls extracted` once to check.
+- `USER 10001` with a numeric UID lets platforms that enforce "non-root" (Kubernetes `runAsNonRoot`) check it without reading `/etc/passwd`.
+- `-XX:+ExitOnOutOfMemoryError`: a JVM that has hit OOM is in an unknown state. Exiting lets the platform restart it cleanly, instead of limping on.
+- The health check hits the management port (8081, M10). It checks *liveness*, not readiness, for the reason in §2.6.
+- **Startup time** (optional): Java 25 supports an ahead-of-time class-loading cache built from a training run, and Boot supports CDS archives. Both cut startup noticeably. Add them only after measuring, and record the before/after in `docs/benchmarks.md`.
+
+```gitignore
+# .dockerignore
+target/
+.git/
+.idea/
+.vscode/
+*.iml
+.env
+.env.*
+!.env.example
+docs/
+plans/
+scripts/
+```
+
+`.env` must be in `.dockerignore`: otherwise `COPY . .` (if anyone ever writes it) bakes your local secrets into an image layer, and deleting the file in a later layer doesn't remove it from the earlier one.
+
+**The alternative: `./mvnw spring-boot:build-image`** (Cloud Native Buildpacks, Paketo).
+
+| | Dockerfile (chosen) | Buildpacks |
+|---|---|---|
+| Write a Dockerfile | Yes | No |
+| Layering, non-root, JVM memory tuning | You write them | Built in (the memory calculator sizes the heap for you) |
+| SBOM | Add a tool | Built in |
+| Control (extra packages, health check) | Full | Through buildpack config |
+| Base-image patching | Rebuild | `pack rebase` swaps the OS layer without rebuilding |
+| Learning value for interviews | High: you can explain every line | Lower |
+
+Choose the Dockerfile for this project because explaining it is part of the point; mention buildpacks as what you'd consider for a fleet of services.
+
+**Pitfalls.** Copying `src/` before the dependency step (every code change re-downloads Maven Central). Running as root because "it works". `-Xmx` baked into the image. `latest` as the only tag. Forgetting `.dockerignore`, so the build context includes `target/` and `.git/` and is slow.
+
+**Done when.** `docker build -t reconflow:local .` succeeds; `docker run --rm reconflow:local id` prints uid 10001; changing one Java file and rebuilding re-runs only the build steps and the last `COPY`; the image is under ~350 MB (record the actual size).
+
+---
+
+### M11.2 — Full-stack Compose profile
+
+**What.** `docker compose --profile full up` runs PostgreSQL, MinIO, Keycloak, a one-off migration container, the API and the worker. `--profile observability` adds Prometheus and Grafana.
+
+**Why.** The single-command demo in M11.9 depends on it, and running api and worker as separate containers proves the split from docs/scalability.md D1 actually works.
+
+**How.** Extend the existing `compose.yaml`. Services without a `profiles:` key always start (the dev setup from M2.4); profiled ones start only when asked.
+
+```yaml
+# compose.yaml (additions)
+x-app: &app
+  image: reconflow:local
+  build: .
+  env_file: .env
+  environment: &app-env
+    DB_URL: jdbc:postgresql://postgres:5432/paymentreconflow
+    S3_ENDPOINT: http://minio:9000
+    OIDC_ISSUER_URI: http://localhost:8180/realms/reconflow   # must equal the token's iss (see M10.1)
+  extra_hosts: ["localhost:host-gateway"]                    # so "localhost:8180" reaches Keycloak from inside
+
+services:
+  # ... postgres, minio, keycloak from earlier phases ...
+
+  minio-init:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z   # pin a real tag
+    profiles: [full]
+    depends_on: { minio: { condition: service_healthy } }
+    entrypoint: >
+      sh -c "mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD}
+             && mc mb --ignore-existing local/reconflow-imports"
+    env_file: .env
+
+  migrate:
+    <<: *app
+    profiles: [full]
+    environment:
+      <<: *app-env
+      SPRING_PROFILES_ACTIVE: prod,migrate
+    depends_on: { postgres: { condition: service_healthy } }
+    restart: "no"
+
+  api:
+    <<: *app
+    profiles: [full]
+    environment:
+      <<: *app-env
+      SPRING_PROFILES_ACTIVE: prod,api,demo
+    ports: ["8080:8080"]
+    depends_on:
+      migrate:    { condition: service_completed_successfully }
+      minio-init: { condition: service_completed_successfully }
+      keycloak:   { condition: service_healthy }
+
+  worker:
+    <<: *app
+    profiles: [full]
+    environment:
+      <<: *app-env
+      SPRING_PROFILES_ACTIVE: prod,worker
+    depends_on:
+      migrate:    { condition: service_completed_successfully }
+      minio-init: { condition: service_completed_successfully }
+
+  prometheus:
+    image: prom/prometheus:v3.5.0       # pin
+    profiles: [observability]
+    volumes: ["./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:12.1.0       # pin
+    profiles: [observability]
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro   # datasource + the M9.10 dashboard
+    ports: ["3000:3000"]
+```
+
+`infra/prometheus/prometheus.yml` scrapes `api:8081` and `worker:8081` at `/actuator/prometheus`.
+
+The image tags above are examples; look up the current ones and pin them. Dependabot's `docker` ecosystem (M10.5) only updates the Dockerfile, so review Compose tags by hand when you upgrade.
+
+**The `demo` profile.** The M3.8 seeder only runs under `local`. The full stack runs with `prod` config, so add a `demo` profile that enables the same seeder: two organizations, one user per role, with `app_user.external_subject` set to the fixed Keycloak user ids from the realm file (M10.1 Step 2). Guard it: the seeder refuses to run if any organization exists that isn't one of the demo organizations, so enabling `demo` by mistake against a real database does nothing.
+
+**Pitfalls.** Port clashes (Keycloak on 8080 by default; it's on 8180 here). `depends_on` without `condition` only waits for the container to *start*, not to be ready. Building the image three times (compose builds once per distinct `build`; the shared `image:` name means one build reused by all three services — check with `docker compose build`). Forgetting `migrate` must exit 0 for api/worker to start.
+
+**Done when.** On a machine with only Docker, `cp .env.example .env && docker compose --profile full up -d` brings everything up; `curl localhost:8080/actuator/health` is not exposed (8081 isn't published) but `docker compose ps` shows api and worker healthy; stopping the worker leaves uploads queued and restarting it processes them.
+
+---
+
+### M11.3 — Build and push the image on merge to `main`
+
+**What.** A CI job that, after tests pass on a push to `main`, builds the image and pushes it to `ghcr.io` tagged with the full commit SHA and `main`.
+
+**Why.** Deploys should ship exactly what CI tested, identified by an immutable tag. If something breaks, you roll back to the previous SHA.
+
+**How.** Add a job to the existing CI workflow (M2.15) so it only runs after the test job succeeds:
+
+```yaml
+# .github/workflows/ci.yml (add)
+  publish-image:
+    needs: [build]                      # the existing build-and-test job
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/kasalmanfarcy/reconflow   # lowercase; see Pitfalls
+          tags: |
+            type=sha,format=long
+            type=raw,value=main
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+      - uses: aquasecurity/trivy-action@0.33.1   # pin; image scan (M10.5 follow-up)
+        with:
+          image-ref: ghcr.io/kasalmanfarcy/reconflow:sha-${{ github.sha }}
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+```
+
+`GITHUB_TOKEN` with `packages: write` is enough for GHCR; no personal token needed. After the first push, make the package public in its GitHub settings if you want people to pull it without logging in, and link it to the repository.
+
+**Pitfalls.**
+
+- **Uppercase in the image name.** The repository is `PaymentReconciliation`; `ghcr.io/${{ github.repository }}` contains capitals and the push fails. Write the lowercase name explicitly.
+- Tagging only `latest`/`main`: you can't tell what's deployed or roll back precisely. The SHA tag is the one deploys use.
+- Building on PRs from forks with `packages: write`: the `if:` restricts publishing to pushes to `main`.
+
+**Done when.** A merge to `main` produces `ghcr.io/kasalmanfarcy/reconflow:sha-<40 chars>`; `docker pull` of it works; a red test run publishes nothing.
+
+---
+
+### M11.4 — Deploy to a host with managed PostgreSQL
+
+**What.** The api and worker running on a public host, with a managed PostgreSQL 16, S3-compatible object storage, Keycloak and HTTPS.
+
+**Why.** A live URL is far more convincing than "it runs on my laptop", and deploying surfaces problems local runs hide: TLS, proxies, secrets, cold starts, migrations against a database you can't just recreate.
+
+**How.**
+
+**Choose a host.** Compare on what this app needs: two process types (api + worker), a managed Postgres, a pre-deploy step for migrations, secrets, and low cost.
+
+| Host | Fits api + worker? | Managed Postgres | Pre-deploy migration step | Notes |
+|---|---|---|---|---|
+| **Render** | Yes: "web service" + "background worker" | Yes, with backups (tiers vary) | Yes (`preDeployCommand`) | Maps one-to-one onto the design. Free Postgres expires; budget for the smallest paid tier while the demo is live |
+| Fly.io | Yes: process groups in one app | Yes (Managed Postgres) | Yes (`release_command`) | More control (regions, machines), more to learn |
+| Railway | Yes: two services from one image | Yes (template) | Via a start command or separate service | Fastest to click together; usage-based pricing |
+| Small VM (e.g. Hetzner) + Compose | Yes | **No**: you run Postgres, backups and upgrades yourself | You script it | Cheapest and most educational, but you own PITR, TLS (Caddy) and patching |
+
+**Recommendation: Render**, because its service types match api/worker/migrate exactly and the managed database removes the backup question. Check current pricing and limits before committing; they change.
+
+**Postgres requirements.** V1 uses PL/pgSQL functions, triggers, declarative partitioning and `UNIQUE NULLS NOT DISTINCT` (PostgreSQL 15+). All are core PostgreSQL, so any managed PostgreSQL **16** works; pin the major version so the host doesn't silently give you 17 with a different planner. After creating the database, connect once as its admin user and run `infra/db/bootstrap-roles.sql` (M10.7).
+
+**Object storage.** MinIO is for local only. Use an S3-compatible bucket (Cloudflare R2, Backblaze B2 or AWS S3). Create one bucket, one access key scoped to it, block public access.
+
+**Keycloak in production.** This is the cost of M10.1. Options:
+
+1. Run Keycloak as another Render web service with `start` (not `start-dev`), pointed at a **separate database** on the same Postgres instance (`keycloak` database, its own role), behind HTTPS with `KC_HOSTNAME` set to its public URL. Expect it to need ~1 GB RAM.
+2. Use a managed IdP's free tier instead. Thanks to the issuer-based design, the app only needs a new `OIDC_ISSUER_URI` and audience: no code change. Saying this in an interview is a good demonstration of why the abstraction mattered.
+
+Pick option 1 if you want the demo to match the repo exactly; option 2 if cost or memory is the constraint. Record the choice in the deployment section of the README.
+
+**Render setup, as code** (`render.yaml`, a Render Blueprint; verify field names against Render's current Blueprint spec):
+
+```yaml
+services:
+  - type: web
+    name: reconflow-api
+    runtime: image
+    image: { url: ghcr.io/kasalmanfarcy/reconflow:main }   # deploy hook switches to the SHA tag
+    healthCheckPath: /actuator/health/readiness
+    preDeployCommand: java -Dspring.profiles.active=prod,migrate org.springframework.boot.loader.launch.JarLauncher
+    envVars:
+      - { key: SPRING_PROFILES_ACTIVE, value: prod,api }
+      - { key: MANAGEMENT_SERVER_PORT, value: "8080" }      # PaaS health checks hit the public port
+      - { key: DB_URL, sync: false }
+      - { key: DB_APP_PASSWORD, sync: false }
+      - { key: DB_MIGRATOR_PASSWORD, sync: false }         # only used by preDeployCommand
+      - { key: S3_ENDPOINT, sync: false }
+      - { key: S3_ACCESS_KEY, sync: false }
+      - { key: S3_SECRET_KEY, sync: false }
+      - { key: OIDC_ISSUER_URI, sync: false }
+  - type: worker
+    name: reconflow-worker
+    runtime: image
+    image: { url: ghcr.io/kasalmanfarcy/reconflow:main }
+    envVars:
+      - { key: SPRING_PROFILES_ACTIVE, value: prod,worker }
+      # ... same DB/S3 vars, NO migrator password
+```
+
+`sync: false` means "set the value in the dashboard; don't commit it". On a PaaS that only routes one port, the management port is merged with the main one, so expose only `health` publicly and either protect `/actuator/prometheus` or leave it unexposed there (M10 actuator section).
+
+**Deploy flow.** CI pushes `sha-<commit>` → a deploy step (Render deploy hook URL stored as a GitHub secret, called with the SHA tag) → Render runs `preDeployCommand` (migrations as the migrator) → if it succeeds, starts new instances → waits for readiness → shifts traffic → stops old instances. If migration fails, the deploy stops and the old version keeps running.
+
+**Pitfalls.** The `prod` profile requiring a value the host doesn't set (good: it fails fast; read the deploy log). Free-tier services that sleep, so the first demo request takes 30 s (note it in the README, or use a paid tier while job hunting). Forgetting `server.forward-headers-strategy=native` behind the platform's TLS proxy (wrong redirect URLs, no HSTS). The worker deployed without the api's health check, so a crash-looping worker goes unnoticed: alert on restarts.
+
+**Done when.** The public URL serves the API over HTTPS; the demo script (M11.9) passes against it with `BASE_URL` pointing at it; a deploy of a new SHA happens without downtime (run a `curl` loop during the deploy and see no errors).
+
+---
+
+### M11.5 — Flyway migrations as part of the deploy, with rollback notes
+
+**What.** Migrations run once per deploy, as a separate step, with the migrator credentials, before any new instance starts. The app itself only *validates* that the schema is current. Every migration carries a rollback note.
+
+**Why.** Two options, and why the second wins:
+
+| | Flyway on app startup | Separate migrate step (chosen) |
+|---|---|---|
+| Simplicity | Nothing extra to run | One more command |
+| Concurrency | Every instance races to migrate; Flyway's lock table serialises them, but a long migration blocks all of them from starting | Runs exactly once |
+| Privileges | Every app instance holds DDL rights | Only the migrate step has the migrator password; the running app is DML-only (M10.7) |
+| Failure | A bad migration crash-loops every instance | The deploy stops; the old version keeps serving |
+| Visibility | Buried in app logs | Its own step with its own log and exit code |
+
+**How.**
+
+**1. A `migrate` profile** that starts the context without a web server and without api/worker beans, runs Flyway, and exits:
+
+```yaml
+# application.yml
+---
+spring:
+  config:
+    activate:
+      on-profile: migrate
+  main:
+    web-application-type: none
+  flyway:
+    enabled: true
+    user: ${DB_MIGRATOR_USER:reconflow_migrator}
+    password: ${DB_MIGRATOR_PASSWORD}
+```
+
+Because the job workers, schedulers and controllers are only created under `api` or `worker`, a `migrate`-only context has no non-daemon threads after startup, and the JVM exits with 0. If Flyway fails, startup fails and the exit code is non-zero, which stops the deploy. Test both outcomes locally with the `migrate` Compose service.
+
+**2. In `api` and `worker`, validate instead of migrate**, so an instance refuses to start against a database whose migrations weren't applied:
+
+```java
+// shared/db/FlywayValidateOnlyConfig.java
+@Configuration
+@Profile("!migrate & !local & !test")
+class FlywayValidateOnlyConfig {
+    @Bean
+    FlywayMigrationStrategy validateOnly() {
+        return Flyway::validate;   // fails if applied checksums differ or migrations are pending
+    }
+}
+```
+
+The app role needs `SELECT` on `flyway_schema_history` for this, which M10.7 left in place. `local` and `test` keep migrate-on-startup, because convenience matters there.
+
+**3. Expand/contract for every change that isn't purely additive.** Example, renaming `exception_case.reason_code` to `reason`:
+
+| Release | Migration | Code |
+|---|---|---|
+| N | `ADD COLUMN reason TEXT`; backfill `UPDATE ... SET reason = reason_code` (in batches if large) | Writes both columns, reads `reason_code` |
+| N+1 | — | Reads and writes `reason` only |
+| N+2 | `DROP COLUMN reason_code` | — |
+
+At every step, the previous release still works against the current schema, so rolling back one release is always safe. M10.1's drop of `password_hash`/`refresh_token` follows the same pattern.
+
+Rules of thumb for PostgreSQL 16: `ADD COLUMN` with a constant default is instant; adding `NOT NULL` to a big table scans it (add a `CHECK (...) NOT VALID` then `VALIDATE CONSTRAINT`); `CREATE INDEX CONCURRENTLY` avoids blocking writes but can't run inside a transaction, so that migration needs `-- flyway:executeInTransaction=false` (verify the script-config syntax for your Flyway version); set a `lock_timeout` in migrations so a blocked `ALTER` fails fast instead of queueing every query behind it.
+
+**4. A rollback note in every migration header.** Flyway Community has no undo (undo migrations are a paid Redgate feature), and a down-script written in advance is rarely tested anyway. So the note describes what to do if this migration's release is rolled back:
+
+```sql
+-- V12__exception_reason_expand.sql
+-- Purpose : add exception_case.reason (expand step of the reason_code rename).
+-- Rollback: safe to leave in place; the previous release ignores the column.
+--           To remove: forward migration DROP COLUMN reason (only after reverting the code).
+-- Locks   : ADD COLUMN without default is metadata-only.
+```
+
+For destructive changes the note says what data is lost and points to the backup/PITR procedure. **Never edit an applied migration**; corrections are new migrations, as V3 did for V2.
+
+**Pitfalls.** A backfill `UPDATE` of millions of rows in one transaction (long locks, huge WAL); batch it in a job instead. Dropping a column the previous release still reads. Using the migrator credentials in the running app "because it's simpler" (undoes M10.7). `CREATE INDEX CONCURRENTLY` inside Flyway's default transaction (it fails).
+
+**Done when.** The deploy log shows the migrate step as its own stage; starting an api instance against a database with a pending migration fails with a clear Flyway validation error; every migration from this phase onward has a `Rollback:` line. Enforce it with a CI check that lists files missing the line (`grep -L 'Rollback:' src/main/resources/db/migration/V*.sql`) and ignores versions below the first one that adopted the rule. Don't add the line to already-applied migrations: even a comment change alters the checksum and Flyway validation fails.
+
+---
+
+### M11.6 — README update
+
+**What.** Rewrite `README.md` to describe the system as built.
+
+**Why.** It's the landing page for recruiters, interviewers and anyone who clones the repo. Most of them read the first screen only.
+
+**How.** Outline:
+
+1. **One-paragraph pitch**: the problem (ledger vs gateway don't agree), what ReconFlow does, and a link to the live demo and the GIF.
+2. **The GIF** (M11.12).
+3. **Quick start**: three lines: clone, `cp .env.example .env`, `./scripts/demo.sh`.
+4. **What it does**: the four questions (which match, which don't, why, who resolved them) with the worked example table.
+5. **Architecture at a glance**: one Mermaid diagram, link to `docs/architecture.md`.
+6. **Engineering highlights**: 6–8 bullets, each linking to the code or test that proves it (idempotent imports, set-based matching, optimistic locking, transactional audit, RLS, job queue with leases, benchmarks).
+7. **API**: link to Swagger UI (non-prod), the committed `openapi.json`, the Bruno collection.
+8. **Development**: prerequisites, running tests, profiles, the two DB roles.
+9. **Project docs**: links to requirements, rules, ADRs, security, benchmarks, trade-offs.
+10. **Roadmap**: v1 done; link to `plans/phase-v2-later-scope.plan`.
+11. Replace the old "Open design questions" section with links to the ADRs (if M1 hasn't already).
+
+Badges: CI status, license. No more; badge walls look like padding.
+
+**Done when.** Someone who has never seen the project can follow the quick start without asking you anything. Test it with a friend, or a fresh VM.
+
+---
+
+### M11.7 — OpenAPI spec through springdoc
+
+**What.** Generated OpenAPI 3 spec and Swagger UI on non-prod profiles; spec committed to the repo and checked in CI.
+
+**Why.** Consumers get an accurate, interactive contract; you get a diff of every API change in code review.
+
+**How.**
+
+```xml
+<dependency>
+    <groupId>org.springdoc</groupId>
+    <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+    <version>${springdoc.version}</version>   <!-- the 3.x line targets Spring Boot 4; 2.x is Boot 3. Check compatibility -->
+</dependency>
+```
+
+```java
+// shared/api/OpenApiConfig.java
+@Configuration
+@OpenAPIDefinition(info = @Info(title = "ReconFlow API", version = "v1"),
+                   security = @SecurityRequirement(name = "bearer"))
+@SecurityScheme(name = "bearer", type = SecuritySchemeType.HTTP, scheme = "bearer", bearerFormat = "JWT")
+class OpenApiConfig {
+    @Bean
+    OperationCustomizer organizationHeader() {
+        return (op, handler) -> op.addParametersItem(new HeaderParameter()
+                .name("X-Organization-Id").required(false)
+                .description("Required when the caller belongs to more than one organization"));
+    }
+}
+```
+
+```yaml
+# application.yml, prod profile
+springdoc:
+  api-docs:
+    enabled: false
+  swagger-ui:
+    enabled: false
+```
+
+In non-prod, permit `/v3/api-docs/**` and `/swagger-ui/**` in the security config (only when the beans exist, so prod has nothing to permit), and give Swagger UI's paths the looser CSP mentioned in M10.
+
+Annotate controllers with `@Operation` and `@ApiResponse` for the non-obvious cases: `202` vs `201`, `409` with its `ProblemDetail`, `412` when `If-Match` doesn't match, `428` when it's missing, `429`. Document `Idempotency-Key` and `If-Match` headers.
+
+**Contract drift check.** A test writes the generated spec to `target/openapi.json`; CI compares it with the committed `docs/openapi.json` and fails on any difference. API changes then show up as a diff in the PR, which is the point.
+
+**Pitfalls.** A springdoc version built for Boot 3 on Boot 4 (startup errors about missing classes). Swagger UI left on in prod. A spec that says `200` for endpoints that return `202`.
+
+**Done when.** `http://localhost:8080/swagger-ui.html` works locally with a Keycloak token; prod returns `404` for both paths; the drift check fails when you change a DTO without regenerating.
+
+---
+
+### M11.8 — Bruno collection for the demo walkthrough
+
+**What.** A `bruno/` folder with numbered requests that walk the demo: login → upload ledger → upload gateway → poll imports → start run → poll run → list exceptions → get one → resolve → report.
+
+**Why Bruno.** Requests are plain-text `.bru` files in the repo, so they're reviewed in PRs and versioned with the code, and the CLI runs them in CI. (Postman collections work too; Bruno avoids a cloud account for a public repo.)
+
+**How.**
+
+```
+bruno/
+  bruno.json
+  environments/
+    local.bru          # baseUrl, keycloakUrl, demo usernames; passwords as secrets
+  01-login.bru
+  02-upload-ledger.bru
+  03-upload-gateway.bru
+  04-get-import.bru
+  05-start-run.bru
+  06-get-run.bru
+  07-list-exceptions.bru
+  08-get-exception.bru
+  09-resolve-exception.bru
+  10-report.bru
+```
+
+```
+# bruno/01-login.bru
+meta {
+  name: 01 Login (Keycloak, demo client)
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{keycloakUrl}}/realms/reconflow/protocol/openid-connect/token
+  body: formUrlEncoded
+  auth: none
+}
+
+body:form-urlencoded {
+  grant_type: password
+  client_id: reconflow-demo
+  username: {{investigatorUser}}
+  password: {{investigatorPassword}}
+}
+
+script:post-response {
+  bru.setVar("accessToken", res.body.access_token);
+}
+
+tests {
+  test("token issued", () => expect(res.status).to.equal(200));
+}
+```
+
+```
+# bruno/02-upload-ledger.bru
+meta {
+  name: 02 Upload ledger
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/api/v1/imports
+  body: multipartForm
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{accessToken}}
+}
+
+body:multipart-form {
+  sourceType: INTERNAL_LEDGER
+  file: @file(../docs/samples/demo/ledger.csv)
+}
+
+script:post-response {
+  bru.setVar("ledgerImportId", res.body.id);
+}
+
+tests {
+  test("accepted", () => expect(res.status).to.equal(202));
+}
+```
+
+`09-resolve-exception.bru` reads the `ETag` saved by `08` and sends it as `If-Match`; add a variant request that sends a stale ETag and expects `412` (or `409`, whichever `api-design.md` specifies), because demonstrating the conflict is the interesting part. Match all field names to `docs/api-design.md`; the ones here are placeholders.
+
+Run it headless: `npx @usebruno/cli run --env local` from `bruno/`, and add that as a smoke step against the Compose stack in CI if the run time is acceptable.
+
+**Done when.** A fresh clone, `docker compose --profile full up`, then running the collection in order passes every test.
+
+---
+
+### M11.9 — Reproducible demo dataset and `scripts/demo.sh`
+
+**What.** A small, fixed dataset with known outcomes, and a script that starts the stack if needed, runs the whole walkthrough with `curl` and `jq`, prints each step, and asserts the results.
+
+**Why.** It's the exit criterion of the whole project ("clone, run one command, watch the workflow"), and because it asserts results, it doubles as an end-to-end smoke test for every deploy.
+
+**How.**
+
+**The dataset**, `docs/samples/demo/`: about 20 ledger rows and 20 gateway rows, hand-written (not random) so that each outcome appears and is easy to explain, extending the projectoverview.md §5 example:
+
+- 12 exact matches
+- 2 missing in gateway, 2 missing in ledger
+- 2 amount mismatches (one by a few cents, one large)
+- 1 duplicate in the gateway file
+- 1 currency mismatch
+- 2 malformed gateway rows (bad amount, bad date) → `COMPLETED_WITH_ERRORS`
+- 1 reference with leading/trailing spaces and different case, which must still match (shows normalization)
+
+Next to it, `expected.json` with the counts the script asserts. For larger demos, `scripts/generate-dataset` (M9.5) with a fixed `--seed`.
+
+**The script:**
+
+```bash
+#!/usr/bin/env bash
+# scripts/demo.sh — end-to-end ReconFlow walkthrough.
+# Usage: ./scripts/demo.sh            (starts the local stack if needed)
+#        BASE_URL=https://... KEYCLOAK_URL=https://... ./scripts/demo.sh --no-start
+set -euo pipefail
+
+BASE_URL="${BASE_URL:-http://localhost:8080}"
+KEYCLOAK_URL="${KEYCLOAK_URL:-http://localhost:8180}"
+DEMO_USER="${DEMO_USER:-investigator@acme.demo}"
+DEMO_PASSWORD="${DEMO_PASSWORD:-demo-password-change-me}"
+SAMPLES="$(cd "$(dirname "$0")/.." && pwd)/docs/samples/demo"
+
+need() { command -v "$1" >/dev/null || { echo "Missing dependency: $1" >&2; exit 1; }; }
+need curl; need jq
+step() { printf '\n\033[1m▶ %s\033[0m\n' "$*"; }
+
+wait_for() {                 # wait_for <description> <timeout-seconds> <command...>
+  local what=$1 timeout=$2; shift 2
+  for ((i = 0; i < timeout; i += 2)); do "$@" && return 0; sleep 2; done
+  echo "Timed out waiting for $what" >&2; exit 1
+}
+
+if [[ "${1:-}" != "--no-start" ]]; then
+  step "Starting the stack (first run builds the image; this takes a few minutes)"
+  [[ -f .env ]] || cp .env.example .env
+  docker compose --profile full up -d --build
+  wait_for "Keycloak" 180 curl -fsS -o /dev/null "$KEYCLOAK_URL/realms/reconflow/.well-known/openid-configuration"
+  wait_for "the API"  180 sh -c "curl -s -o /dev/null -w '%{http_code}' '$BASE_URL/api/v1/imports' | grep -q 401"
+fi
+
+step "Logging in as $DEMO_USER"
+TOKEN=$(curl -fsS "$KEYCLOAK_URL/realms/reconflow/protocol/openid-connect/token" \
+  -d grant_type=password -d client_id=reconflow-demo \
+  --data-urlencode "username=$DEMO_USER" --data-urlencode "password=$DEMO_PASSWORD" | jq -r .access_token)
+AUTH=(-H "Authorization: Bearer $TOKEN")
+
+upload() {                   # upload <sourceType> <file> → prints import id
+  curl -fsS "${AUTH[@]}" -F "sourceType=$1" -F "file=@$2;type=text/csv" "$BASE_URL/api/v1/imports" | jq -r .id
+}
+import_status() { curl -fsS "${AUTH[@]}" "$BASE_URL/api/v1/imports/$1" | jq -r .status; }
+import_done()   { [[ "$(import_status "$1")" =~ ^(COMPLETED|COMPLETED_WITH_ERRORS|FAILED)$ ]]; }
+
+step "Uploading the internal ledger"
+LEDGER=$(upload INTERNAL_LEDGER "$SAMPLES/ledger.csv"); echo "import $LEDGER"
+step "Uploading the gateway settlement file"
+GATEWAY=$(upload GATEWAY "$SAMPLES/gateway.csv");      echo "import $GATEWAY"
+
+step "Waiting for both imports"
+wait_for "ledger import"  60 import_done "$LEDGER"
+wait_for "gateway import" 60 import_done "$GATEWAY"
+curl -fsS "${AUTH[@]}" "$BASE_URL/api/v1/imports/$GATEWAY" \
+  | jq '{status, totalRows, validRows, errorRows, firstErrors: (.errors.content // [])[:2]}'
+
+step "Starting a reconciliation run"
+RUN=$(curl -fsS "${AUTH[@]}" -H "Idempotency-Key: demo-$(date +%s)" -H 'Content-Type: application/json' \
+  -d "$(jq -n --slurpfile e "$SAMPLES/expected.json" '$e[0].run')" \
+  "$BASE_URL/api/v1/reconciliation-runs" | jq -r .id)
+echo "run $RUN"
+run_done() { [[ "$(curl -fsS "${AUTH[@]}" "$BASE_URL/api/v1/reconciliation-runs/$RUN" | jq -r .status)" =~ ^(COMPLETED|FAILED)$ ]]; }
+wait_for "reconciliation run" 120 run_done
+SUMMARY=$(curl -fsS "${AUTH[@]}" "$BASE_URL/api/v1/reconciliation-runs/$RUN")
+echo "$SUMMARY" | jq '{status, matchedCount, mismatchCount, unmatchedLeftCount, unmatchedRightCount, duplicateCount}'
+
+step "Checking the results against expected.json"
+jq -e --slurpfile e "$SAMPLES/expected.json" \
+  '.matchedCount == $e[0].matched and .mismatchCount == $e[0].mismatched and .duplicateCount == $e[0].duplicates' \
+  <<<"$SUMMARY" >/dev/null && echo "✓ counts match" || { echo "✗ counts differ from expected.json" >&2; exit 1; }
+
+step "Listing open exceptions"
+EXCEPTIONS=$(curl -fsS "${AUTH[@]}" "$BASE_URL/api/v1/exceptions?runId=$RUN&status=OPEN&size=50")
+echo "$EXCEPTIONS" | jq -r '.content[] | "\(.type)\t\(.reference)\t\(.amountDifference // "")"' | column -t
+EXC=$(echo "$EXCEPTIONS" | jq -r '[.content[] | select(.type == "AMOUNT_MISMATCH")][0].id')
+
+step "Resolving amount mismatch $EXC (with If-Match)"
+ETAG=$(curl -fsS -D - -o /dev/null "${AUTH[@]}" "$BASE_URL/api/v1/exceptions/$EXC" | awk -F': ' 'tolower($1)=="etag"{print $2}' | tr -d '\r')
+curl -fsS "${AUTH[@]}" -H "If-Match: $ETAG" -H 'Content-Type: application/json' \
+  -d '{"resolutionCode":"GATEWAY_FEE_DEDUCTED","note":"Gateway deducted its fee before settlement; confirmed on the statement."}' \
+  "$BASE_URL/api/v1/exceptions/$EXC/resolve" | jq '{id, status, resolutionCode}'
+
+step "Trying the same resolve again with the old ETag (expect a conflict)"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" -H "If-Match: $ETAG" -H 'Content-Type: application/json' \
+  -d '{"resolutionCode":"OTHER","note":"second attempt"}' "$BASE_URL/api/v1/exceptions/$EXC/resolve")
+echo "HTTP $CODE (stale version rejected)"; [[ "$CODE" =~ ^(409|412)$ ]]
+
+step "Reconciliation report"
+curl -fsS "${AUTH[@]}" "$BASE_URL/api/v1/reports/reconciliation?runId=$RUN" | jq .
+
+step "Audit trail of the resolved exception"
+curl -fsS "${AUTH[@]}" "$BASE_URL/api/v1/audit-events?entityType=EXCEPTION_CASE&entityId=$EXC" \
+  | jq -r '.content[] | "\(.createdAt)\t\(.action)\t\(.actorId)"' | column -t
+
+printf '\n\033[1;32mDemo complete.\033[0m Swagger UI: %s/swagger-ui.html\n' "$BASE_URL"
+```
+
+Field names (`totalRows`, `content`, `matchedCount`, …) must be changed to whatever `docs/api-design.md` specifies; the structure is what matters. The script deliberately polls readiness itself instead of relying on `docker compose up --wait`, because the one-off `migrate` and `minio-init` containers exit by design and older Compose versions treat that as a failure under `--wait`.
+
+**Pitfalls.** A demo that depends on today's date (the partition window in V1 covers 12 months back to 3 months ahead; keep demo dates inside it, or derive them from the current month in the generator). A non-idempotent demo: running it twice must work, which it does because each run uploads with the duplicate-import policy in mind — if that policy rejects re-uploads with `409`, the script should accept the `409`, read the existing batch id from the `ProblemDetail`, and continue. Hard-coded passwords that are also used anywhere real.
+
+**Done when.** On a fresh clone on a clean machine with Docker, `./scripts/demo.sh` finishes green; running it a second time also finishes green; `BASE_URL=<deployed> ./scripts/demo.sh --no-start` passes against the deployment.
+
+---
+
+### M11.10 — Final `docs/architecture.md`
+
+**What.** Replace the M1 design-time architecture doc with one that matches the code, with diagrams kept in Mermaid so they live in git and render on GitHub.
+
+**Why.** Interviewers will ask you to draw the system. Having drawn it accurately once, from the code, is the best preparation.
+
+**How.** Sections and diagrams:
+
+1. **Context** — who uses it and what it talks to:
+
+```mermaid
+flowchart LR
+  uploader([Uploader]) & investigator([Investigator]) & admin([Org admin])
+  uploader & investigator & admin -->|HTTPS, OIDC token| api[ReconFlow API]
+  api -->|OIDC discovery, JWKS| kc[Keycloak]
+  api --> pg[(PostgreSQL 16)]
+  api --> s3[(Object storage)]
+  worker[ReconFlow worker] --> pg
+  worker --> s3
+```
+
+2. **Containers** — api, worker, migrate, PostgreSQL, object storage, Keycloak, Prometheus; which talks to which, over what, and which credentials each holds (app role vs migrator).
+3. **Components** — the modules (`ingestion`, `ledger`, `reconciliation`, `exceptions`, `reporting`, `audit`, `organization`, `security`, `shared`) and their allowed dependencies. Spring Modulith can generate this from the code (its `Documenter` writes C4-style PlantUML), which guarantees it matches; ArchUnit tests (M2.9) enforce it.
+4. **Key flows** as sequence diagrams: upload → job → worker → import completed; run → day-chunked set-based matching → exceptions; resolve with `If-Match` and a concurrent `409`/`412`; crash and lease expiry → re-claim → resume from checkpoint.
+5. **Data model** — `erDiagram` of the main tables, linking to `database-design.md` for detail.
+6. **State machines** — `stateDiagram-v2` for import batch, run and exception.
+7. **Cross-cutting** — tenancy (three layers), audit, idempotency (which constraint protects which retry), observability.
+8. **Deployment** — the M11.4 topology.
+
+**Done when.** Every box in every diagram corresponds to a class, table, container or service that exists, and you've checked each one.
+
+---
+
+### M11.11 — Trade-offs write-up
+
+**What.** `docs/trade-offs.md`: what you chose, what you gave up, what you'd do at 100× scale, and what you learned.
+
+**Why.** Senior interviews are mostly about trade-offs. This document is your rehearsed answer to "what would you do differently?"
+
+**How.** Outline:
+
+1. **Decisions and their costs** — one short paragraph each, linking the ADR: modular monolith; DB job queue instead of Kafka; set-based SQL matching instead of in-memory; partitioning from day one; shared schema + RLS; `@Version` + conditional requests; building auth then delegating it; no Redis.
+2. **Deferred, and why** — the v2 list (link `plans/phase-v2-later-scope.plan`), plus things like per-tenant encryption keys and data residency, each with the reason it waited.
+3. **At 100× (≈100,000 users, ~150M rows/day)** — use docs/scalability.md §8 as the starting point:
+   - Ingestion: `COPY` instead of batched inserts; workers scaled out; the job queue moved to Kafka with a transactional outbox once claim queries show up in the top slow queries.
+   - Database: read replicas for reports; sub-partitioning or sharding by tenant; a large tenant on its own database; PgBouncer.
+   - Reporting: pre-aggregated tables or a columnar store for analytics instead of querying the OLTP tables.
+   - Audit: streaming to an append-only store (e.g. object storage with object lock) instead of a growing table.
+   - What *wouldn't* change: the domain model, the idempotency constraints, the module boundaries.
+4. **What I measured** — the benchmark numbers from `docs/benchmarks.md`, and what surprised you.
+5. **Lessons learned** — honest ones: bugs the tests caught, design reviews that found defects (the auth plan's change log is a real example), what took longer than expected, what you'd design first next time.
+
+**Done when.** Each claim in sections 1–4 links to code, an ADR, or a measurement.
+
+---
+
+### M11.12 — Demo video or GIF
+
+**What.** A 30–60 second GIF (or short MP4) at the top of the README.
+
+**Why.** Most visitors won't run anything. The GIF is the demo for them.
+
+**How.**
+
+- **Terminal demo (recommended):** record `scripts/demo.sh` with `asciinema rec demo.cast`, then convert with `agg demo.cast docs/media/demo.gif`. Text stays sharp and the file stays small. Use a large font and an 100×30 terminal.
+- **UI demo:** record Swagger UI or the Grafana dashboard with QuickTime (or Kap), then `gifski --fps 12 --width 1000 -o docs/media/swagger.gif recording.mov`.
+- **MP4 instead of GIF:** GitHub renders a video if you drag it into the README editor on github.com; better quality at a smaller size, but it doesn't autoplay everywhere.
+
+Keep it under ~5 MB, cut waiting time (speed up polling sections), and show the three moments that matter: the run summary, the exception list, and the stale-ETag conflict.
+
+**Done when.** The README shows it on first screen and it loads quickly on a phone.
+
+---
+
+## 5. Testing strategy
+
+| What | How |
+|---|---|
+| Image builds and runs non-root | CI job builds it on every PR (without pushing) and runs `docker run --rm img id -u` expecting `10001` |
+| Image vulnerabilities | Trivy in the publish job (M11.3) |
+| Migrations from zero | Existing Testcontainers tests start on an empty DB and apply every migration |
+| Migrations from the previous release | Optional CI job: start PostgreSQL, migrate with the `main` image, then migrate with the PR's image, then run the smoke test. Catches migrations that only work from an empty database |
+| App refuses pending migrations | Integration test with `FlywayValidateOnlyConfig` active against a DB missing the last migration |
+| Full-stack smoke | `scripts/demo.sh` against Compose in CI (on `main`, or nightly if too slow for PRs) |
+| Deployed smoke | `scripts/demo.sh --no-start` against the deployment after each deploy |
+| Zero-downtime deploy | Manual, once: `while true; do curl -s -o /dev/null -w '%{http_code}\n' $URL/actuator/health/readiness; sleep 0.5; done` during a deploy |
+| API contract | OpenAPI drift check (M11.7); Bruno collection in CI |
+| Docs accuracy | Manual review against the code before marking M11.10 done |
+
+---
+
+## 6. Exit criteria checklist
+
+- [ ] Multi-stage Dockerfile, non-root, layered, `.dockerignore` excludes `.env`
+- [ ] `docker compose --profile full up` runs api, worker, migrate, Postgres, MinIO, Keycloak; `observability` adds Prometheus and Grafana
+- [ ] Merges to `main` push `ghcr.io/kasalmanfarcy/reconflow:sha-<commit>` after tests pass; image scanned
+- [ ] Deployed on a public HTTPS URL with managed PostgreSQL 16 and S3-compatible storage
+- [ ] Migrations run as a separate step with the migrator role; the app only validates; every new migration has a `Rollback:` note
+- [ ] README rewritten; old open questions replaced by ADR links
+- [ ] OpenAPI spec committed and drift-checked; Swagger UI off in prod
+- [ ] Bruno collection walks the demo and passes
+- [ ] `./scripts/demo.sh` passes on a fresh clone, twice in a row, and against the deployment
+- [ ] `docs/architecture.md` matches the code
+- [ ] `docs/trade-offs.md` written, every claim linked
+- [ ] GIF or video in the README
+
+TASKS.md's exit criterion — *someone can clone the repo, run a single command, and watch the full workflow from upload to resolution* — is the `./scripts/demo.sh` line. Test it on a machine that has never seen the project.
+
+---
+
+## 7. Interview questions this phase prepares you for
+
+**Why a multi-stage Dockerfile?**
+The build needs a JDK, Maven and the source; the runtime needs only a JRE and the compiled classes. Building in one stage and copying the output into a JRE-only stage makes the image smaller and removes tools an attacker could use. It also keeps the Maven cache and source code out of the shipped image.
+
+**What does extracting the jar into layers buy you?**
+Docker reuses unchanged layers. Dependencies change rarely and the application code changes every commit, so splitting them means a typical rebuild and push only ships the small application layer instead of an 80 MB fat jar. Deploys get faster and registry storage smaller.
+
+**How should a JVM be configured in a container?**
+Let it size from the container limit with `MaxRAMPercentage` around 75, leaving room for non-heap memory, rather than hard-coding `-Xmx` into the image. Exit on OOM so the orchestrator restarts a clean process. Run as a non-root numeric UID.
+
+**How do you run database migrations in a deployment with several instances?**
+As one separate step before new instances start, using credentials that have DDL rights; the running app only has data rights and only validates that the schema is current. If the migration fails, the deploy stops and the old version keeps serving. Running migrations on every app startup means racing instances, DDL rights in every process, and crash loops on failure.
+
+**How do you make schema changes with zero downtime?**
+Expand/contract: add the new structure in a backwards-compatible way, deploy code that uses it, then remove the old structure in a later release. At every point, the current and previous code versions both work with the schema, so a rolling deploy and a one-step rollback are both safe. Also avoid long locks: concurrent index creation, `NOT VALID` constraints validated later, batched backfills, and a lock timeout.
+
+**How do you roll back a Flyway migration?**
+Flyway Community has no undo, and pre-written down-scripts are rarely tested anyway. I roll back by redeploying the previous image, which works because expand/contract keeps the previous version compatible with the new schema. Fixes to the schema itself go forward as new migrations; real data loss is handled by point-in-time recovery.
+
+**Liveness vs readiness?**
+Liveness answers "is the process stuck?" and failing it restarts the container, so it mustn't depend on the database or a DB outage restarts everything. Readiness answers "can I take traffic?" and failing it only removes the instance from the load balancer, so it should include the database.
+
+**Why tag images with the git SHA?**
+It's immutable and maps one-to-one to the code, so you always know what's running, can reproduce it, and can roll back to an exact previous build. `latest` changes under you and makes "what's deployed?" unanswerable.
+
+**How do secrets get into your containers?**
+As environment variables from the platform's secret store, never baked into the image or committed. The running app has only the DB app role's password; the migrator password is given only to the migration step. The app fails fast at startup if a required secret is missing.
+
+**Dockerfile or buildpacks?**
+Buildpacks give a good, secure image with no Dockerfile, built-in memory tuning and SBOMs, and can rebase the OS layer without rebuilding: great for many services. I wrote a Dockerfile here because I wanted to understand and be able to explain every layer.
+
+---
+
+## 8. Common mistakes
+
+- **Secrets in the image**: a `COPY . .` that picks up `.env`. Deleting it in a later layer doesn't remove it.
+- **Running migrations from every app instance with owner credentials**, quietly undoing M10.7.
+- **Dropping or renaming a column in the same release as the code change.** The old instances still running during the deploy start failing.
+- **A readiness probe that's really a liveness probe** (or the reverse), causing restart loops during a DB blip.
+- **Only a `latest` tag.**
+- **A demo that only works on your machine**: absolute paths, an existing `.env`, a local Maven cache, dates outside the partition window, data left over from a previous run.
+- **Docs and diagrams that describe the plan instead of the code.** Interviewers who open the repo will notice the difference.
+- **A README that starts with the tech stack** instead of the problem.
+- **Leaving the deployment on a free tier that sleeps** while sending the link to recruiters, so the first click takes 30 seconds or times out.
+
+---
+
+## Resume tie-in
+
+Each deliverable is the evidence behind a resume bullet (see the "after it's fully built" version discussed earlier). If the evidence isn't there, the bullet shouldn't be either.
+
+| Resume claim | Backed by |
+|---|---|
+| Multi-tenant payment reconciliation platform (the overview bullet) | Live URL (M11.4), README pitch (M11.6), GIF (M11.12) |
+| Streaming import at **[N] rows in [X s]** | `docs/benchmarks.md` (M9.6), linked from the README highlights |
+| Idempotent engine, nothing lost or double-counted | `scripts/demo.sh` run twice with identical results (M11.9); property test linked from `architecture.md` |
+| Exception workflow with optimistic locking and transactional audit | Demo's stale-ETag step and audit-trail output (M11.9); Bruno conflict request (M11.8); sequence diagram (M11.10) |
+| Tenant isolation with RLS and cross-tenant tests | `docs/security.md` (M10), least-privilege roles in deployment (M11.4–M11.5) |
+| In-house auth, then OIDC migration touching only the security package | The M10.1 ADR, linked from `docs/trade-offs.md` (M11.11) |
+| Postgres job queue with leases and failure-injection tests | `architecture.md` crash/re-claim sequence diagram (M11.10), trade-offs section on Kafka (M11.11) |
+| Shipped with partitioned schema, CI with Testcontainers, metrics, non-root Docker image | Dockerfile (M11.1), CI + GHCR job (M11.3), migrate step (M11.5), Grafana in Compose (M11.2) |

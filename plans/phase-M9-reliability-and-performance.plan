@@ -1,0 +1,1171 @@
+# Phase M9 — Reliability and Performance
+
+**Status:** Not started · **Tasks:** TASKS.md M9.1–M9.15, plus the "New" items from docs/scalability.md §9 (partition maintenance, archival, restore drill) · **Depends on:** M5 (job table and worker), M6 (chunked engine), M7 (optimistic locking), M8 (report queries) · **Date:** 2026-11-01
+
+Up to M8, ReconFlow works when nothing goes wrong. This phase proves it still works when things do go wrong (crashes, deadlocks, killed workers, slow clients) and measures how fast it is, instead of guessing. It ends with the evidence you'll quote in interviews: benchmark numbers, failure-injection tests that pass, and dashboards that show the system running.
+
+Two rules run through the whole phase:
+
+1. **Measure before changing.** Every performance change starts with a number and ends with a new number. A tuning change without a before-and-after is a guess.
+2. **Recovery is built on idempotency.** A crashed job is simply run again. That's only safe because the constraints from M5–M7 (`UNIQUE (batch_id, source_row_number, transaction_date)`, `UNIQUE (run_id, ledger_record_id)`, the active-exception partial index) make a repeat run produce the same result. M9 tests that claim, it doesn't add a new mechanism.
+
+---
+
+## 1. Goal
+
+By the end of M9:
+
+1. A worker killed at any point leaves no stuck work: its imports and runs resume on another worker, and the final state is identical to a clean run (proved by failure-injection tests).
+2. Transient database errors (serialization failures, deadlocks, dropped connections) are retried with backoff; validation and constraint errors are not.
+3. A deterministic generator creates 50k-row and 500k-row datasets with known discrepancy rates.
+4. `docs/benchmarks.md` records import throughput, reconciliation time and API latency on documented hardware, and the k6 scenarios S1–S6 from docs/scalability.md §7 have been run.
+5. N+1 queries are caught by tests, every list endpoint is capped at a maximum page size.
+6. Micrometer metrics are exported to Prometheus and shown in a Grafana dashboard; liveness and readiness probes are separate and correct; shutdown is graceful.
+7. A Kafka ADR records whether Kafka is needed, based on the measurements. The expected answer is "not yet".
+8. Partition maintenance runs on a schedule; archival and the restore drill are designed (and the restore drill performed once).
+
+---
+
+## 2. Concepts to understand first
+
+### 2.1 At-least-once execution with exactly-once effects
+
+A job system can promise one of three things:
+
+| Guarantee | Meaning | How |
+|---|---|---|
+| At most once | A job runs zero or one times. A crash loses work. | Mark done before doing it. |
+| At least once | A job runs one or more times. A crash causes a repeat. | Mark done after doing it; re-run anything not marked done. |
+| Exactly once | Runs exactly once. | Impossible to guarantee across a crash in a distributed system: the worker can always die after doing the work but before recording that it did. |
+
+The practical answer is **at-least-once execution plus idempotent effects**: the job may run twice, but running it twice has the same effect as running it once. ReconFlow gets idempotency from database constraints and checkpoints:
+
+- An import resumes from `import_batch.last_committed_row`; a row that slipped through twice hits `UNIQUE (batch_id, source_row_number, transaction_date)`.
+- A run resumes from `reconciliation_run.last_completed_date`; a match inserted twice hits `UNIQUE (run_id, ledger_record_id)`.
+- A re-raised exception hits `exception_case_active_uk`.
+
+Be precise in interviews: "exactly-once **effects**", never "exactly-once delivery".
+
+### 2.2 Leases, heartbeats and fencing
+
+A **lease** is a lock with an expiry. A worker that claims a job sets `lease_until = now() + 2 min` and renews it every 30 s (the **heartbeat**). If the worker dies, it stops renewing; after at most 2 minutes the lease expires and the sweeper hands the job to someone else. A plain lock (`locked_by` without an expiry) would stay held forever by a dead worker.
+
+The hard case is a worker that **isn't dead, just paused**: a 3-minute garbage-collection pause or a network partition. Its lease expires, another worker takes the job, then the first one wakes up and carries on writing. Now two workers are processing the same import.
+
+Two defences, both used here:
+
+1. **Fencing on every write.** Each chunk commit checks, in the same transaction, that this worker still owns the job:
+
+   ```sql
+   UPDATE job SET lease_until = now() + interval '2 minutes', updated_at = now()
+    WHERE id = :jobId AND locked_by = :workerId AND status = 'RUNNING';
+   -- 0 rows updated → we lost the lease → roll back this chunk and stop.
+   ```
+
+   Because the ownership check and the chunk's inserts commit together, a worker that lost its lease can't commit anything after the moment it lost it.
+2. **Idempotency constraints** as the final safety net: even if two workers did overlap, duplicate rows are rejected.
+
+`locked_by` must be unique per worker **process**, for example `hostname + ":" + pid + ":" + random UUID at startup`. The hostname alone isn't enough: a restarted container gets the same hostname and would "own" its previous life's jobs.
+
+### 2.3 Transient versus permanent failures
+
+Retrying is only useful if the next attempt might succeed.
+
+| Failure | Example | Retry? |
+|---|---|---|
+| **Transient** | Serialization failure (SQLState `40001`), deadlock (`40P01`), connection lost (`08xxx`), lock or statement timeout (`55P03`, `57014`), object storage `503` | Yes, with backoff and a limit |
+| **Permanent** | Invalid CSV row, unique-constraint violation (`23505`) on a genuinely duplicate request, `NOT NULL` violation (`23502`), a bug (`NullPointerException`) | No. Retrying gives the same result, wastes resources and delays the error |
+| **Business conflict** | Optimistic lock failure on an exception (`@Version`) during a **user** request | No. It must reach the user as `409` so they can reload and decide. Retrying silently would overwrite the other user's change, which is exactly the lost update `@Version` exists to prevent |
+
+The SQLState classes come from the SQL standard: `40` = transaction rollback, `08` = connection exception, `23` = integrity constraint violation. Spring translates them into its `DataAccessException` hierarchy, which separates `TransientDataAccessException` (e.g. `PessimisticLockingFailureException`, `CannotAcquireLockException`, `QueryTimeoutException`) from `NonTransientDataAccessException` (e.g. `DataIntegrityViolationException`). Use the hierarchy where you can, and the raw SQLState as a fallback.
+
+### 2.4 Retries need backoff and jitter
+
+Retrying immediately after a deadlock often deadlocks again, because the other transaction is still running. **Exponential backoff** waits 100 ms, 200 ms, 400 ms… **Jitter** adds randomness so that 50 workers that failed at the same moment don't all retry at the same moment (the *thundering herd*). Always cap the number of attempts.
+
+Retries also multiply load. With three layers each retrying three times, one failure becomes 27 attempts. ReconFlow has exactly two retry layers, and they're deliberately different (§4 M9.3).
+
+### 2.5 Latency percentiles
+
+The mean hides the users who suffer. If 99 requests take 10 ms and one takes 5 s, the mean is 60 ms, which describes nobody. Report **p50** (typical), **p95** and **p99** (the tail). The SLOs in docs/scalability.md §6 are written as p95 for that reason.
+
+Percentiles can't be averaged across instances or time windows. Prometheus computes them from **histogram buckets**, which can be added up, then `histogram_quantile()` estimates the percentile. That's why metrics must publish histograms, not precomputed percentiles, when there are two or more instances.
+
+### 2.6 Metric cardinality
+
+Every unique combination of metric name and tag values is a separate **time series** in Prometheus, and each one costs memory and storage. `http.server.requests` with tags `uri` (30 values) × `method` (4) × `status` (10) × `outcome` (5) is already up to 6,000 series per instance, before histogram buckets multiply it by ~20.
+
+Adding `organizationId` (100 values, growing) multiplies that by 100. Adding `batchId`, `runId`, `userId` or a raw URL with ids in it is unbounded: a new series per upload, forever. Prometheus slows down and eventually runs out of memory. This is called a **cardinality explosion**.
+
+Rule: **tags must have a small, fixed set of values.** Per-tenant or per-entity detail belongs in logs (with the request id) or in the database, not in metrics.
+
+### 2.7 Liveness versus readiness
+
+Kubernetes, and most platforms, ask two different questions:
+
+- **Liveness: "Is this process broken beyond repair?"** If it fails, the platform **restarts** the container.
+- **Readiness: "Should this instance get traffic right now?"** If it fails, the platform **stops sending requests** to it, but doesn't restart it.
+
+The database belongs in readiness, **never** in liveness. If the database goes down and liveness checks it, every instance fails liveness at once and the platform restarts them all in a loop. Restarting doesn't fix the database, and when it comes back every instance reconnects at the same moment. Readiness does the right thing: stop sending traffic until the dependency is back.
+
+---
+
+## 3. Starting point
+
+After M8:
+
+- The `job` table and worker exist (built in M5, moved forward from M9.2 per docs/scalability.md §9): claim with `SELECT … FOR UPDATE SKIP LOCKED`, 2-minute leases, 30-second heartbeat, per-organization cap of 2 running jobs, a sweeper that re-queues expired leases, exponential backoff through `run_after`, and validation failures never retried.
+- Imports commit every 5,000 rows and record `last_committed_row`; reconciliation commits one day at a time and records `last_completed_date`; run totals are written at completion.
+- The `api` and `worker` Spring profiles.
+- Actuator with `health` and `info` exposed, JSON logs with a request id (M2.11–M2.12).
+- `compose.yaml` with PostgreSQL and MinIO.
+- `create_transaction_record_partition(date)` in V1, with partitions created 12 months back to 3 months ahead **at migration time only**. Nothing extends that window yet; the first missing month is 3–4 months after the V1 migration ran. **Partition maintenance is therefore urgent, not optional** (§4 M9.N1).
+
+---
+
+## 4. Step by step
+
+### M9.1 Recover work stuck in `PROCESSING` or `RUNNING`
+
+**What**
+
+After any crash or restart, every `import_batch` in `PROCESSING` and every `reconciliation_run` in `RUNNING` either resumes or ends in `FAILED` with a reason. Nothing stays stuck.
+
+**Why**
+
+The domain status is what users see. A batch stuck in `PROCESSING` forever looks like a hang, blocks reconciliation of that period and can never be retried (retry only applies to `FAILED`).
+
+**How**
+
+The design decision is: **the job row is the source of truth for whether work is alive; the domain row is the source of truth for progress.** The domain row never has its own lease. It's recovered through its job.
+
+| Situation | What happens |
+|---|---|
+| Worker dies, job has attempts left | Sweeper sees `lease_until < now()`, sets job `QUEUED` with backoff. The domain row stays `PROCESSING`/`RUNNING`. The next worker resumes from the checkpoint. |
+| Worker dies, job is out of attempts | Sweeper sets job `FAILED` **and**, in the same transaction, the domain row to `FAILED` with `failure_reason = 'Processing abandoned after N attempts'`, plus an audit event. |
+| Domain row is `PROCESSING` but has no `QUEUED`/`RUNNING` job | Shouldn't happen if enqueueing was transactional (M5). Detect it anyway with the consistency check below. |
+
+The sweeper's re-queue, from M5, with the attempt-limit branch added:
+
+```sql
+-- Jobs whose worker stopped renewing the lease.
+UPDATE job
+   SET status      = CASE WHEN attempts >= max_attempts THEN 'FAILED' ELSE 'QUEUED' END,
+       run_after   = now() + make_interval(secs => least(10 * 2 ^ attempts, 3600)),
+       locked_by   = NULL,
+       lease_until = NULL,
+       last_error  = coalesce(last_error, '') || ' | lease expired',
+       updated_at  = now()
+ WHERE status = 'RUNNING' AND lease_until < now()
+RETURNING id, type, payload, status;
+```
+
+For each returned row with `status = 'FAILED'`, the sweeper marks the domain row failed through the module's own service (`ImportBatchStateMachine.fail(...)`, `RunStateMachine.fail(...)`), not with raw SQL, so the central transition logic and audit event from M5.15 and M6.10 still apply.
+
+The `CHECK (status <> 'RUNNING' OR (locked_by IS NOT NULL AND lease_until IS NOT NULL))` in V1 means the `UPDATE` above must clear `locked_by` and `lease_until` only when leaving `RUNNING`, which it does.
+
+**Startup sweep.** When a worker starts (`ApplicationReadyEvent`, `worker` profile only), it runs the sweeper once immediately instead of waiting for the first scheduled tick. It must only reclaim **expired** leases. It must not reclaim jobs by `locked_by`, because other workers are still alive and holding valid leases.
+
+**Consistency check.** A scheduled query (every 5 minutes) finds domain rows in flight without a live job:
+
+```sql
+SELECT b.id
+  FROM import_batch b
+ WHERE b.status = 'PROCESSING'
+   AND b.updated_at < now() - interval '10 minutes'
+   AND NOT EXISTS (SELECT 1 FROM job j
+                    WHERE j.type = 'IMPORT'
+                      AND j.payload ->> 'batchId' = b.id::text
+                      AND j.status IN ('QUEUED', 'RUNNING'));
+```
+
+Log each one at `ERROR`, increment `reconflow.jobs.orphaned`, and mark it `FAILED` with a reason. Don't auto-re-enqueue: an orphan means a bug in the enqueue path, which a human should look at. A `FAILED` batch can be retried explicitly (M5.20). An index on `((payload ->> 'batchId'))` isn't needed: the outer query is filtered to a handful of stale rows.
+
+**Fencing.** Each chunk commit in the import and reconciliation handlers starts with the ownership `UPDATE` from §2.2. If it updates zero rows, throw `LeaseLostException`; the chunk's transaction rolls back and the handler stops without touching the job row (it's someone else's now). Because the heartbeat and the chunk share a transaction, the chunk commit doubles as a heartbeat.
+
+The background heartbeat (every 30 s, separate thread) uses the same `UPDATE`. If it updates zero rows, it sets a flag the handler checks between rows, so the handler stops promptly instead of finishing a 5,000-row chunk it can't commit.
+
+**Pitfalls**
+
+- Recovering by `locked_by = <my hostname>` at startup. Container hostnames repeat across restarts and can collide.
+- Marking the domain row `FAILED` directly when the lease expires, even though the job will be retried. Users would see `FAILED`, then `COMPLETED`.
+- Heartbeating from the handler thread only. A long single statement (a big `INSERT … SELECT` in reconciliation) blocks it past the lease. Use a separate heartbeat thread, and keep each statement well under 2 minutes (one day per chunk already does).
+- A lease shorter than the longest GC pause or chunk. Keep 2 minutes, and alert if `reconflow.jobs.lease.lost` is ever non-zero.
+
+**Done when**
+
+- Integration test: claim a job, stop heartbeating, move `lease_until` into the past, run the sweeper → job `QUEUED`, domain row still `PROCESSING`; a second worker resumes and completes it.
+- Same with `attempts = max_attempts` → job `FAILED`, domain row `FAILED` with a reason, audit event written.
+- Fencing test: worker A's lease is taken over by worker B; A's next chunk commit fails with `LeaseLostException` and commits nothing.
+
+### M9.2 Background processing (already built in M5 — harden it)
+
+**What**
+
+TASKS.md M9.2 says "move processing off the request thread if the ADR chose async". The ADR chose async with a DB-backed job table (docs/scalability.md D4), and docs/scalability.md §9 moved building it into M5. So in M9 there's nothing to introduce. This task is **hardening and proving** the existing queue.
+
+**Why**
+
+The job queue is now a core part of correctness. Its edge cases (two workers claiming at once, the fairness cap, poison jobs) need tests, not just a happy path.
+
+**How**
+
+Add these tests to `JobQueueIT` (Testcontainers PostgreSQL):
+
+1. **No double claim.** Enqueue 200 jobs. Start 8 threads, each looping `claim()` until empty, recording claimed ids. Assert 200 distinct ids, no duplicates. This is what `FOR UPDATE SKIP LOCKED` guarantees: a locked row is skipped, not waited for and not claimed twice.
+2. **Fairness cap.** Org A enqueues 30 jobs, org B enqueues 1. With 4 claiming threads, assert org A never has more than 2 `RUNNING` at once, and org B's job starts before org A's queue drains.
+
+   Note a race in the fairness query from docs/scalability.md §4.2: two workers can both count org A's running jobs as 1 at the same moment and both claim, giving 3. `SKIP LOCKED` locks the candidate rows, not the count. Either accept a soft cap (simplest, document it), or serialize claims per organization with `pg_advisory_xact_lock(hashtext(organization_id::text))` inside the claim transaction. Decide, document, and make the test match the decision.
+3. **Poison job.** A job whose handler always throws a non-transient exception goes straight to `FAILED` with `last_error` set, after one attempt. A job that throws a transient exception is retried with growing `run_after` until `max_attempts`.
+4. **Backoff values.** Unit-test the backoff function: attempt 1 → ~20 s, attempt 5 → ~320 s, capped at 1 h, with jitter within ±20%.
+5. **Claim index used.** `EXPLAIN` the claim query on a table with 100k `DONE` rows and 50 `QUEUED` rows: it should use `job_claim_idx` (partial on `QUEUED`), not scan the `DONE` rows.
+
+Also add a retention job: delete `DONE` jobs older than 30 days (keep `FAILED` longer, for diagnosis). Without it, the table grows forever, even though the partial indexes keep claims fast.
+
+**Done when**
+
+- All five tests pass. The fairness decision is in `docs/architecture.md`.
+
+### M9.3 Retry with backoff for transient database failures
+
+**What**
+
+Two retry layers, each with a clear job:
+
+| Layer | Retries | Mechanism |
+|---|---|---|
+| **In-process** (seconds) | One transaction that failed with a transient DB error | `@Retryable` around the transactional method |
+| **Job** (minutes) | A whole job attempt that failed with a transient error that in-process retries didn't fix | The job queue's `run_after` backoff (M5) |
+
+Nothing else retries. In particular, HTTP request handlers for user actions don't retry business conflicts.
+
+**Why**
+
+Under concurrent load, PostgreSQL will occasionally abort a transaction as a deadlock victim or, at `REPEATABLE READ`/`SERIALIZABLE`, with a serialization failure. These are normal and expected: the database is telling you "try again". Without retries, a busy morning produces random failed imports.
+
+**How — choosing the tool**
+
+| Option | Notes |
+|---|---|
+| Spring Framework 7's built-in resilience (`@Retryable`, `@EnableResilientMethods`) | Boot 4 ships Framework 7, which added core retry support. No extra dependency. **Verify the exact annotations and attributes against the Boot 4 / Framework 7 docs.** |
+| Spring Retry (`org.springframework.retry`) | The long-standing library. Was put into maintenance in favour of the Framework 7 support. |
+| Resilience4j | Also gives circuit breakers, bulkheads and rate limiters. Worth it if you also need those (M10.4 rate limiting could use it). |
+| Hand-rolled loop | Easy to get wrong (no jitter, retrying inside the transaction). Only for learning. |
+
+**Decision:** use Framework 7's `@Retryable` for in-process retries; consider Resilience4j only if M10.4 needs it anyway.
+
+```java
+@Service
+class ImportChunkWriter {
+
+    @Retryable(includes = TransientDataAccessException.class,   // check attribute names in the docs
+               maxRetries = 3, delay = 100, multiplier = 2, jitter = 50)
+    @Transactional
+    public void commitChunk(ChunkCommand cmd) { ... }
+}
+```
+
+The ordering matters: **the retry must wrap the transaction, not run inside it.** When PostgreSQL aborts a transaction, every later statement in that transaction fails with `25P02 current transaction is aborted`. Retrying inside it is pointless; the whole transaction must roll back and start again. Check that the retry interceptor is ordered outside the transaction interceptor (interceptor `@Order`, or put `@Retryable` on a caller in a different bean that calls the `@Transactional` method). Write a test that proves it (below).
+
+**Classifier.** Spring's exception translation covers most cases. For anything that arrives untranslated (e.g. from a `CopyManager` bulk load), add a fallback that walks the cause chain for an `SQLException` and checks its SQLState:
+
+```java
+final class TransientFailures {
+    private static final Set<String> TRANSIENT_STATES = Set.of(
+            "40001",   // serialization_failure
+            "40P01",   // deadlock_detected
+            "55P03",   // lock_not_available
+            "57014");  // query_canceled (statement_timeout)
+
+    static boolean isTransient(Throwable t) {
+        for (Throwable c = t; c != null; c = c.getCause()) {
+            if (c instanceof TransientDataAccessException) return true;
+            if (c instanceof NonTransientDataAccessException) return false;
+            if (c instanceof SQLException e && e.getSQLState() != null) {
+                String s = e.getSQLState();
+                return TRANSIENT_STATES.contains(s) || s.startsWith("08");   // connection exceptions
+            }
+        }
+        return false;
+    }
+}
+```
+
+The job runner uses the same classifier to decide between `QUEUED` with backoff (transient) and `FAILED` (anything else). That's what keeps validation failures from ever being retried.
+
+**Connection failures and idempotency.** A `08xxx` error during `COMMIT` is the nasty case: the commit may or may not have happened. Retrying is safe only because the chunk is idempotent (unique constraints, checkpoint compare-and-set). Write that reasoning down in the code comment; it's the kind of thing an interviewer will probe.
+
+**Pitfalls**
+
+- Retrying `OptimisticLockingFailureException` in an exception resolve request. That defeats `@Version`. It must become `409`.
+- Retrying `DataIntegrityViolationException`. A real duplicate stays a duplicate.
+- Retrying inside the transaction.
+- Retrying non-idempotent side effects (sending an email, calling an external API) along with the DB work. Keep those outside, or behind an outbox.
+
+**Done when**
+
+- Test: a fault hook makes `commitChunk` throw a `CannotAcquireLockException` (or a real deadlock, created with two transactions locking two rows in opposite order) on the first attempt; the second attempt succeeds and the chunk is committed exactly once.
+- Test: a `DataIntegrityViolationException` is not retried (called once).
+- Test: concurrent resolve of the same exception still returns one `200` and one `409` (M7.14 still green).
+
+### M9.4 Failure-injection tests
+
+**What**
+
+Tests that crash processing at named points, recover, and assert that the final state is **identical** to a run that never crashed.
+
+**Why**
+
+This is the proof of §2.1. "It's idempotent" is a claim; these tests are the evidence, and they're the strongest thing on this project to talk about in an interview.
+
+**How — the fault hook**
+
+```java
+/** Named points where tests can inject a crash. A no-op in production. */
+public interface FaultInjector {
+    void at(String point);
+    FaultInjector NONE = point -> {};
+}
+```
+
+```java
+// in the import handler
+chunkWriter.commitChunk(chunk);
+faults.at("import.after-chunk-commit");
+```
+
+Production wires `FaultInjector.NONE` (a bean in `shared`). Tests replace it with a `ScriptedFaultInjector` that throws `SimulatedCrash` when a given point has been hit N times. Keep the hook interface tiny and the production implementation a no-op lambda; there's no runtime cost and no test code in production.
+
+Points to cover:
+
+| Point | What it simulates |
+|---|---|
+| `import.before-chunk-commit` | Crash with a chunk built but not committed |
+| `import.after-chunk-commit` | Crash right after a commit, before the next chunk (checkpoint must already be saved) |
+| `import.after-last-chunk` | All rows in, batch not yet marked `COMPLETED` |
+| `reconcile.after-day-commit` | One day's matches committed, the next not started |
+| `reconcile.before-summary` | All days done, run totals not yet written |
+| `exceptions.after-case-insert` | Exception raised, history row not yet written (should be one transaction, so the test proves nothing partial is visible) |
+
+**How — the test**
+
+```java
+@ParameterizedTest
+@MethodSource("faultPoints")   // every point × hit counts 1, 2, last
+void crashThenResumeEqualsCleanRun(String point, int hit) {
+    Snapshot clean = runCleanScenario();                    // separate org, no faults
+
+    var org = fixtures.newOrg();
+    faults.crashAt(point, hit);
+    startScenario(org);                                     // upload ledger + gateway, start run
+    awaitJobAttemptFails(org);                              // SimulatedCrash escapes the handler
+
+    faults.clear();
+    expireLeases(org);                                      // UPDATE job SET lease_until = now() - interval '1 second'
+    sweeper.sweep();
+    worker.drainQueue();                                    // run until no QUEUED jobs for the org
+
+    assertThat(snapshot(org)).isEqualTo(clean);
+}
+```
+
+`SimulatedCrash` must be handled like a dead worker, not like a failed job: the test runner catches it, leaves the job `RUNNING` with its lease, and stops. That's why the test expires the lease manually. If the job runner instead marks the job failed, you're testing the retry path, not the crash path. Test both, separately.
+
+**How — the snapshot**
+
+The snapshot is a canonical, id-free, timestamp-free description of the final business state, so two runs in different organizations compare equal:
+
+```sql
+-- records
+SELECT source_type, normalized_reference, amount, currency, transaction_date, source_row_number, is_duplicate_in_source
+  FROM transaction_record WHERE organization_id = :org
+ ORDER BY source_type, source_row_number;
+
+-- matches, by business key not id
+SELECT l.normalized_reference, g.normalized_reference, m.match_type, m.amount_difference
+  FROM reconciliation_match m
+  JOIN transaction_record l ON l.id = m.ledger_record_id  AND l.transaction_date = m.ledger_txn_date
+  JOIN transaction_record g ON g.id = m.gateway_record_id AND g.transaction_date = m.gateway_txn_date
+ WHERE m.organization_id = :org
+ ORDER BY 1, 2;
+
+-- exceptions
+SELECT discrepancy_key, type, status, amount_difference FROM exception_case
+ WHERE organization_id = :org ORDER BY discrepancy_key;
+
+-- counts and totals
+SELECT status, total_rows, valid_rows, error_rows FROM import_batch WHERE organization_id = :org ORDER BY source_type;
+SELECT status, matched_count, matched_amount, mismatch_count, unmatched_left_count, unmatched_right_count, duplicate_count
+  FROM reconciliation_run WHERE organization_id = :org;
+SELECT count(*) FROM import_row_error WHERE organization_id = :org;
+```
+
+Map each result to a list of records and compare with `equals` (convert amounts with `stripTrailingZeros()` or compare with `compareTo`-based comparators, because `BigDecimal.equals` is scale-sensitive). One check catches lost rows, duplicated rows, wrong totals and double-raised exceptions.
+
+**Optional: a real process kill.** The in-process test can't catch things like a missing `flush()` before a crash. For extra confidence, run the worker as a separate JVM (or container via Testcontainers' `GenericContainer` with the app image from M11.1), send `SIGKILL` (`docker kill`) at a random time during a 50k import, start a new worker, and compare snapshots. This is scenario S5 in docs/scalability.md §7. Run it in a nightly or manual CI job, not on every PR.
+
+**Pitfalls**
+
+- Comparing ids or timestamps. They always differ.
+- Snapshot queries that miss a table. When a new table is added, add it to the snapshot.
+- Fault hooks with side effects in production (logging every call at INFO, allocating). Keep the production path a no-op.
+- Running every point × every hit count with a 50k dataset. Use the small sample files in the parameterized test; use the big dataset only in the S5 run.
+
+**Done when**
+
+- The parameterized test passes for every point and hit count.
+- The S5 kill test has been run once on the 50k dataset with a matching snapshot, and the result is in `docs/benchmarks.md`.
+
+### M9.5 Synthetic dataset generator
+
+**What**
+
+`scripts/generate_dataset.py` — creates a matched pair of ledger and gateway CSVs with a fixed seed and controlled discrepancy rates, plus an `expected.json` with the exact counts a correct reconciliation must produce.
+
+**Why**
+
+Benchmarks and query plans are only meaningful on realistic volume. A fixed seed makes every run reproducible: the same command always gives byte-identical files, so a benchmark change is caused by code, not data. `expected.json` turns every benchmark run into a correctness check too.
+
+**How**
+
+Decision: **Python 3, standard library only** (`csv`, `random`, `decimal`, `argparse`, `json`, `datetime`). It's the quickest to read and change, and needs no build step. A Java CLI would also work; pick Python unless you want the practice.
+
+```
+python3 scripts/generate_dataset.py \
+    --rows 50000 --seed 42 --currency AED \
+    --start 2026-09-01 --days 30 \
+    --mismatch-rate 0.01 --missing-in-gateway 0.005 --missing-in-ledger 0.005 \
+    --duplicate-rate 0.002 --malformed-rate 0.001 \
+    --out target/datasets/50k
+```
+
+Core logic (sketch):
+
+```python
+rng = random.Random(args.seed)              # never the global random: deterministic and isolated
+for i in range(args.rows):
+    ref = f"PAY-{i:08d}"
+    day = start + timedelta(days=rng.randrange(args.days))
+    amount = (Decimal(rng.randrange(100, 5_000_000)) / 100).quantize(Decimal("0.01"))  # never float
+
+    r = rng.random()
+    if r < cut_missing_gw:
+        ledger.append(row(ref, amount, day)); expected["missing_in_gateway"] += 1
+    elif r < cut_missing_ledger:
+        gateway.append(row(ref, amount, day)); expected["missing_in_ledger"] += 1
+    elif r < cut_mismatch:
+        ledger.append(row(ref, amount, day))
+        gateway.append(row(ref, amount + Decimal("1.00"), day)); expected["amount_mismatch"] += 1
+    elif r < cut_duplicate:
+        ledger.append(row(ref, amount, day))
+        gateway += [row(ref, amount, day)] * 2; expected["duplicate"] += 1
+    else:
+        ledger.append(row(ref, amount, day)); gateway.append(row(ref, amount, day)); expected["matched"] += 1
+```
+
+Then inject malformed rows (bad date, bad currency, missing amount) into either file at `--malformed-rate`, recording each in `expected["malformed_rows"]`. Shuffle each file with the same `rng` so the order isn't sorted by reference (real files aren't). Write with the column layout and date format from `docs/reconciliation-rules.md`/M1.3 exactly.
+
+Generate amounts with `Decimal`. Python's `float` gives `0.1 + 0.2 = 0.30000000000000004`, and the CSV would contain values the ledger never had.
+
+Sizes: `--rows 50000` for the benchmark, `--rows 500000` for stress, and a "6 months of a large tenant" preset for query plans. Don't commit generated files; commit the script and the exact command (in `docs/benchmarks.md`). Generated data goes under `target/` (gitignored).
+
+Also add a `--orgs N` mode later for S3 (noisy neighbour), which writes one pair of files per organization with skewed sizes.
+
+**Pitfalls**
+
+- Using `random.random()` (global state) or `datetime.now()` in the output. Breaks reproducibility.
+- Discrepancy categories that overlap (a duplicate that's also a mismatch) without `expected.json` accounting for it. Keep the categories disjoint.
+- Generating files bigger than the M1.3 upload limit without noticing. The 500k file must still be within it, or the stress test measures the limit instead.
+
+**Done when**
+
+- Running the command twice produces byte-identical files (`shasum` matches).
+- Importing and reconciling the 50k dataset produces exactly the counts in `expected.json`.
+
+### M9.6 Benchmarks and load tests
+
+**What**
+
+Measure import throughput, reconciliation time and API latency, run the k6 scenarios S1–S6 from docs/scalability.md §7 (at a scale your machine can manage), and record everything in `docs/benchmarks.md`.
+
+**Why**
+
+docs/scalability.md is full of estimates ("≈ 20,000 rows/s", "1–3 s per day"). This task replaces estimates with measurements, and either confirms the design or shows where it's wrong. Interviewers ask "how fast is it?" — "50k rows imported in 4.2 s on an M-series laptop, p95 of 3 runs" is a far better answer than "fast".
+
+**How — the method**
+
+1. **Fix the environment.** Same machine, nothing else running, Docker resource limits written down, JVM flags written down (`-Xmx`, GC), `local` profile with `prod`-like settings (no devtools, INFO logging).
+2. **Load realistic background data first** (S4/S6 need it; plans on empty tables are meaningless): e.g. 6 months of synthetic data for 10 organizations, then `ANALYZE`.
+3. **Warm up.** The JVM compiles hot code after it's run a while (JIT), so the first run is slower. Do one discarded warmup run.
+4. **Repeat** at least 3 times and report the median, plus min and max. If runs vary by more than ~20%, find out why before trusting any number.
+5. **Measure with the app's own metrics** (`reconflow.import.duration` etc., M9.9) and with an external timer; they should agree.
+
+**How — import and reconciliation**
+
+A small script `scripts/bench_import.sh` (bash + curl + jq) that logs in, uploads both 50k files, polls until `COMPLETED`, starts a run, polls until `COMPLETED`, and prints wall-clock times. Derived numbers: rows/s for import; records compared per second for reconciliation.
+
+**How — k6 for API load**
+
+```javascript
+// perf/k6/s1-steady-browsing.js
+import http from 'k6/http';
+import { check, sleep } from 'k6';
+
+export const options = {
+  scenarios: {
+    browsing: { executor: 'constant-vus', vus: 100, duration: '30m' },
+  },
+  thresholds: {
+    'http_req_duration{kind:read}': ['p(95)<300'],     // SLO from docs/scalability.md §6
+    http_req_failed: ['rate<0.001'],
+  },
+};
+
+export function setup() { /* log in once per test org, return tokens */ }
+
+export default function (data) {
+  const r = Math.random();
+  const res = r < 0.60 ? http.get(`${BASE}/api/v1/exceptions?page=0&size=20`, auth(data), { tags: { kind: 'read' } })
+            : r < 0.85 ? http.get(`${BASE}/api/v1/exceptions/${pick(data.exceptionIds)}`, auth(data), { tags: { kind: 'read' } })
+            : r < 0.95 ? http.get(`${BASE}/api/v1/transactions?reference=PAY-0000`, auth(data), { tags: { kind: 'read' } })
+            :            http.get(`${BASE}/api/v1/reports/reconciliation?runId=${data.runId}`, auth(data), { tags: { kind: 'read' } });
+  check(res, { 'status 200': (x) => x.status === 200 });
+  sleep(30);   // 2 requests per minute per user
+}
+```
+
+One script per scenario: `s2-morning-burst.js` (uploads while S1 runs), `s3-noisy-neighbour.js`, `s4-month-end.js`, `s5-chaos.md` (manual kill steps, links M9.4), `s6-contention.js` (50 users resolving the same 10 exceptions; assert exactly one `200` per exception, rest `409`).
+
+Scale down honestly. A laptop can't run 3M × 3M with production-sized hardware. Run what fits (e.g. S4 at 300k × 300k), record the scale factor, and say in the doc which scenarios ran at full scale and which were scaled down.
+
+**How — `docs/benchmarks.md` template**
+
+```markdown
+# Benchmarks
+
+## Environment
+| | |
+|---|---|
+| Date / commit | 2026-11-xx / abc1234 |
+| Machine | e.g. MacBook, CPU model, cores, RAM |
+| Docker limits | Postgres: 4 CPU / 8 GB; app: 2 CPU / 2 GB |
+| JVM | Java 25, -Xmx1g, G1 (default) |
+| PostgreSQL | 16.x, shared_buffers=2GB, work_mem=16MB (list non-defaults) |
+| Dataset | `scripts/generate_dataset.py --rows 50000 --seed 42 ...` (exact command) |
+| Background data | 6 months × 10 orgs, N rows in transaction_record |
+
+## Method
+Warmup runs, repetitions, how time was measured.
+
+## Results
+| Benchmark | Runs | Median | Min | Max | Unit | Target (scalability.md §6) | Pass |
+|---|---|---|---|---|---|---|---|
+| Import 50k ledger rows | 3 | | | | s | | |
+| Import throughput | 3 | | | | rows/s | ≥ 1,700 | |
+| Reconcile 50k × 50k, 30 days | 3 | | | | s | | |
+| S1 read p50 / p95 / p99 | 1 | | | | ms | p95 < 300 | |
+| ... | | | | | | | |
+
+## Load scenarios S1–S6
+Per scenario: scale run (full or scaled down, and by how much), k6 summary, pass/fail against criteria.
+
+## Report queries (M8.5)
+Query, plan summary, cold/warm time.
+
+## Findings and changes
+What was slow, what changed (M9.7), before → after.
+```
+
+**Pitfalls**
+
+- Benchmarking with debug logging or devtools on.
+- Measuring once.
+- Reporting averages instead of percentiles.
+- Running k6 on the same machine and attributing its CPU use to the app. Note it, or run k6 elsewhere.
+- Benchmarking on an empty database.
+
+**Done when**
+
+- `docs/benchmarks.md` has the 50k import and reconciliation results with environment and method, plus S1–S6 results (with scale factors). This is the M9 exit criterion.
+
+### M9.7 Tuning: batch sizes, indexes, fetch strategies, N+1 checks
+
+**What**
+
+Use the M9.6 measurements to fix the biggest bottleneck, re-measure, repeat. Add automated N+1 detection so fixed problems stay fixed.
+
+**Why**
+
+Tuning without measurement optimizes the wrong thing. Tuning without regression tests lets the next change undo it.
+
+**How — the likely wins, in order of expected impact**
+
+1. **JDBC batch inserts that actually batch.** Check all of these:
+   - `reWriteBatchedInserts=true` on the PostgreSQL JDBC URL. Without it, pgJDBC sends a batch of 500 inserts as 500 statements in one round trip; with it, it rewrites them into multi-row `INSERT … VALUES (…), (…), …`. Often a 2–5× gain.
+   - If imports go through Hibernate: `spring.jpa.properties.hibernate.jdbc.batch_size: 500`, `order_inserts: true`. Batching is **disabled** for `GenerationType.IDENTITY` ids. ReconFlow's ids are UUIDv7 generated by the application (V1 conventions), so batching works; that's one of the reasons for that choice. (TASKS.md M5.14 mentions "sequence-based IDs" — app-generated UUIDv7 achieves the same goal.)
+   - Better still for the import hot path: `JdbcClient`/`JdbcTemplate.batchUpdate`, or PostgreSQL `COPY` via `CopyManager` into a staging table followed by `INSERT … SELECT … ON CONFLICT DO NOTHING`. `COPY` is the fastest way to load rows into PostgreSQL. Measure each before choosing.
+   - Batch size: try 100, 500, 1,000, 5,000 and plot rows/s. It usually flattens out around 500–1,000.
+2. **Indexes.** Use `pg_stat_statements` to find the queries with the highest total time (add it to the Compose Postgres: `shared_preload_libraries=pg_stat_statements`, then `CREATE EXTENSION pg_stat_statements;`). `EXPLAIN (ANALYZE, BUFFERS)` the top ones. Add indexes only for queries that need them; every index costs inserts.
+3. **Fetch strategies.** In JPA, set `@ManyToOne(fetch = LAZY)` everywhere (the JPA default for `@ManyToOne` is `EAGER`). For list endpoints, use DTO projections or `JOIN FETCH`/`@EntityGraph` for what the response needs. Never return entities from controllers.
+4. **Connection pool.** Check `hikaricp.connections.pending` under load. A bigger pool isn't automatically faster; PostgreSQL works best with roughly (CPU cores × 2) active connections. docs/scalability.md §2.5 already budgets ~37.
+
+**How — N+1 detection**
+
+An N+1 is one query for a list, then one more query per item to load a relation lazily: 21 queries for a page of 20 exceptions. It's invisible in tests with 2 rows and slow in production with 2,000.
+
+Add a query counter for tests. Two options:
+
+- **datasource-proxy** (`net.ttddyy:datasource-proxy`): wrap the test `DataSource` with `ProxyDataSourceBuilder.create(ds).countQuery().build()` and read `QueryCountHolder.get(...)`.
+- **Hibernate statistics** (`hibernate.generate_statistics: true` in tests only): `sessionFactory.getStatistics().getPrepareStatementCount()`. Only counts Hibernate's statements, not `JdbcClient`'s.
+
+Prefer datasource-proxy, because it sees every statement. Then:
+
+```java
+@Test
+void listingExceptionsUsesConstantQueries() {
+    fixtures.exceptions(org, 50);
+    queryCounter.reset();
+    api.as(org.investigator()).get("/api/v1/exceptions?size=50");
+    assertThat(queryCounter.selects()).isLessThanOrEqualTo(3);   // page, count, maybe one join
+}
+```
+
+Write one per list endpoint and one per detail endpoint that shows related data (exception detail with records and notes). The check is "the number of queries doesn't grow with the number of rows": run with 5 rows and with 50 and assert the counts are equal.
+
+**Pitfalls**
+
+- Tuning by intuition ("let's add Redis").
+- Changing several things at once, so you can't tell which helped.
+- `spring.jpa.open-in-view` — already `false` (M2.7). With it on, lazy loading in the view layer hides N+1s until production.
+
+**Done when**
+
+- Each change has a before/after row in `docs/benchmarks.md` "Findings and changes".
+- N+1 tests exist for every list and detail endpoint.
+
+### M9.8 Every list endpoint paginates, with a maximum page size
+
+**What**
+
+No endpoint can return an unbounded list. Default page size 50, maximum 200 (phase-M1 api-design §4; values above the maximum are clamped). Sorting limited to an allow-list of indexed fields.
+
+**Why**
+
+`GET /api/v1/transactions?size=10000000` is a free denial-of-service: one request makes the server load millions of rows. An arbitrary sort (`?sort=raw_values`) on an unindexed column forces a full sort of a huge table, which is the same attack in another form.
+
+**How**
+
+```yaml
+spring:
+  data:
+    web:
+      pageable:
+        default-page-size: 50
+        max-page-size: 200
+```
+
+Spring Data **clamps** silently: `size=5000` becomes 200. That's convenient but surprising. Decide between clamping (document it, and return the effective `size` in the response) and rejecting with `400`. Clamping is fine for v1; document it in `api-design.md`.
+
+Sorting: validate `Pageable.getSort()` against a per-endpoint allow-list, and return `400` with a `ProblemDetail` for anything else:
+
+```java
+static final Set<String> SORTABLE = Set.of("createdAt", "amountDifference", "status");
+```
+
+Page versus slice: a `Page` runs an extra `count(*)` query to compute total pages. On `transaction_record` with millions of rows, the count can cost more than the page itself. For `GET /api/v1/transactions` use `Slice` (has `hasNext`, no total) or keyset pagination (`WHERE (transaction_date, id) < (:lastDate, :lastId) ORDER BY transaction_date DESC, id DESC LIMIT 21`). Keyset pagination stays fast at page 10,000; `OFFSET` gets slower the deeper you go, because the database still reads and discards all the skipped rows. Use `Page` for small tables (imports, runs, exceptions).
+
+Response shape: Spring Data warns against serializing `PageImpl` directly because its JSON isn't stable. Use `@EnableSpringDataWebSupport(pageSerializationMode = VIA_DTO)` or your own `PageResponse<T>` record. Pick one in M2/M5 and keep it.
+
+Test: a parameterized test calls every list endpoint (collected from the `RequestMappingHandlerMapping` or a hand-kept list) with `size=1000` and asserts at most 100 items, and with `sort=password_hash` and asserts `400`.
+
+**Done when**
+
+- Max page size configured, sort allow-lists in place, the parameterized test passes, and `api-design.md` documents both.
+
+### M9.9 Micrometer metrics
+
+**What**
+
+Business and processing metrics, exposed alongside the defaults Spring Boot already provides (HTTP, JVM, Hikari, Tomcat).
+
+**Why**
+
+Logs tell you what happened to one request. Metrics tell you how the system behaves overall and over time: "imports got 3× slower since Tuesday's deploy". The SLOs in docs/scalability.md §6 can only be checked with metrics.
+
+**How — the metrics**
+
+Micrometer names use dots; the Prometheus registry converts them to snake_case and adds unit suffixes (`reconflow.import.duration` → `reconflow_import_duration_seconds`; counters get `_total`).
+
+| Name | Type | Tags (all low-cardinality) | Recorded where |
+|---|---|---|---|
+| `reconflow.import.rows` | Counter | `source_type`, `outcome` = `valid`/`rejected` | After each chunk commit |
+| `reconflow.import.duration` | Timer | `source_type`, `outcome` = `completed`/`completed_with_errors`/`failed` | Batch reaches a final state |
+| `reconflow.reconciliation.duration` | Timer | `outcome` | Run reaches a final state |
+| `reconflow.reconciliation.results` | Counter | `result` = `matched`/`mismatch`/`unmatched_left`/`unmatched_right`/`duplicate` | Run completion, incremented by the run's counts |
+| `reconflow.exceptions.open` | Gauge | `type` | Refreshed by a scheduled query, see below |
+| `reconflow.jobs.queue.wait` | Timer | `type` | At claim: `now() - created_at` |
+| `reconflow.jobs.queued` | Gauge | `type` | Scheduled query |
+| `reconflow.jobs.completed` | Counter | `type`, `outcome` = `done`/`retried`/`failed` | Job runner |
+| `reconflow.jobs.lease.lost` | Counter | `type` | Fencing failure (M9.1). Should always be 0 |
+| `reconflow.jobs.orphaned` | Counter | `type` | Consistency check (M9.1) |
+| `reconflow.partitions.default.rows` | Gauge | — | Partition maintenance (M9.N1). Alert if > 0 |
+
+```java
+@Component
+class ImportMetrics {
+    private final MeterRegistry registry;
+
+    void rows(SourceType source, long valid, long rejected) {
+        registry.counter("reconflow.import.rows", "source_type", source.name(), "outcome", "valid").increment(valid);
+        registry.counter("reconflow.import.rows", "source_type", source.name(), "outcome", "rejected").increment(rejected);
+    }
+
+    void completed(SourceType source, ImportStatus status, Duration took) {
+        Timer.builder("reconflow.import.duration")
+             .tag("source_type", source.name()).tag("outcome", status.name().toLowerCase())
+             .publishPercentileHistogram()           // buckets, so Prometheus can compute p95 across instances
+             .register(registry)
+             .record(took);
+    }
+}
+```
+
+**Gauges from database counts.** A gauge is read on every scrape (every 15 s). If it runs `SELECT count(*) …` each time, and there are several instances, that's a steady background load, and a slow query can stall the scrape. Instead, refresh an `AtomicLong` from a `@Scheduled` query every 60 s (one instance is enough — run it in the `worker` profile) and point the gauge at the `AtomicLong`. Note that these counts span all organizations, and RLS will hide rows unless the query runs as a role or in a context that allows cross-tenant counts. Use a dedicated, read-only system path for it and document why.
+
+**Cardinality (see §2.6).** No `organization_id`, `batch_id`, `run_id`, `user_id` or raw reference in tags. If someone asks "which tenant's imports are slow?", answer it from logs (each import logs its org and duration at completion) or from the database, not from metrics. With 100 tenants a per-org tag would *survive*, but the number keeps growing with every customer, and it's the habit an interviewer is checking for. Also check that `http.server.requests` uses the URI *template* (`/api/v1/exceptions/{id}`), which Spring does by default, not the actual URL with ids in it.
+
+**SLO histogram buckets.** Configure buckets at the SLO boundaries so "what fraction of requests met the SLO" is exact rather than estimated:
+
+```yaml
+management:
+  metrics:
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+      slo:
+        http.server.requests: 100ms, 300ms, 500ms, 1s
+        reconflow.import.duration: 30s, 2m, 5m
+```
+
+**Done when**
+
+- Every metric above appears at `/actuator/prometheus` after an import and a run, with the stated tags.
+- A test asserts the counters' values after importing the sample files (use `SimpleMeterRegistry` or the real registry in an integration test).
+
+### M9.10 Prometheus endpoint and Grafana
+
+**What**
+
+Expose `/actuator/prometheus`; add Prometheus and Grafana to `compose.yaml` under an `observability` profile; provision a dashboard and a few alert rules.
+
+**How — the app**
+
+Add `io.micrometer:micrometer-registry-prometheus` (version managed by Boot). Expose the endpoint, ideally on a separate management port so it's never reachable through the public load balancer:
+
+```yaml
+management:
+  server:
+    port: 8081            # internal only; the LB forwards 8080
+  endpoints:
+    web:
+      exposure:
+        include: health, info, prometheus
+```
+
+Security: permit `/actuator/prometheus` and `/actuator/health/**` without a token, but only on the management port. Check how Boot 4 applies the security filter chain to a separate management port, and write a test that `GET :8080/actuator/prometheus` is not served (verify against the Boot 4 docs).
+
+**How — Compose**
+
+```yaml
+services:
+  prometheus:
+    image: prom/prometheus:v3.x.y          # pin the exact version you test with
+    profiles: [observability]
+    volumes:
+      - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./ops/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports: ["9090:9090"]
+    extra_hosts: ["host.docker.internal:host-gateway"]   # reach the app running on the host
+
+  grafana:
+    image: grafana/grafana:12.x.y          # pin
+    profiles: [observability]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set in .env}
+    volumes:
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports: ["3000:3000"]
+
+volumes:
+  grafana-data:
+```
+
+`ops/prometheus/prometheus.yml`:
+
+```yaml
+global:
+  scrape_interval: 15s
+rule_files: [/etc/prometheus/alerts.yml]
+scrape_configs:
+  - job_name: reconflow
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ['host.docker.internal:8081']
+```
+
+`docker compose --profile observability up` starts it; the default `docker compose up` stays light.
+
+**Dashboard** (`ops/grafana/dashboards/reconflow.json`, provisioned from `ops/grafana/provisioning/`): rows for API (request rate, p95 latency by URI template, error rate), imports (rows/s valid vs rejected, duration p95), reconciliation (duration, results by type), jobs (queued, queue wait p95, failed, lease lost), database (Hikari active/pending, from Boot's defaults), JVM (heap, GC pause).
+
+Example queries:
+
+```
+histogram_quantile(0.95, sum by (le, uri) (rate(http_server_requests_seconds_bucket[5m])))
+sum by (outcome) (rate(reconflow_import_rows_total[5m]))
+```
+
+**Alerts** (`ops/prometheus/alerts.yml`): `reconflow_partitions_default_rows > 0`; job queue wait p95 > 2 min for 10 min; `increase(reconflow_jobs_completed_total{outcome="failed"}[15m]) > 0`; `increase(reconflow_jobs_lease_lost_total[1h]) > 0`; API p95 above SLO for 10 min. Alertmanager routing is out of scope for v1; the rules show in the Prometheus UI.
+
+**Done when**
+
+- With the observability profile up and the app running, the dashboard shows live data during a 50k import (take a screenshot for `docs/benchmarks.md` and the README).
+
+### M9.11 Liveness and readiness health groups, and graceful shutdown
+
+**What**
+
+Separate liveness and readiness endpoints with the right checks in each, and a shutdown sequence that never drops a request or abandons a chunk.
+
+**How — health groups**
+
+```yaml
+management:
+  endpoint:
+    health:
+      probes:
+        enabled: true          # adds /actuator/health/liveness and /readiness
+      group:
+        liveness:
+          include: livenessState
+        readiness:
+          include: readinessState, db
+```
+
+- **Liveness** includes only `livenessState`, the application's own view of whether it's broken. Not the database, not MinIO. See §2.7 for why.
+- **Readiness** includes `readinessState` and `db`. Consider adding object storage for the `api` profile (uploads fail without it). For the `worker` profile, readiness matters less (it receives no HTTP traffic), but keep it consistent.
+- Set health indicators to time out quickly (a slow DB check shouldn't take the probe past the platform's timeout).
+
+**How — graceful shutdown**
+
+```yaml
+server:
+  shutdown: graceful           # stop accepting new requests, finish in-flight ones
+spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+```
+
+On `SIGTERM`, Spring Boot marks readiness `REFUSING_TRAFFIC`, the web server stops accepting new connections and waits for in-flight requests up to the timeout, then beans are destroyed.
+
+The worker needs its own stop logic. Make the job runner a `SmartLifecycle` bean:
+
+```java
+@Override
+public void stop(Runnable callback) {
+    accepting = false;                         // 1. stop claiming new jobs
+    executor.shutdown();                       // 2. let current handlers reach their next chunk boundary
+    // handlers check `accepting` between chunks; at a boundary they commit and return early
+    if (!executor.awaitTermination(25, SECONDS)) executor.shutdownNow();
+    releaseOwnedLeases();                      // 3. UPDATE job SET status='QUEUED', run_after=now(),
+                                               //    locked_by=NULL, lease_until=NULL
+                                               //    WHERE locked_by = :me AND status='RUNNING'
+    callback.run();
+}
+```
+
+Releasing leases on the way out means another worker picks the job up immediately instead of waiting up to 2 minutes for the lease to expire. If the process is killed before it gets there, the lease expiry still recovers it (M9.1) — graceful shutdown is an optimization, crash recovery is the guarantee.
+
+Make sure the platform's grace period (e.g. Kubernetes `terminationGracePeriodSeconds`, Fly/Render equivalents) is longer than `timeout-per-shutdown-phase`.
+
+**Done when**
+
+- Stopping the DB container makes readiness `DOWN` and liveness stays `UP`.
+- Test: send `SIGTERM` (or close the context) during an import; the job is back in `QUEUED` within seconds, and another worker completes it with a correct snapshot.
+
+### M9.12 Kafka ADR — is it needed?
+
+**What**
+
+`docs/adr/NNNN-kafka.md`: a decision, based on the M9.6 measurements, on whether to introduce Kafka.
+
+**Why**
+
+TASKS.md says "only if M9.6 shows a need". The ADR records the evidence either way. "I measured it and didn't need Kafka" is a stronger interview answer than "I added Kafka".
+
+**How**
+
+Use the triggers from docs/scalability.md §8 as the decision criteria:
+
+| Criterion | Threshold | Measured value |
+|---|---|---|
+| Job claim query in the top 5 by total time in `pg_stat_statements` | Yes/No | |
+| Sustained job rate | > 50 jobs/s | |
+| Job queue wait p95 at the morning burst | > 5 min after adding workers | |
+| Need to fan out the same event to several independent consumers or external systems | Yes/No | |
+| Need to replay history of events | Yes/No | |
+
+**Expected outcome:** at the measured load (hundreds of jobs per hour, i.e. far below 1 job/s), none of these is met. The ADR says "Decision: no Kafka in v1", records the numbers, and lists the triggers that would reopen it. Then skip M9.13–M9.15 in the code, but still read the sections below: these are standard interview topics, and you can explain how you *would* add Kafka.
+
+A point to make in the ADR: the `job` table already gives the main property people use Kafka for here, durable work handed from the API to workers, **without the dual-write problem**, because enqueueing commits in the same transaction as the business row. The transactional outbox (next section) exists precisely to give Kafka that same property.
+
+### M9.13 Transactional outbox (only if the ADR says yes)
+
+**The dual-write problem.** An import completes; the code commits the batch as `COMPLETED` and then publishes `ImportCompleted` to Kafka. If the process crashes between the two, the database says completed but no event was sent. If you publish first and the commit fails, consumers react to an import that never completed. There's no transaction across PostgreSQL and Kafka.
+
+**The outbox.** Write the event into a table **in the same transaction** as the business change, then publish from that table separately:
+
+```sql
+CREATE TABLE outbox_event (
+    id             UUID        PRIMARY KEY,     -- also the event id consumers deduplicate on
+    aggregate_type TEXT        NOT NULL,        -- IMPORT_BATCH
+    aggregate_id   UUID        NOT NULL,
+    event_type     TEXT        NOT NULL,        -- ImportCompleted
+    payload        JSONB       NOT NULL,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    published_at   TIMESTAMPTZ
+);
+CREATE INDEX outbox_unpublished_idx ON outbox_event (created_at) WHERE published_at IS NULL;
+```
+
+A **relay** publishes and marks rows:
+
+- **Polling relay:** every second, `SELECT … WHERE published_at IS NULL ORDER BY created_at LIMIT 100 FOR UPDATE SKIP LOCKED`, send each to Kafka, wait for the broker acknowledgement, set `published_at`. Simple, and the same pattern as the job table.
+- **CDC relay:** Debezium reads the PostgreSQL write-ahead log and publishes outbox inserts. Lower latency and no polling load, but another system to run.
+
+The relay can crash after sending and before marking, so it can publish an event twice. The outbox is therefore **at-least-once**, and consumers must be idempotent (M9.14).
+
+**Ordering.** Kafka only orders messages within a partition. Use the aggregate id (or organization id) as the message key so all events for one batch go to the same partition, in order. Publish from the relay in `created_at` order per key.
+
+**Spring Modulith note:** Modulith's event publication registry plus its Kafka externalization implements this pattern. Worth knowing; building it by hand once teaches more.
+
+### M9.14 Idempotent consumers and a dead-letter topic (only if the ADR says yes)
+
+**Idempotent consumer.** Record each processed event id in the same transaction as the consumer's effect:
+
+```sql
+CREATE TABLE processed_event (
+    consumer    TEXT        NOT NULL,
+    event_id    UUID        NOT NULL,
+    processed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (consumer, event_id)
+);
+```
+
+```java
+@KafkaListener(topics = "reconflow.import-completed", groupId = "reconciliation-trigger")
+@Transactional
+void on(ImportCompleted event) {
+    int inserted = jdbc.sql("""
+            INSERT INTO processed_event (consumer, event_id) VALUES ('reconciliation-trigger', :id)
+            ON CONFLICT DO NOTHING
+            """).param("id", event.eventId()).update();
+    if (inserted == 0) return;          // already processed: a redelivery
+    runs.requestFor(event);             // the effect, same transaction
+}
+```
+
+Commit the Kafka offset **after** the DB transaction commits (Spring Kafka's default with `AckMode.RECORD`/`BATCH` and a non-transactional producer). A crash in between means redelivery, which the table above absorbs.
+
+**Dead-letter topic.** A message that can never be processed (a bug, malformed payload) would otherwise block its partition forever, retried in a loop. Spring Kafka's `DefaultErrorHandler` with a `DeadLetterPublishingRecoverer` retries with backoff, then sends the message to `<topic>.DLT` with the exception in its headers, and moves on:
+
+```java
+@Bean
+DefaultErrorHandler errorHandler(KafkaTemplate<Object, Object> template) {
+    var handler = new DefaultErrorHandler(new DeadLetterPublishingRecoverer(template),
+                                          new ExponentialBackOff(1_000, 2.0) {{ setMaxElapsedTime(60_000); }});
+    handler.addNotRetryableExceptions(DeserializationException.class, ValidationException.class);
+    return handler;
+}
+```
+
+Same classification as M9.3: permanent errors go straight to the DLT, transient ones are retried. Monitor the DLT (a metric on its size) and have a documented way to replay it after a fix.
+
+### M9.15 Kafka integration tests (only if the ADR says yes)
+
+Use Testcontainers' Kafka module (`org.testcontainers:kafka`, with the `apache/kafka` image) and `@ServiceConnection` so Spring Boot configures `spring.kafka.bootstrap-servers` automatically. Tests:
+
+- Business change and outbox row commit together; a rollback leaves neither.
+- Relay publishes each outbox row; killing it between send and mark causes a duplicate send, and the consumer applies the effect once.
+- A poison message lands on the DLT; the next message on the same partition is still processed.
+- Events for one aggregate arrive in order.
+
+Use Awaitility (`await().atMost(10, SECONDS).untilAsserted(...)`) for asynchronous assertions, never `Thread.sleep`.
+
+### M9.N1 Partition maintenance job (from docs/scalability.md §9)
+
+**What**
+
+A scheduled job that keeps monthly `transaction_record` partitions created at least 3 months ahead, and watches the default partition.
+
+**Why**
+
+V1 created partitions up to 3 months after the migration ran. Once real dates pass that window, new rows land in `transaction_record_default`. That works, but it's a trap: PostgreSQL **refuses to create a monthly partition for a range while the default partition holds rows in that range** ("updated partition constraint for default partition would be violated"). The longer it goes unnoticed, the bigger the manual repair.
+
+**How**
+
+In the `worker` profile:
+
+```java
+@Scheduled(cron = "0 15 2 * * *", zone = "UTC")   // daily, 02:15 UTC
+void maintainPartitions() {
+    jdbc.sql("""
+        SELECT create_transaction_record_partition(m::date)
+          FROM generate_series(date_trunc('month', now()),
+                               date_trunc('month', now()) + interval '3 months',
+                               interval '1 month') AS m
+        """).query().listOfRows();
+    defaultRows.set(jdbc.sql("SELECT count(*) FROM transaction_record_default").query(Long.class).single());
+}
+```
+
+Two workers may run it at the same time. `CREATE TABLE IF NOT EXISTS` is idempotent, but two concurrent creations of the same partition can still race and one fails. Wrap the job in a transaction-scoped advisory lock (`SELECT pg_try_advisory_xact_lock(<constant>)`, skip if false), or use ShedLock. The advisory lock needs no extra dependency.
+
+The count on the default partition feeds the `reconflow.partitions.default.rows` gauge and the alert from M9.10. If it's ever non-zero, the repair runbook (`docs/runbooks/default-partition.md`) is: create a new table for the month, move the rows from the default partition into it in a transaction, then attach it as a partition.
+
+Also: the import validator should reject transaction dates far in the future or past (for example, more than 1 year ahead), so a typo like `2062` doesn't land in the default partition at all. Add this rule to `reconciliation-rules.md`.
+
+Note for `NOT VALID`-free attaches: creating partitions with `PARTITION OF` (what the function does) is a short operation, but it takes a lock on the parent. Running it at 02:15 UTC keeps it away from the morning import burst.
+
+**Done when**
+
+- Test: with a fixed clock 5 months after V1, run the job → partitions exist through month +3, and running it twice is harmless.
+- The default-partition gauge and alert exist.
+
+### M9.N2 Archival job (outline — design now, build when data ages)
+
+docs/scalability.md §5.3: keep 13 months hot in PostgreSQL, archive older months to object storage as Parquet, then drop the partition. Nothing is 13 months old during v1 development, so write the design and runbook now, build it later.
+
+The steps, per month and per organization:
+
+1. **Export** the month's rows. Either `COPY (SELECT … FROM transaction_record_YYYY_MM WHERE organization_id = …) TO STDOUT (FORMAT csv)` streamed and gzipped to object storage, or Parquet (smaller, columnar, queryable with DuckDB/Athena) using DuckDB's PostgreSQL scanner or a Parquet writer library. Parquet is the target; gzipped CSV is the easy first version.
+2. **Verify**: row count and a checksum (e.g. `sum(amount)` and a hash of ordered ids) computed in the database must match the same figures computed from the archived file. Store them in an `archive_manifest` table.
+3. **Archive dependents first.** `reconciliation_match` and `exception_case_record` have foreign keys into the partition (V1 comments note this). Their rows for that month must be archived and deleted first, or the detach fails.
+4. **Detach and drop**: `ALTER TABLE transaction_record DETACH PARTITION transaction_record_YYYY_MM CONCURRENTLY;` then `DROP TABLE`. `CONCURRENTLY` (PostgreSQL 14+) avoids blocking queries on the parent, but can't run inside a transaction block and can't be used while a default partition exists — check that against your setup.
+5. **Audit** an `ARCHIVED_PARTITION` event.
+
+Restore path: load the archived file into a staging table for a one-off investigation. Archived data isn't served by the API in v1; document that.
+
+### M9.N3 Quarterly restore drill
+
+**What**
+
+Actually restore a backup into a fresh database, start the app against it, and check it works. Write down how long it took. That's your measured RTO.
+
+**Why**
+
+A backup that has never been restored is a hope, not a backup. The RPO and RTO in docs/scalability.md §6 (≤ 5 min, ≤ 1 h) are claims until a drill measures them.
+
+**How**
+
+Locally (and once deployed in M11, against the managed provider's point-in-time recovery):
+
+1. Take a backup: `pg_dump -Fc` (logical) of the benchmark database. With managed PostgreSQL, use its PITR to restore to a timestamp.
+2. Restore into a new empty database: `pg_restore -d reconflow_restore …`.
+3. Start the app against it with `ddl-auto=validate`: Flyway sees all migrations applied, Hibernate validates the schema.
+4. Run checks: the snapshot queries from M9.4 for a known organization match the source; `/actuator/health` is `UP`; one report query returns the expected totals.
+5. Record in `docs/runbooks/restore-drill.md`: date, backup size, restore duration, check results, problems found.
+
+Remember: `pg_dump` doesn't include roles (M10.7 adds separate roles); `pg_dumpall --roles-only` does. A restore that loses the app role is a classic drill finding.
+
+**Done when**
+
+- One drill completed and recorded, with the measured restore time.
+
+---
+
+## 5. Testing strategy
+
+| Level | What | Where |
+|---|---|---|
+| Unit | Transient-failure classifier, backoff function, metric tag values, page/sort validation | `shared/**`, `jobs/**` tests |
+| Integration (every PR) | Job queue concurrency and fairness, lease expiry and fencing, retry wraps the transaction, N+1 query counts, page-size caps, partition maintenance, health groups | Testcontainers PostgreSQL |
+| Failure injection (every PR) | Every fault point × hit count on the small sample files; snapshot equals clean run | `FailureInjectionIT` |
+| Nightly / manual | Real `SIGKILL` of a worker during a 50k import (S5); full k6 scenarios | CI scheduled job or by hand, results in `docs/benchmarks.md` |
+| Kafka (if built) | Outbox atomicity, idempotent consumer, DLT, ordering | Testcontainers Kafka |
+
+Keep the per-PR suite under ~10 minutes. Large datasets and k6 don't belong in it.
+
+---
+
+## 6. Exit criteria checklist
+
+- [ ] Stuck `PROCESSING`/`RUNNING` work recovers through the job lease; out-of-attempts work ends `FAILED` with a reason and an audit event.
+- [ ] Fencing prevents a worker that lost its lease from committing.
+- [ ] Job queue tests: no double claim, fairness cap (soft or strict, documented), poison jobs, backoff.
+- [ ] Transient DB errors retried with backoff outside the transaction; permanent errors and `409` conflicts not retried.
+- [ ] Failure-injection tests pass for every fault point; the S5 kill test has been run once.
+- [ ] `scripts/generate_dataset.py` is deterministic and its `expected.json` matches a real reconciliation.
+- [ ] `docs/benchmarks.md` has the 50k import and reconciliation results with environment and method, plus S1–S6 (with scale factors).
+- [ ] Tuning changes recorded with before/after; N+1 tests for every list and detail endpoint.
+- [ ] Every list endpoint caps page size and validates sort fields.
+- [ ] Metrics visible in Prometheus and on the Grafana dashboard; no high-cardinality tags.
+- [ ] Separate liveness and readiness groups (DB only in readiness); graceful shutdown releases leases.
+- [ ] Kafka ADR written with measured values.
+- [ ] Partition maintenance scheduled, default-partition alert in place; archival designed; one restore drill recorded.
+
+---
+
+## 7. Interview questions this phase prepares you for
+
+**How do you make a background job safe to run twice?**
+Make its effects idempotent: checkpoints so a resumed job skips finished work, and unique constraints so anything repeated is rejected by the database. Then the system can use at-least-once execution, which is achievable, and still get exactly-once effects. I proved it with failure-injection tests that crash at named points and compare the final state with a clean run.
+
+**What's a lease, and what problem does fencing solve?**
+A lease is a lock with an expiry that the holder must keep renewing, so a dead worker's lock frees itself. Fencing handles a worker that's only paused: its lease expires, someone else takes over, and then it wakes up. Every write checks ownership in the same transaction, so a worker that lost the lease can't commit anything.
+
+**Why `FOR UPDATE SKIP LOCKED` for a job queue?**
+`FOR UPDATE` locks the claimed row so no one else can claim it; `SKIP LOCKED` makes other workers skip rows that are already locked instead of waiting. Many workers can claim concurrently without blocking each other and without double-claiming. For hundreds of jobs per hour, it's simpler than a broker and has no dual-write problem because enqueueing is part of the business transaction.
+
+**Which errors do you retry, and which don't you?**
+Retry transient ones: serialization failures, deadlocks, dropped connections, timeouts, with exponential backoff and jitter and a cap. Don't retry permanent ones like validation or constraint violations, because the result won't change. And never silently retry an optimistic-lock conflict in a user request; return 409, because retrying would overwrite another user's change.
+
+**Why must a retry wrap the transaction rather than run inside it?**
+After an error, PostgreSQL marks the transaction aborted, and every further statement fails until it rolls back. The retry has to roll back and begin a new transaction, so the retry interceptor must sit outside the transactional one.
+
+**Why should liveness not check the database?**
+Liveness failure causes a restart. If the database is down, restarting every app instance doesn't fix it and causes a reconnect storm when it returns. Readiness is the right place: it takes the instance out of rotation until the dependency recovers.
+
+**What's metric cardinality, and why not tag metrics with tenant id?**
+Each unique combination of tag values is a separate time series. Unbounded values like tenant, user or batch ids multiply the series count without limit and can take down the monitoring system. Per-tenant detail goes in logs or the database.
+
+**Why report p95/p99 instead of averages, and how do you get them across instances?**
+Averages hide the slow tail that users actually notice. Percentiles can't be averaged across instances, so each instance publishes histogram buckets, which can be summed, and Prometheus estimates the percentile from the combined buckets.
+
+**Why didn't you use Kafka?**
+I measured the load: hundreds of jobs per hour, with the claim query nowhere near the top of `pg_stat_statements`. A PostgreSQL job queue handles that with no extra infrastructure and no dual-write problem. I wrote down the thresholds that would change the decision, and if we crossed them I'd add Kafka with a transactional outbox and idempotent consumers.
+
+**What's the transactional outbox pattern?**
+Write the event to an outbox table in the same database transaction as the business change, then a separate relay publishes it to the broker and marks it sent. That removes the gap where the database commits but the publish is lost. Since the relay can publish twice, consumers deduplicate by event id.
+
+**How do you know your backups work?**
+By restoring them. I run a restore drill into a fresh database, start the app against it, run integrity checks, and record how long it took. That measured time is the real RTO.
+
+---
+
+## 8. Common mistakes
+
+- Treating "exactly-once delivery" as achievable, instead of at-least-once with idempotent effects.
+- Using the hostname as the worker id.
+- Marking the domain row `FAILED` when a lease expires, even though the job will be retried.
+- Retrying inside the transaction, retrying constraint violations, or retrying `409` conflicts.
+- Benchmarking once, on an empty database, with debug logging, and reporting the mean.
+- Changing several things at once while tuning.
+- Tagging metrics with tenant, user, batch or run ids.
+- Running a `count(*)` query on every metrics scrape.
+- Putting the database in the liveness probe.
+- Forgetting to release leases on shutdown, so every deploy adds a 2-minute stall.
+- Adding Kafka without a measured reason, or without an outbox and idempotent consumers.
+- Ignoring the partition window until rows pile up in the default partition.
+- Assuming backups work without ever restoring one.

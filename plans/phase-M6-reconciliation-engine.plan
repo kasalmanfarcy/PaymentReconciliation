@@ -1,0 +1,1306 @@
+# Phase M6 — Reconciliation Engine
+
+**Status:** Not started · **Tasks:** TASKS.md M6.1–M6.22 · **Depends on:** M3 (tenant context, permissions), M4 (audit), M5 (normalized `transaction_record` rows, job runner) · **Date:** 2026-11-01
+
+This is the core of ReconFlow. It takes the normalized ledger and gateway records that M5 imported, compares them for a period and currency, and produces three kinds of output: **matches**, **exception cases**, and **summary totals** on the run. Everything in M7 (investigation) and M8 (reporting) reads what this phase writes.
+
+The engine has to be correct before it's fast, and safe to repeat before it's clever. Every design choice below follows from three promises:
+
+1. **Every in-scope record ends up in exactly one place** for a run: in one match, or linked to one exception. Nothing is lost or counted twice.
+2. **Running the same thing twice changes nothing.** No duplicate matches, no duplicate active exceptions.
+3. **A crash in the middle is harmless.** The run resumes from a checkpoint and ends in the same state as a clean run.
+
+---
+
+## 1. Goal
+
+When this phase is done:
+
+- `POST /api/v1/reconciliation-runs` accepts a period, a currency and a source pair, and returns `202 Accepted` with a run ID. Repeating the request returns the same run (`200`).
+- A background worker runs the matching in day-sized chunks with a resumable checkpoint, and moves the run `PENDING → RUNNING → COMPLETED | FAILED`.
+- The engine produces `EXACT` matches and exception cases of type `MISSING_IN_GATEWAY`, `MISSING_IN_LEDGER`, `AMOUNT_MISMATCH`, `CURRENCY_MISMATCH` and `DUPLICATE_IN_SOURCE`.
+- `GET` endpoints show the run, its summary totals and its matches.
+- Tests prove the worked examples from projectoverview.md §5 produce exactly the expected outcome for every record, and a property-based test proves promise 1 on random data.
+
+---
+
+## 2. Concepts to understand first
+
+### 2.1 Set-based versus row-by-row processing
+
+There are two ways to match 100,000 ledger rows against 100,000 gateway rows:
+
+| Approach | How | Cost |
+|---|---|---|
+| **Row-by-row (in Java)** | Load both sides into `Map<String, List<Record>>`, loop, decide, `save()` each result | Every row crosses the network twice and lives in heap. A monthly run for a large tenant (3M × 3M) needs over a gigabyte of objects |
+| **Set-based (in SQL)** | One `INSERT … SELECT … GROUP BY` statement classifies every group and writes the matches | The data never leaves PostgreSQL. The database does a hash aggregate, which is what it's built for |
+
+docs/scalability.md §2.4 and decision D5 chose **set-based**. Java still orchestrates the run (lifecycle, chunking, checkpoints, calling the exceptions module), and only the ~2% of groups that become exceptions are pulled into Java.
+
+### 2.2 Grouping, not pairing
+
+The naive mental model is "for each ledger record, find its gateway partner". That model breaks on duplicates: if the gateway has `TXN-104` twice, which one is the partner? Any answer is an arbitrary pick, and the task list forbids arbitrary picks (M6.8).
+
+The correct model is **group, then classify**:
+
+1. Put every in-scope record into a group keyed by `(normalized_reference, transaction_type)`.
+2. Count what's in each group per source and per currency.
+3. The counts decide the outcome. A group with one ledger record and one gateway record in the same currency is a candidate match. Anything else is an exception.
+
+Because each record belongs to exactly one group, and each group gets exactly one outcome, promise 1 holds by construction.
+
+### 2.3 Idempotency
+
+An operation is **idempotent** if doing it twice has the same effect as doing it once. ReconFlow needs idempotency at three levels:
+
+| Level | Threat | Mechanism |
+|---|---|---|
+| **Request** | The client times out and retries `POST /reconciliation-runs`; two runs start | `UNIQUE (organization_id, idempotency_key)` on `reconciliation_run` |
+| **Job** | A worker crashes after committing some days; the job is re-delivered | Checkpoint (`last_completed_date`) + `ON CONFLICT DO NOTHING` on matches |
+| **Business outcome** | A second run over an overlapping period raises the same discrepancy again | Partial unique index `exception_case_active_uk` on `(organization_id, discrepancy_key) WHERE status <> 'RESOLVED'` |
+
+The job runner from M5 gives *at-least-once execution*. The constraints turn that into *exactly-once effects*. You'll be asked about this distinction in interviews.
+
+### 2.4 `ON CONFLICT` versus catching the exception
+
+In PostgreSQL, once a statement fails inside a transaction, the **whole transaction is aborted**: every later statement fails with `current transaction is aborted, commands ignored until end of transaction block`. So the Java pattern
+
+```java
+try { insert(run); } catch (DataIntegrityViolationException e) { return findExisting(key); }
+```
+
+does not work inside one transaction: the `findExisting` call fails too. You'd need a savepoint or a second transaction. `INSERT … ON CONFLICT … DO NOTHING` avoids the error completely: the insert either happens or quietly doesn't, and the transaction stays usable. Under `READ COMMITTED`, if a concurrent transaction has inserted the same key but not yet committed, our insert **waits** for it, then does nothing. That's exactly the behaviour we want for a race.
+
+### 2.5 Chunking and checkpoints
+
+A one-month run for a large tenant is too big for one transaction (long locks, huge WAL, all work lost on a crash). So the run is split into **chunks**, and each chunk commits in its own transaction together with a **checkpoint** that says "this chunk is done". On restart, the worker reads the checkpoint and continues from the next chunk.
+
+The key rule is that the chunk's output and the checkpoint commit **in the same transaction**. Then there's no state where the work is committed but the checkpoint isn't (which would redo the work), or vice versa (which would skip it).
+
+### 2.6 `BigDecimal` equality
+
+```java
+new BigDecimal("1000.0").equals(new BigDecimal("1000.00"))     // false: scale differs
+new BigDecimal("1000.0").compareTo(new BigDecimal("1000.00"))  // 0: same value
+```
+
+`equals` compares value **and scale**. Money is compared by value, so always use `compareTo`. In SQL, `NUMERIC` equality is value-based (`1000.0 = 1000.00` is true), so the set-based engine is safe. The risk is in Java code that compares amounts (tests, the in-memory oracle, the exceptions module). M6.22 is the regression test.
+
+### 2.7 Property-based testing
+
+An example-based test says "for *this* input, expect *this* output". A **property-based test** says "for *any* input, this rule must hold", then a library (here **jqwik**) generates hundreds of random inputs and tries to break the rule. When it finds a failing input, it **shrinks** it to the smallest input that still fails, so you get a readable counter-example.
+
+The property here is promise 1: the set of in-scope records equals the disjoint union of matched records and exception-linked records. Random data finds edge cases you'd never write by hand (a reference that's a duplicate on one side and a different currency on the other, all on the last day of the period).
+
+---
+
+## 3. Starting point
+
+V1 (`src/main/resources/db/migration/V1__initial_schema.sql`) already created the tables this phase uses, so M6.1–M6.3 are mostly about entities, repositories and filling a few gaps:
+
+| Table | Already has | Notes |
+|---|---|---|
+| `reconciliation_run` | Period, sources, `currency` (pinned), status `CHECK`, `idempotency_key` + `UNIQUE (organization_id, idempotency_key)`, `last_completed_date` checkpoint, all summary count/amount columns, `failure_reason`, `triggered_by`, timestamps | Missing: a count for `CURRENCY_MISMATCH`, and a request fingerprint for `Idempotency-Key` reuse detection |
+| `reconciliation_match` | Composite FKs to `transaction_record (id, transaction_date)`, `match_type` (`EXACT` only), `UNIQUE (run_id, ledger_record_id)`, `UNIQUE (run_id, gateway_record_id)` | M6.3's "a record can't be matched twice within a run" is already enforced |
+| `exception_case` | `type` `CHECK` with all five types, `discrepancy_key`, `exception_case_active_uk` partial unique index, `version`, resolution `CHECK` | Missing: an `amount` column (the amount at stake, needed for M7.6 amount filters and the run summary) |
+| `exception_case_record` | Links a case to 1..n records | Fine as is |
+| `job` | `RECONCILE` type, leases, attempts | Built into a runner in M5 |
+| `transaction_record` | Partitioned by month; index `(organization_id, source_type, transaction_date, normalized_reference)` | The engine also needs to look records up **by reference across a period** (see M6.5), which that index serves poorly |
+
+**Gaps, closed by one new migration** (M6.1, below):
+
+1. `reconciliation_run.currency_mismatch_count` and `request_fingerprint`.
+2. `exception_case.amount`.
+3. A table linking each run to every exception it observed, created or re-observed (`exception_case_run`). Without it, a re-run that deduplicates into an existing active case has no record that it saw that case, and the run summary and M8.4's "exceptions for a run" export can't be computed.
+4. A `uuid_generate_v7()` SQL function, because set-based `INSERT … SELECT` needs IDs generated inside the database.
+5. An index for reference lookups.
+
+No Java code exists yet beyond `PaymentreconflowApplication`. This plan assumes M2's module packages, M3's `TenantContext`/`CurrentUser`, M4's `AuditService`, and M5's job runner exist. Where this plan names an M5 type (`JobHandler`, `JobContext`), align it with whatever M5 actually built.
+
+---
+
+## 4. Step by step
+
+### Module layout
+
+```
+com.reconflow.paymentreconflow.reconciliation
+  api/            ReconciliationRunController, CreateRunRequest, RunResponse, MatchResponse
+  application/    ReconciliationRunService     (create, retry, queries)
+                  RunLifecycle                 (the only place run status changes)
+                  ReconcileJobHandler          (worker entry point)
+                  RunExecutor                  (chunk loop, checkpoints)
+  engine/         MatchingStrategy, ExactReferenceStrategy, RunContext, DayResult
+  domain/         ReconciliationRun, RunStatus, ReconciliationMatch
+  persistence/    ReconciliationRunRepository, MatchQueries
+
+com.reconflow.paymentreconflow.exceptions        (module API: top-level package only)
+  DiscrepancyRecorder, Discrepancy, RecordRef, ExceptionType, RunExceptionSummary
+  internal/...                                    (built out in M7)
+```
+
+**Module boundary decision.** Reconciliation creates exception cases by calling a **synchronous API of the exceptions module** (`DiscrepancyRecorder`), inside the same database transaction as the chunk. It never writes `exception_case` tables itself.
+
+Why not a domain event? Spring Modulith's `@ApplicationModuleListener` is `@TransactionalEventListener(AFTER_COMMIT)` + `@Async`: the exceptions would be written *after* the chunk commits, in a separate transaction. A crash between the two loses exceptions while the checkpoint says the day is done, which breaks promises 1 and 3. A plain synchronous `@EventListener` would run in the same transaction, but it hides a hard dependency behind an event: the reconciliation module *needs* the exceptions to be written, so the dependency should be visible in the code. The direction `reconciliation → exceptions` is allowed; `exceptions` never depends on `reconciliation`.
+
+In Spring Modulith, types in a module's **top-level package** are its public API, and sub-packages are internal. So `exceptions.DiscrepancyRecorder` is callable from `reconciliation`, and `exceptions.internal.*` is not. M2.9's `ApplicationModules.verify()` test fails the build if anyone breaks that.
+
+The engine reads `transaction_record` (owned by the `ledger` module) **in SQL**. Modulith checks Java type dependencies, not SQL, so record this in `docs/architecture.md`: the ledger module publishes `transaction_record` as a read model that reconciliation may query, and only ledger writes it.
+
+---
+
+### M6.1 — `reconciliation_run`: migration gaps and entity
+
+**What.** Add the missing columns and tables in a new migration, then map `ReconciliationRun` as a JPA entity.
+
+**Why.** The run is the unit of work, the unit of idempotency, and the unit of reporting. Its entity is what the API reads and what `RunLifecycle` mutates.
+
+**How.**
+
+Create `src/main/resources/db/migration/V<next>__reconciliation_engine.sql`, where `<next>` is the next free version when you write it (V4 if nothing else has been added; M3–M5 will probably have added some). Never edit V1–V3.
+
+```sql
+-- =====================================================================
+-- ReconFlow — reconciliation engine support (M6)
+-- reconciliation_run and exception_case are empty until M6 ships, so the
+-- NOT NULL columns need no backfill.
+-- =====================================================================
+
+-- 1. Summary column for the fifth exception type, and the request
+--    fingerprint used to detect Idempotency-Key reuse with a different body.
+ALTER TABLE reconciliation_run
+    ADD COLUMN currency_mismatch_count INT      NOT NULL DEFAULT 0,
+    ADD COLUMN request_fingerprint     CHAR(64) NOT NULL;           -- SHA-256 hex
+
+-- 2. The amount at stake in a case: the ledger amount if there is one,
+--    otherwise the gateway amount. Drives amount filters (M7.6) and totals.
+ALTER TABLE exception_case
+    ADD COLUMN amount NUMERIC(19,4) NOT NULL;
+
+-- 3. Every run that observed a case, whether it created it or found it
+--    already open. exception_case.run_id stays "the run that raised it".
+--    Owned by the exceptions module; written only by DiscrepancyRecorder.
+CREATE TABLE exception_case_run (
+    exception_id     UUID        NOT NULL REFERENCES exception_case (id),
+    run_id           UUID        NOT NULL REFERENCES reconciliation_run (id),
+    organization_id  UUID        NOT NULL REFERENCES organization (id),
+    created          BOOLEAN     NOT NULL,     -- true if this run created the case
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (run_id, exception_id)
+);
+CREATE INDEX exception_case_run_exception_idx ON exception_case_run (exception_id);
+
+-- 4. UUIDv7 inside the database, for set-based INSERT ... SELECT.
+--    gen_random_uuid() gives a v4 UUID (random, correct variant bits).
+--    We overwrite the first 48 bits with the Unix time in milliseconds,
+--    then flip bits 52 and 53 so the version nibble reads 0111 (7).
+--    Must produce the same layout as the Java generator; a unit test
+--    checks UUID.version() == 7 on a value from each.
+CREATE FUNCTION uuid_generate_v7() RETURNS uuid
+LANGUAGE sql VOLATILE AS $$
+    SELECT encode(
+        set_bit(
+            set_bit(
+                overlay(uuid_send(gen_random_uuid())
+                        PLACING substring(int8send(floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint) FROM 3)
+                        FROM 1 FOR 6),
+                52, 1),
+            53, 1),
+        'hex')::uuid;
+$$;
+
+-- 5. The engine looks a group up by reference across the whole run
+--    period. The existing match index leads with transaction_date, so a
+--    reference lookup over 31 days scans every row of the date range.
+--    Created on the partitioned parent, so every partition gets it.
+CREATE INDEX transaction_record_reference_idx ON transaction_record
+    (organization_id, normalized_reference, transaction_type, transaction_date);
+```
+
+Entity, in `reconciliation/domain/ReconciliationRun.java`:
+
+```java
+@Entity
+@Table(name = "reconciliation_run")
+public class ReconciliationRun {
+    @Id private UUID id;                                     // UUIDv7, assigned by the app
+    @Column(name = "organization_id", nullable = false, updatable = false) private UUID organizationId;
+    @Column(name = "idempotency_key", nullable = false, updatable = false) private String idempotencyKey;
+    @Column(name = "request_fingerprint", nullable = false, updatable = false) private String requestFingerprint;
+    private LocalDate periodStart;
+    private LocalDate periodEnd;                             // inclusive
+    @Enumerated(EnumType.STRING) private SourceType leftSource;
+    @Enumerated(EnumType.STRING) private SourceType rightSource;
+    private String currency;
+    @Enumerated(EnumType.STRING) private RunStatus status;
+    private LocalDate lastCompletedDate;
+    private int matchedCount;          private BigDecimal matchedAmount;
+    private int mismatchCount;         private BigDecimal mismatchNetDifference;
+    private int unmatchedLeftCount;    private BigDecimal unmatchedLeftAmount;
+    private int unmatchedRightCount;   private BigDecimal unmatchedRightAmount;
+    private int duplicateCount;        private int currencyMismatchCount;
+    private String failureReason;
+    private UUID triggeredBy;
+    private Instant startedAt, completedAt;
+    @CreationTimestamp private Instant createdAt;
+    @UpdateTimestamp   private Instant updatedAt;
+
+    protected ReconciliationRun() {}                         // JPA
+    // No setters for status. Only RunLifecycle changes status, through
+    // package-private methods: markRunning(), markCompleted(summary), markFailed(reason), markPending().
+}
+```
+
+`ddl-auto: validate` (M2.6) checks this mapping against the real schema at startup, so a typo in a column name fails fast.
+
+**Pitfalls.**
+- `CHAR(3)` and `CHAR(64)` columns: Hibernate's validator may complain that it expected `varchar`. Use `@JdbcTypeCode(SqlTypes.CHAR)` with `@Column(length = 3)`, or `columnDefinition = "char(3)"`. Verify against the Hibernate 7 docs that ship with Boot 4.
+- The engine updates the run with JDBC (checkpoint, counts). Never hold a loaded `ReconciliationRun` entity in the same transaction as a JDBC update to it: the persistence context would be stale, and a later flush could overwrite the JDBC change. Each transaction uses one or the other.
+- `updated_at` is maintained by `@UpdateTimestamp`, which JDBC updates bypass. Every JDBC `UPDATE reconciliation_run` must set `updated_at = now()` itself.
+
+**Done when.** The migration applies on a fresh database, the app starts with `ddl-auto: validate`, and a repository test saves and reloads a run. A test asserts `uuid_generate_v7()` returns a UUID whose `version()` is 7 and whose timestamp is within a second of now.
+
+---
+
+### M6.2 — `reconciliation_match` entity
+
+**What.** Map `ReconciliationMatch` as a read-only entity, and add a read projection for the paginated matches endpoint.
+
+**Why.** Matches are written set-based by SQL (M6.5), never through JPA. The entity exists so `ddl-auto: validate` checks the table, and for the rare single-match lookup.
+
+**How.**
+
+```java
+@Entity
+@Immutable                                   // org.hibernate.annotations.Immutable: never dirty-checked or updated
+@Table(name = "reconciliation_match")
+public class ReconciliationMatch {
+    @Id private UUID id;
+    private UUID organizationId;
+    private UUID runId;
+    private UUID ledgerRecordId;   private LocalDate ledgerTxnDate;
+    private UUID gatewayRecordId;  private LocalDate gatewayTxnDate;
+    @Enumerated(EnumType.STRING) private MatchType matchType;   // EXACT
+    private BigDecimal amountDifference;
+    private Instant createdAt;
+}
+```
+
+Don't map `@ManyToOne TransactionRecord`. `transaction_record` has a composite key `(id, transaction_date)` because it's partitioned, and it belongs to another module. Keep the IDs and dates as plain columns.
+
+The endpoint (M6.16) reads matches through `JdbcClient` into a `MatchView` record that joins both source records, so it can show references and amounts side by side in one query.
+
+**Pitfalls.** Using `@Entity` + `saveAll()` for matches defeats the set-based design and is ~50× slower at volume.
+
+**Done when.** The app starts against the schema and a test reads back a match inserted by SQL.
+
+---
+
+### M6.3 — Uniqueness constraints
+
+**What.** Confirm the constraints exist, and prove them with tests.
+
+**Why.** They are what make retries safe. Code can have bugs; constraints can't be skipped.
+
+**How.** V1 already has:
+
+- `UNIQUE (run_id, ledger_record_id)` and `UNIQUE (run_id, gateway_record_id)`: a record matches at most once per run.
+- `UNIQUE (organization_id, idempotency_key)` on the run.
+
+Write a repository integration test for each: insert a duplicate with plain JDBC and assert `DuplicateKeyException` (Spring's translation of SQLState `23505`).
+
+Note that a record **can** be matched in two different runs (overlapping periods). That's correct: each run is a self-contained snapshot.
+
+**Done when.** The three constraint tests pass.
+
+---
+
+### M6.4 — `MatchingStrategy` and `ExactReferenceStrategy`
+
+**What.** A strategy interface for "classify one chunk of a run", with one v1 implementation.
+
+**Why.** v2 adds fee-aware and one-to-many matching (TASKS.md "Later"). The run lifecycle, chunking, checkpointing and exception recording don't change when the matching rules do. The strategy pattern keeps them apart.
+
+**How.**
+
+```java
+package com.reconflow.paymentreconflow.reconciliation.engine;
+
+public interface MatchingStrategy {
+    /** Stable name, stored on matches as match_type in later versions. */
+    String name();
+
+    /**
+     * Classifies every group anchored on {@code day} and writes matches.
+     * Must be called inside a transaction, with the tenant bound.
+     * Returns the discrepancies for the caller to hand to the exceptions module.
+     */
+    DayResult reconcileDay(RunContext run, LocalDate day);
+}
+
+public record RunContext(UUID organizationId, UUID runId, LocalDate periodStart, LocalDate periodEnd,
+                         SourceType leftSource, SourceType rightSource, String currency) {}
+
+public record DayResult(int matchesInserted, List<Discrepancy> discrepancies) {}
+```
+
+`ExactReferenceStrategy` is a `@Component` that uses `JdbcClient`. Its SQL is in M6.5–M6.8.
+
+**Pitfalls.** Don't make the strategy responsible for transactions or checkpoints. The executor owns those; the strategy only reads and writes inside the transaction it's given.
+
+**Done when.** The interface exists and `ExactReferenceStrategy` is the only bean implementing it.
+
+---
+
+### M6.5 — Exact matching (the core SQL)
+
+**What.** Classify every in-scope group and insert `EXACT` matches, one day-chunk at a time.
+
+**Why.** This is the product's central rule: same normalized reference, same currency, same transaction type, same amount → matched.
+
+#### Scope: which records take part in a run
+
+A record is **in scope** for a run when all of these hold:
+
+| Condition | Reason |
+|---|---|
+| `organization_id` = the run's organization | Tenancy |
+| `source_type` ∈ {left, right} | v1 has only two sources, so this is every record |
+| `transaction_date` within `[period_start, period_end]` | The run's period |
+| `status = 'SUCCESS'` | Only completed money movements are reconciled. A ledger `SUCCESS` against a gateway `FAILED` is a real discrepancy, and it shows up as `MISSING_IN_GATEWAY` with reason code `COUNTERPART_NOT_SUCCESS` (M6.7) |
+| Its group contains at least one record in the run's currency | A run is pinned to one currency (V1 comment, M1.12 ADR). Groups entirely in another currency belong to that currency's run |
+
+Write this table into `docs/reconciliation-rules.md`. It's the definition the property test (M6.19) checks against.
+
+#### The date-boundary problem, and the decision
+
+Chunking by day creates a trap. A ledger record dated 31 Jan and its gateway record dated 1 Feb (settlement lag) fall in different day chunks. If each chunk only looks at its own day, the 31 Jan chunk reports `MISSING_IN_GATEWAY` and the 1 Feb chunk reports `MISSING_IN_LEDGER`: two false exceptions for one good payment.
+
+Three options:
+
+| Option | How | Trade-off |
+|---|---|---|
+| A. One statement for the whole period | No chunks | Simplest and correct, but a month for a large tenant is one huge transaction, and a crash loses all of it |
+| B. Chunk the left side by day, search the right side across the period, then sweep right-only records at the end | Left day D finds partners anywhere in the period | Breaks on duplicates: two left records with the same reference on D1 and D2 are seen by two different chunks, each seeing only one of them. Also needs a special final step |
+| **C. Anchor-day chunking (chosen)** | Every group gets an **anchor day** = the earliest `transaction_date` of any record in the group, within the period. The chunk for day D processes exactly the groups whose anchor is D, and loads **all** of each group's records across the whole period | Each group has exactly one anchor, so it's processed exactly once, in full. Duplicates, cross-day matches and right-only records need no special cases. Cost: each chunk looks groups up by reference across the period, which is what the new `transaction_record_reference_idx` is for |
+
+Option C keeps promise 1 with no extra steps, and keeps the `last_completed_date` checkpoint from V1. Put the reasoning in an ADR (`docs/adr/NNNN-anchor-day-chunking.md`).
+
+v1 matches only **within** the run's period. A ledger record on 31 Jan and a gateway record on 1 Feb match in a run covering both days, but not in a January-only run. A configurable settlement window is in v2 scope. Document this as a known limitation.
+
+#### The SQL
+
+The chunk works through a temporary table that lives only for the chunk's transaction. Create it with explicit columns, then fill it with `INSERT … SELECT`: PostgreSQL doesn't accept bind parameters in `CREATE TABLE … AS`, because it's a utility statement.
+
+```sql
+-- Step 1: scratch table for this chunk; dropped automatically at COMMIT.
+CREATE TEMP TABLE recon_group (
+    normalized_reference TEXT        NOT NULL,
+    transaction_type     TEXT        NOT NULL,
+    currencies           TEXT[]      NOT NULL,
+    ledger_n             INT         NOT NULL,
+    gateway_n            INT         NOT NULL,
+    ledger_ids           UUID[],
+    ledger_dates         DATE[],
+    gateway_ids          UUID[],
+    gateway_dates        DATE[],
+    ledger_amount        NUMERIC(19,4),
+    gateway_amount       NUMERIC(19,4),
+    outcome              TEXT        NOT NULL
+) ON COMMIT DROP;
+```
+
+```sql
+-- Step 2: classify every group anchored on :day.
+INSERT INTO recon_group
+WITH day_keys AS (
+    -- Groups with at least one in-scope record on :day (any currency).
+    SELECT DISTINCT normalized_reference, transaction_type
+    FROM transaction_record
+    WHERE organization_id  = :org
+      AND transaction_date = :day
+      AND status           = 'SUCCESS'
+),
+candidates AS (
+    -- Every in-period record of those groups, on both sides, in any currency.
+    SELECT t.id, t.transaction_date, t.source_type, t.normalized_reference,
+           t.transaction_type, t.currency, t.amount, t.is_duplicate_in_source
+    FROM transaction_record t
+    JOIN day_keys k
+      ON k.normalized_reference = t.normalized_reference
+     AND k.transaction_type     = t.transaction_type
+    WHERE t.organization_id = :org
+      AND t.transaction_date BETWEEN :periodStart AND :periodEnd
+      AND t.status = 'SUCCESS'
+),
+groups AS (
+    SELECT normalized_reference,
+           transaction_type,
+           min(transaction_date)                                                AS anchor_date,
+           array_agg(DISTINCT currency::text ORDER BY currency::text)           AS currencies,
+           count(*) FILTER (WHERE source_type = 'INTERNAL_LEDGER')              AS ledger_n,
+           count(*) FILTER (WHERE source_type = 'GATEWAY')                      AS gateway_n,
+           bool_or(is_duplicate_in_source)                                      AS flagged_dup,
+           array_agg(id               ORDER BY id) FILTER (WHERE source_type = 'INTERNAL_LEDGER') AS ledger_ids,
+           array_agg(transaction_date ORDER BY id) FILTER (WHERE source_type = 'INTERNAL_LEDGER') AS ledger_dates,
+           array_agg(id               ORDER BY id) FILTER (WHERE source_type = 'GATEWAY')         AS gateway_ids,
+           array_agg(transaction_date ORDER BY id) FILTER (WHERE source_type = 'GATEWAY')         AS gateway_dates,
+           min(amount) FILTER (WHERE source_type = 'INTERNAL_LEDGER')           AS ledger_amount,
+           min(amount) FILTER (WHERE source_type = 'GATEWAY')                   AS gateway_amount
+    FROM candidates
+    GROUP BY normalized_reference, transaction_type
+)
+SELECT normalized_reference, transaction_type, currencies,
+       ledger_n, gateway_n, ledger_ids, ledger_dates, gateway_ids, gateway_dates,
+       ledger_amount, gateway_amount,
+       CASE
+           WHEN ledger_n > 1 OR gateway_n > 1 OR flagged_dup         THEN 'DUPLICATE_IN_SOURCE'
+           WHEN cardinality(currencies) > 1                          THEN 'CURRENCY_MISMATCH'
+           WHEN ledger_n = 1 AND gateway_n = 1
+            AND ledger_amount = gateway_amount                       THEN 'MATCH'
+           WHEN ledger_n = 1 AND gateway_n = 1                       THEN 'AMOUNT_MISMATCH'
+           WHEN ledger_n = 1                                         THEN 'MISSING_IN_GATEWAY'
+           ELSE                                                           'MISSING_IN_LEDGER'
+       END
+FROM groups
+WHERE anchor_date = :day                     -- each group processed exactly once
+  AND :currency = ANY (currencies);          -- group involves the run's currency
+```
+
+```sql
+-- Step 3: write the matches. ON CONFLICT DO NOTHING makes a resumed
+-- chunk safe: rows a crashed attempt already committed are skipped.
+-- (They can't actually exist, because the chunk and the checkpoint
+-- commit together, but the constraint is the safety net.)
+INSERT INTO reconciliation_match
+    (id, organization_id, run_id,
+     ledger_record_id, ledger_txn_date, gateway_record_id, gateway_txn_date,
+     match_type, amount_difference)
+SELECT uuid_generate_v7(), :org, :runId,
+       ledger_ids[1], ledger_dates[1], gateway_ids[1], gateway_dates[1],
+       'EXACT', 0
+FROM recon_group
+WHERE outcome = 'MATCH'
+ON CONFLICT DO NOTHING;
+```
+
+```sql
+-- Step 4: everything that isn't a match goes back to Java (~2% of groups).
+SELECT * FROM recon_group WHERE outcome <> 'MATCH' ORDER BY outcome, normalized_reference, transaction_type;
+```
+
+**Reading the `CASE`.** The order of the `WHEN` branches *is* the precedence of the rules, and it's a business decision, so copy it into `reconciliation-rules.md`:
+
+1. **Duplicates first.** If either side has more than one candidate, nothing else about the group can be trusted. Which of the two `TXN-104` gateway rows would you compare amounts with?
+2. **Currency next.** A group that mixes currencies can't be compared by amount.
+3. **Then the 1:1 cases**, decided by amount.
+4. **Then the one-sided cases.**
+
+Because `currencies` covers the whole group, a mixed-currency group gets the same classification in the AED run and in the USD run, and (see M6.6) the same discrepancy key. The two runs deduplicate into one case.
+
+**How it runs in Java.**
+
+```java
+@Component
+class ExactReferenceStrategy implements MatchingStrategy {
+    private final JdbcClient jdbc;
+
+    public String name() { return "EXACT_REFERENCE"; }
+
+    public DayResult reconcileDay(RunContext run, LocalDate day) {
+        jdbc.sql(CREATE_TEMP_TABLE).update();
+        jdbc.sql(CLASSIFY_GROUPS)
+            .param("org", run.organizationId()).param("day", day)
+            .param("periodStart", run.periodStart()).param("periodEnd", run.periodEnd())
+            .param("currency", run.currency())
+            .update();
+        int matches = jdbc.sql(INSERT_MATCHES)
+            .param("org", run.organizationId()).param("runId", run.runId())
+            .update();
+        List<Discrepancy> discrepancies = jdbc.sql(SELECT_EXCEPTION_GROUPS)
+            .query(this::toDiscrepancy).list();            // M6.6–M6.8 build these
+        return new DayResult(matches, enrichReasonCodes(run, discrepancies));
+    }
+}
+```
+
+Keep the SQL in `src/main/resources/sql/reconciliation/*.sql` and load it once at startup (`StreamUtils.copyToString`). Long SQL in Java string literals is hard to read and impossible to paste into `psql` for `EXPLAIN ANALYZE`.
+
+**Pitfalls.**
+- Run `EXPLAIN (ANALYZE, BUFFERS)` on the classify query with a realistic dataset (M9.5's generator). Expect index scans on `transaction_record_reference_idx` and partition pruning to the months in the period. If you see a sequential scan of a whole partition per day, the planner isn't using the index; check that every predicate is present.
+- `array_agg(… ORDER BY id)` makes the arrays deterministic. Without `ORDER BY`, two runs could link records in a different order, and tests comparing arrays become flaky.
+- `currency` is `CHAR(3)`. Cast to `text` before `array_agg`, or the comparison with `:currency` can trip over `bpchar` padding semantics.
+- Temp tables and connection pools: `ON COMMIT DROP` matters. Without it, the next transaction on the same pooled connection finds the table already there and `CREATE TEMP TABLE` fails.
+
+**Done when.** On the projectoverview.md §5 dataset, PAY-101 produces one `EXACT` match and the other three references produce no match.
+
+---
+
+### M6.6 — Amount comparison and discrepancy keys
+
+**What.** Turn `AMOUNT_MISMATCH` groups (and every other non-match) into `Discrepancy` commands with a deterministic `discrepancy_key`.
+
+**Why.** "References match but amounts differ" must never be counted as matched (M6.6). It must become exactly one active case, no matter how many runs see it.
+
+**How.**
+
+The module API, in `exceptions/` (top-level package):
+
+```java
+public enum ExceptionType { MISSING_IN_GATEWAY, MISSING_IN_LEDGER, AMOUNT_MISMATCH, CURRENCY_MISMATCH, DUPLICATE_IN_SOURCE }
+
+public record RecordRef(UUID id, LocalDate transactionDate, SourceType sourceType) {}
+
+public record Discrepancy(
+        ExceptionType type,
+        String discrepancyKey,
+        String reasonCode,              // nullable
+        String currency,                // the run's currency
+        BigDecimal amount,              // amount at stake
+        BigDecimal amountDifference,    // gateway − ledger; AMOUNT_MISMATCH only
+        List<RecordRef> records) {}
+```
+
+**Discrepancy key format:**
+
+```
+<TYPE>:<normalized_reference>:<transaction_type>:<currencies joined by '/'>
+
+AMOUNT_MISMATCH:PAY-103:PAYMENT:AED
+CURRENCY_MISMATCH:PAY-207:PAYMENT:AED/USD
+DUPLICATE_IN_SOURCE:TXN-104:PAYMENT:INR
+```
+
+This extends the `<TYPE>:<normalized_reference>` format proposed in phase-M1 §4.6 with the transaction type and the currency set. The transaction type is needed because a `PAYMENT` and a `REFUND` with the same reference are separate groups (M6.5) and can be separate discrepancies. The sorted currency set still gives every currency's run the same key, which was M1's reason for leaving the currency out. Update `docs/reconciliation-rules.md` to this format.
+
+Rules:
+- The key identifies **the discrepancy, not the run**. Two runs over overlapping periods compute the same key, and the partial unique index lets only one active case exist.
+- Currencies are the sorted set of the whole group, so the AED run and the USD run agree on `AED/USD`.
+- The key has no period in it, so a January run and a "January 15 – February 15" run share cases.
+- A reference may contain `:`. That's still unambiguous: the type, transaction type and currencies never contain `:`, so a parser reads the first field from the left and the last two from the right. Don't escape anything.
+
+**Amounts:**
+- `amount_difference = gateway_amount − ledger_amount`. A negative number means the gateway paid less. PAY-103: `700.00 − 750.00 = −50.00`. Put the sign convention in `reconciliation-rules.md`.
+- `amount` = `ledger_amount` if the group has a ledger record, otherwise `gateway_amount`.
+
+**Inserting cases** is the exceptions module's job (`DiscrepancyRecorder`, implemented in `exceptions/internal/`). For each discrepancy, **in key order**:
+
+```sql
+-- 1. Create the case, or do nothing if an active one already exists.
+INSERT INTO exception_case
+    (id, organization_id, run_id, type, reason_code, discrepancy_key,
+     status, currency, amount, amount_difference)
+VALUES (:id, :org, :runId, :type, :reasonCode, :key, 'OPEN', :currency, :amount, :diff)
+ON CONFLICT (organization_id, discrepancy_key) WHERE status <> 'RESOLVED'
+DO NOTHING
+RETURNING id;
+```
+
+`ON CONFLICT (cols) WHERE predicate` is how you target a **partial** unique index: PostgreSQL infers `exception_case_active_uk` from the column list plus the predicate.
+
+```sql
+-- 2. If nothing was returned, an active case exists: find it.
+SELECT id FROM exception_case
+WHERE organization_id = :org AND discrepancy_key = :key AND status <> 'RESOLVED';
+```
+
+Then, for a **new** case: insert `exception_status_history` (`from_status NULL → OPEN`, `actor_id NULL`) and an audit event `EXCEPTION_CREATED` (system actor). For **both** new and existing cases: link every record and the run.
+
+```sql
+INSERT INTO exception_case_record (exception_id, transaction_record_id, transaction_date, organization_id)
+VALUES (:caseId, :recordId, :txnDate, :org)
+ON CONFLICT DO NOTHING;                      -- an existing case may already link it
+
+INSERT INTO exception_case_run (exception_id, run_id, organization_id, created)
+VALUES (:caseId, :runId, :org, :created)
+ON CONFLICT DO NOTHING;                      -- a resumed chunk may have linked it
+```
+
+Use `JdbcClient` batch-style loops or `NamedParameterJdbcTemplate.batchUpdate` for the links. Volume is ~2% of groups, so per-case statements are fine for v1. Measure in M9.
+
+**What happens to a resolved case when the discrepancy appears again?** The partial index ignores `RESOLVED` rows, so the insert succeeds and a **new `OPEN` case** is created. That's deliberate: a resolution says "we've dealt with what we saw then"; seeing the same discrepancy in a new run means it still exists, and someone should look. The old case and its resolution stay untouched. Document this in `reconciliation-rules.md`. If it proves noisy (for example, a written-off item reappearing in every overlapping run), the v2 fix is to suppress re-raising when the latest resolution code is terminal, such as `WRITTEN_OFF`. Don't build that now.
+
+**Pitfalls.**
+- **Deadlocks between concurrent runs.** Two runs of the same org can insert the same keys at the same time. If run A inserts key 1 then key 2, and run B inserts key 2 then key 1, each waits on the other's uncommitted row. Sorting discrepancies by key before inserting gives every transaction the same lock order, which prevents this.
+- **The concurrent-insert visibility gap.** If a concurrent transaction inserted the key and committed while our `INSERT … DO NOTHING` was waiting, step 2's `SELECT` runs as a new statement under `READ COMMITTED` and sees it. Don't merge steps 1 and 2 into one CTE statement: a single statement uses one snapshot taken *before* the wait, and the step-2 part can come back empty.
+- Never compare amounts with `BigDecimal.equals` anywhere on this path.
+
+**Done when.** PAY-103 produces one `AMOUNT_MISMATCH` case with `amount_difference = -50.0000`, `amount = 750.0000`, two linked records, and no match row.
+
+---
+
+### M6.7 — Unmatched detection on both sides
+
+**What.** `MISSING_IN_GATEWAY` for ledger-only groups and `MISSING_IN_LEDGER` for gateway-only groups, with a reason code where one can be determined.
+
+**Why.** Missing records are the most common real-world exception: a settlement that hasn't arrived, a payment the business never recorded.
+
+**How.** The classify query already produces both outcomes. Anchor-day chunking means gateway-only groups need no separate sweep: they're anchored on their own earliest date, like any other group.
+
+The types are named by **source**, not by side. A ledger-only group is `MISSING_IN_GATEWAY` whether the run's `left_source` is the ledger or the gateway. The summary columns are by side (`unmatched_left_*`), so map them in Java when computing the summary (M6.9).
+
+**Reason codes.** Before handing discrepancies to the exceptions module, enrich the missing ones with one extra query per chunk:
+
+```sql
+-- Which missing groups have a counterpart that exists but isn't SUCCESS?
+SELECT DISTINCT o.normalized_reference, o.transaction_type, o.source_type
+FROM transaction_record o
+WHERE o.organization_id = :org
+  AND o.transaction_date BETWEEN :periodStart AND :periodEnd
+  AND o.status <> 'SUCCESS'
+  AND (o.normalized_reference, o.transaction_type) IN (
+        SELECT normalized_reference, transaction_type FROM recon_group
+        WHERE outcome IN ('MISSING_IN_GATEWAY', 'MISSING_IN_LEDGER'));
+```
+
+If the gateway has the reference with status `FAILED` and the ledger says `SUCCESS`, the case is `MISSING_IN_GATEWAY` with `reason_code = 'COUNTERPART_NOT_SUCCESS'`. The investigator sees immediately that the gateway declined a payment the business thinks succeeded. Otherwise `reason_code` stays `NULL`.
+
+List the reason codes in `reconciliation-rules.md` (M1.6). v1 needs only `COUNTERPART_NOT_SUCCESS`.
+
+**Pitfalls.**
+- An empty period on one side (no gateway file imported yet) turns every ledger record into `MISSING_IN_GATEWAY`. Guard against the common case: at run creation, return `409` with code `import-in-progress` if the org has an import batch in `RECEIVED` or `PROCESSING` (ask the ingestion module's API, don't query its table). The worker checks again when it starts, and if an import is still running it re-schedules the job a minute later instead of starting. It can't detect "the user forgot to upload the gateway file". The run summary makes that obvious (every record unmatched), which is good enough for v1.
+- Don't treat a missing record as "unmatched" in the summary *and* as an exception in a different count. It's one case, counted once.
+
+**Done when.** PAY-102 → `MISSING_IN_GATEWAY` (amount 500.00), PAY-104 → `MISSING_IN_LEDGER` (amount 200.00), and a test with a `FAILED` gateway counterpart gets `COUNTERPART_NOT_SUCCESS`.
+
+---
+
+### M6.8 — Duplicate detection
+
+**What.** Any group with more than one candidate on either side, or with a record M5 flagged as duplicated within its source file, becomes one `DUPLICATE_IN_SOURCE` case linking **every** record in the group.
+
+**Why.** Picking one duplicate and matching it would hide a possible double charge or double booking. The engine's job is to surface ambiguity, not resolve it (projectoverview.md §5 step 5).
+
+**How.** Already in the `CASE`: `ledger_n > 1 OR gateway_n > 1 OR flagged_dup` is the first branch. `toDiscrepancy` builds `RecordRef`s from **all four arrays** (ledger and gateway IDs), so TXN-104 links three records: one ledger, two gateway.
+
+The engine counts candidates itself and doesn't rely only on `is_duplicate_in_source`. That way duplicates **across** files are caught too: the same gateway settlement imported twice under two different file hashes (one extra row changes the hash) produces two records for every reference, and every one of them becomes a duplicate case. That's the correct, loud outcome.
+
+**Pitfalls.**
+- `amount` for a duplicate case is the ledger amount if present, else the minimum gateway amount: a representative value for filtering, not a total. Say so in `api-design.md`.
+- The linked records of a duplicate case can span several days and both sides. Make sure the M7 detail endpoint shows them all.
+
+**Done when.** TXN-104 produces one `DUPLICATE_IN_SOURCE` case linked to exactly three records, and no match.
+
+---
+
+### M6.9 — Atomic persistence per chunk, and the run summary
+
+**What.** Each day-chunk commits its matches, its exception cases and its checkpoint in **one transaction**. At the end, one transaction computes the summary and marks the run `COMPLETED`.
+
+**Why.** Promise 3. If any part of the chunk fails, all of it rolls back, and the checkpoint still points at the previous day. The retry redoes exactly that day.
+
+**How.** `RunExecutor`, in `reconciliation/application/`:
+
+```java
+@Component
+class RunExecutor {
+    private final TransactionTemplate tx;
+    private final TenantSession tenantSession;      // binds RLS: set_config('app.org_id', :org, true)
+    private final RunLifecycle lifecycle;
+    private final MatchingStrategy strategy;
+    private final DiscrepancyRecorder discrepancies;
+
+    void execute(UUID organizationId, UUID runId, JobContext job) {
+        RunContext run = tx.execute(s -> {
+            tenantSession.bind(organizationId);
+            return lifecycle.start(organizationId, runId);      // PENDING|RUNNING -> RUNNING; null if already COMPLETED
+        });
+        if (run == null) return;                                // job re-delivered after completion: nothing to do
+
+        LocalDate day = lifecycle.resumeFrom(run);              // last_completed_date + 1, or period_start
+        for (; !day.isAfter(run.periodEnd()); day = day.plusDays(1)) {
+            LocalDate d = day;
+            tx.executeWithoutResult(s -> {
+                tenantSession.bind(organizationId);
+                lifecycle.lockForChunk(run, d);                 // fencing check, see Pitfalls
+                DayResult result = strategy.reconcileDay(run, d);
+                discrepancies.record(organizationId, runId, result.discrepancies());
+                lifecycle.advanceCheckpoint(run, d);
+            });
+            job.heartbeat();                                    // extends the lease (scalability.md §4.3)
+        }
+
+        tx.executeWithoutResult(s -> {
+            tenantSession.bind(organizationId);
+            lifecycle.complete(run);                            // summary + COMPLETED, same transaction
+        });
+    }
+}
+```
+
+**Why `TransactionTemplate` and not `@Transactional`?** `@Transactional` works through a Spring proxy, so it only applies when the method is called from *another* bean. A loop that calls `this.processDay()` bypasses the proxy and gets no transaction (or, worse, the outer one). `TransactionTemplate` makes each chunk's boundary explicit and visible.
+
+**Binding the tenant for RLS.** The worker has no HTTP request and no `TenantContext`, so it sets the session variable from the job's `organization_id` at the start of every transaction. `SET LOCAL` can't take a bind parameter, so use the function form:
+
+```sql
+SELECT set_config('app.org_id', :org, true);   -- true = local to this transaction
+```
+
+Every query *also* filters `organization_id = :org` explicitly. RLS is the safety net, not the mechanism (scalability.md §5.4).
+
+**The checkpoint and the fencing check:**
+
+```sql
+-- lockForChunk: lock the run row, and confirm nobody else has moved it on.
+SELECT status, last_completed_date
+FROM reconciliation_run
+WHERE id = :runId AND organization_id = :org
+FOR UPDATE;
+-- expect status = 'RUNNING' and last_completed_date = :day - 1 (or NULL when :day = period_start)
+
+-- advanceCheckpoint
+UPDATE reconciliation_run
+SET last_completed_date = :day, updated_at = now()
+WHERE id = :runId AND organization_id = :org;
+```
+
+**Per-day summary row (added by M8.1).** Phase M8 adds a `reconciliation_run_day` table (see phase-M8-reporting.plan) so date-range reports can pick one authoritative run per day. Once it exists, the chunk transaction also inserts that day's row (`run_id, organization_id, day, currency`, plus the day's match/mismatch/unmatched/duplicate counts and amounts) right before `advanceCheckpoint`, with `ON CONFLICT (run_id, day) DO NOTHING`. Because it commits with the day's matches, cases and checkpoint, a resumed run never double-counts a day. The day's counts come from `recon_group` (outcomes whose anchor is that day), so `sum(day rows)` equals the run totals; M8 adds a test for exactly that.
+
+**The summary**, computed from scratch in the completing transaction, so a resumed run gets exactly the same numbers as a clean one:
+
+```sql
+-- Matches: count and total (ledger amount; equal to gateway amount for EXACT).
+SELECT count(*) AS matched_count, coalesce(sum(t.amount), 0) AS matched_amount
+FROM reconciliation_match m
+JOIN transaction_record t
+  ON t.id = m.ledger_record_id AND t.transaction_date = m.ledger_txn_date
+WHERE m.run_id = :runId AND m.organization_id = :org;
+```
+
+Exception counts come from the exceptions module's API, `DiscrepancyRecorder.summarize(org, runId)`, which runs:
+
+```sql
+SELECT ec.type,
+       count(*)                                 AS cases,
+       coalesce(sum(ec.amount), 0)              AS amount,
+       coalesce(sum(ec.amount_difference), 0)   AS net_difference
+FROM exception_case_run r
+JOIN exception_case ec ON ec.id = r.exception_id
+WHERE r.run_id = :runId AND r.organization_id = :org
+GROUP BY ec.type;
+```
+
+`RunLifecycle.complete` maps the result onto the run's columns:
+
+| Column | Source |
+|---|---|
+| `matched_count`, `matched_amount` | Match query |
+| `mismatch_count`, `mismatch_net_difference` | `AMOUNT_MISMATCH` cases / `net_difference` |
+| `unmatched_left_*` | Missing-in-the-*other*-source cases for `left_source` records (`MISSING_IN_GATEWAY` when left is the ledger) |
+| `unmatched_right_*` | The other missing type |
+| `duplicate_count` | `DUPLICATE_IN_SOURCE` cases |
+| `currency_mismatch_count` | `CURRENCY_MISMATCH` cases |
+
+Counts are **cases**, not records: a duplicate case with three records counts once. State that in `api-design.md`, because M8.6 reconciles report totals against raw counts.
+
+**Pitfalls.**
+- **Zombie workers.** A worker pauses (a long GC, a network partition) past its lease. The sweeper re-queues the job and a second worker starts. Then the first wakes up and carries on. Without fencing, both write the same days. The `FOR UPDATE` lock serializes them, and the checkpoint comparison makes the stale one fail: it expects `last_completed_date = D−1` and finds `D` or later. Throw a non-retryable `StaleRunOwnershipException` and stop. This is the "fencing token" idea from distributed systems, with the checkpoint acting as the token.
+- Don't heartbeat inside the chunk transaction. The heartbeat is a separate small update to `job`; doing it in the chunk transaction means the lease isn't extended until the chunk commits.
+- A run with an empty period still loops over its days (cheap) and completes with zeros. Don't special-case it.
+
+**Done when.** Killing the worker after day 3 of a 10-day run, then letting the job resume, gives the same matches, cases and summary as an uninterrupted run (M6.12's test).
+
+---
+
+### M6.10 — Run lifecycle
+
+**What.** All status changes happen in `RunLifecycle`, and only valid transitions are allowed.
+
+**Why.** Scattered `run.setStatus(...)` calls are how a run ends up `COMPLETED` with a failure reason, or `RUNNING` forever. One class, one table of allowed transitions, one place to audit.
+
+**How.**
+
+| From | To | Trigger | Audit action | Notes |
+|---|---|---|---|---|
+| — | `PENDING` | `POST /reconciliation-runs` | `RUN_REQUESTED` (actor = user) | Created with its `RECONCILE` job in one transaction |
+| `PENDING` | `RUNNING` | Worker claims the job | `RUN_STARTED` (system) | Sets `started_at` |
+| `RUNNING` | `RUNNING` | Job re-delivered after a crash or expired lease | none | Resume from checkpoint; not a transition |
+| `RUNNING` | `COMPLETED` | Last chunk done | `RUN_COMPLETED` (payload: summary) | Sets `completed_at`, summary columns |
+| `RUNNING` | `FAILED` | Non-retryable error, or the job runner gives up after `max_attempts` | `RUN_FAILED` (payload: reason) | Sets `failure_reason` (truncated to 1,000 chars, no stack trace) |
+| `FAILED` | `PENDING` | `POST /reconciliation-runs/{id}/retry` | `RUN_RETRY_REQUESTED` (actor = user) | Clears `failure_reason`, keeps `last_completed_date`, enqueues a new job |
+
+```java
+public enum RunStatus {
+    PENDING, RUNNING, COMPLETED, FAILED;
+
+    private static final Map<RunStatus, Set<RunStatus>> ALLOWED = Map.of(
+        PENDING,   Set.of(RUNNING),
+        RUNNING,   Set.of(COMPLETED, FAILED),
+        FAILED,    Set.of(PENDING),
+        COMPLETED, Set.of());
+
+    public boolean canMoveTo(RunStatus next) { return ALLOWED.get(this).contains(next); }
+}
+```
+
+`RunLifecycle` checks `canMoveTo`, updates the entity, and calls `AuditService.record(...)`. Because `AuditService` uses `Propagation.MANDATORY` (M4), calling it outside a transaction throws, which catches the mistake in tests.
+
+**Transient versus permanent failures.** A lost connection or a serialization failure is **transient**: the job runner retries with backoff, and the run stays `RUNNING`. A data-invariant violation (say, the classify query returns a group with `ledger_n = 0 AND gateway_n = 0`) is **permanent**: retrying won't help, so fail the run immediately. Mark permanent failures with a dedicated exception type the job runner recognizes, and never retry validation errors (M9.3).
+
+Marking the run `FAILED` happens in a **new transaction**: the chunk transaction that hit the error has already rolled back.
+
+The retry endpoint (M6.12) isn't in the task list's API section, but M6.12 needs it:
+
+```
+POST /api/v1/reconciliation-runs/{id}/retry      permission: RUN_CREATE
+  200 OK  {run, status: PENDING}     when FAILED
+  409     code: invalid-state-transition   otherwise
+```
+
+**Pitfalls.** Don't add a `CANCELLED` state "while you're there". Every state needs tests, permissions and audit. Add it when a user needs it.
+
+**Done when.** A unit test covers every cell of the transition table, allowed and forbidden.
+
+---
+
+### M6.11 — Idempotent run creation
+
+**What.** Starting the "same run" twice returns the existing run instead of creating a second one.
+
+**Why.** Clients retry on timeouts. Users double-click. Without this, two runs over the same period both raise every exception and both count every match, and the reports are wrong.
+
+**How.**
+
+**What makes two runs "the same run"** (record this in the M1.12 ADR):
+
+| Case | Key stored in `idempotency_key` |
+|---|---|
+| Client sends `Idempotency-Key: abc` | `client:abc` |
+| No header | `auto:` + `sha256(org | periodStart | periodEnd | leftSource | rightSource | currency)` |
+
+The `client:` / `auto:` prefixes keep the two namespaces apart, so a client can't accidentally send a key that collides with a derived one. `request_fingerprint` always stores the SHA-256 of the canonical request (the same string as the derived key's hash input).
+
+**Rules:**
+
+| Situation | Response |
+|---|---|
+| New key | `202 Accepted`, `Location: /api/v1/reconciliation-runs/{id}`, body = the new `PENDING` run |
+| Existing key, same fingerprint | `200 OK`, body = the existing run in whatever state it's in, including `FAILED` (use `/retry`) or `COMPLETED` |
+| Existing `client:` key, **different** fingerprint | `422 Unprocessable Content`, code `idempotency-key-reused` |
+
+With no header, the same period, sources and currency always map to the same run. **To deliberately re-run a period** (for example after a late gateway file), the client sends a fresh `Idempotency-Key`. The new run is independent: it gets its own matches; exceptions that are still active are re-observed, not duplicated (M6.6).
+
+**How this differs from the HTTP `Idempotency-Key` header draft.** The IETF draft (*The Idempotency-Key HTTP Header Field*) treats the key as a **request-replay** mechanism: the server stores the key with a fingerprint of the request and the response, replays the stored response for a retry, returns `422` if the same key arrives with a different payload, returns `409` if the first request is still in flight, and may expire keys after a while. ReconFlow's key is a **business identity** for the run: it's stored on the run itself, never expires (runs are permanent records), and a repeat returns the run's *current* state rather than a replay of the first response. The `422` on fingerprint mismatch is borrowed from the draft. The in-flight `409` isn't needed, because the run row exists the moment the first request commits. Explain this difference in `api-design.md`.
+
+**The race.** Two identical requests arrive at the same time. Both check "does the key exist?", both see no, both insert. The unique constraint stops the second insert, but you must handle it without aborting the transaction (§2.4):
+
+```sql
+INSERT INTO reconciliation_run
+    (id, organization_id, idempotency_key, request_fingerprint, period_start, period_end,
+     left_source, right_source, currency, status, triggered_by)
+VALUES (:id, :org, :key, :fingerprint, :ps, :pe, :left, :right, :currency, 'PENDING', :userId)
+ON CONFLICT (organization_id, idempotency_key) DO NOTHING
+RETURNING id;
+```
+
+```java
+@Transactional
+public CreateRunResult create(CreateRunRequest req, String clientKey) {
+    UUID org = tenant.organizationId();
+    String fingerprint = Fingerprints.sha256(org, req);
+    String key = clientKey == null ? "auto:" + fingerprint : "client:" + clientKey;
+
+    Optional<UUID> inserted = runs.insertIfAbsent(newRun(org, key, fingerprint, req));
+    if (inserted.isPresent()) {
+        jobs.enqueue(org, JobType.RECONCILE, Map.of("runId", inserted.get()));   // same transaction
+        audit.record(RUN_REQUESTED, inserted.get(), ...);
+        return CreateRunResult.created(runs.get(org, inserted.get()));            // 202
+    }
+    ReconciliationRun existing = runs.findByKey(org, key).orElseThrow();          // new statement: sees the winner's row
+    if (!existing.requestFingerprint().equals(fingerprint)) throw new IdempotencyKeyReusedException();  // 422
+    return CreateRunResult.existing(existing);                                    // 200
+}
+```
+
+The run row and its job row commit **in the same transaction**. That's the point of the DB-backed queue (scalability.md D4): there's no window where the run exists but its job doesn't (a run stuck in `PENDING` forever), or vice versa.
+
+**Request validation** (`CreateRunRequest`, Bean Validation + a service check):
+
+| Field | Rule | Error |
+|---|---|---|
+| `periodStart`, `periodEnd` | Required; `periodEnd >= periodStart`; at most 92 days long | `400` |
+| `currency` | Required; `Currency.getInstance(value)` succeeds; upper case | `400` |
+| `leftSource`, `rightSource` | Default `INTERNAL_LEDGER` / `GATEWAY`; must differ | `400` |
+| `Idempotency-Key` header | Optional; 1–255 printable ASCII characters | `400` |
+| Active imports for the org | None in `RECEIVED`/`PROCESSING` | `409 import-in-progress` |
+
+All errors are `ProblemDetail` with `type: https://reconflow.dev/problems/<code>`, `code` and `requestId`, through the global handler from M2.10.
+
+**Done when.** Two concurrent identical `POST`s (fired from two threads behind a `CountDownLatch`) produce exactly one run and one job: one response is `202` and the other is `200` with the same ID. A reused client key with a different body gets `422`.
+
+---
+
+### M6.12 — Retrying a failed run
+
+**What.** `POST /reconciliation-runs/{id}/retry` moves a `FAILED` run back to `PENDING` and enqueues a new job. The job resumes from `last_completed_date`.
+
+**Why.** A run that failed on day 20 of 31 shouldn't redo days 1–19, and must not duplicate their matches.
+
+**How.** The retry uses `RunLifecycle` (`FAILED → PENDING`) and enqueues a `RECONCILE` job in the same transaction. The executor's `resumeFrom` starts at `last_completed_date + 1`. Days 1–19 are never touched again. If somehow they were, `ON CONFLICT DO NOTHING` on matches and on case/run links makes them no-ops, and the summary is recomputed from scratch.
+
+**Done when.** A test injects a failure on day N (a test-only `MatchingStrategy` decorator that throws once on a chosen day), retries, and asserts:
+- the match count equals a clean run's;
+- there are no duplicate `(run_id, ledger_record_id)` rows (guaranteed by the constraint, but assert it anyway);
+- `exception_case_run` has the same rows as a clean run;
+- the summary columns equal a clean run's.
+
+---
+
+### M6.13 — Audit events
+
+**What.** `RUN_REQUESTED`, `RUN_STARTED`, `RUN_COMPLETED`, `RUN_FAILED`, `RUN_RETRY_REQUESTED`, plus `EXCEPTION_CREATED` per new case (from the exceptions module).
+
+**Why.** "Who started this run, when, and what did it find?" is an audit question (README question 4).
+
+**How.** All through `AuditService.record(...)`, in the same transaction as the change it describes. Payloads:
+
+| Action | `entity_type` | Payload |
+|---|---|---|
+| `RUN_REQUESTED` | `RECONCILIATION_RUN` | `{periodStart, periodEnd, currency, leftSource, rightSource, idempotencyKeyType: "client"\|"auto"}` |
+| `RUN_STARTED` | same | `{resumedFrom}` |
+| `RUN_COMPLETED` | same | The summary counts and totals |
+| `RUN_FAILED` | same | `{reason, lastCompletedDate}` |
+| `RUN_RETRY_REQUESTED` | same | `{lastCompletedDate}` |
+| `EXCEPTION_CREATED` | `EXCEPTION_CASE` | `{type, discrepancyKey, runId}` |
+
+`actor_id` is `NULL` for worker actions (V1 allows it); `request_id` is the originating request's ID for user actions, and `job:<jobId>` for worker actions.
+
+Don't put raw amounts and references of individual records in audit payloads beyond what's needed. Audit rows are permanent and can't be deleted (M10.6 reviews this).
+
+**Done when.** A completed run has exactly one each of created, started and completed events, and a failed-then-retried run has the failed and retried events in order.
+
+---
+
+### M6.14–M6.17 — API
+
+**What.** Four endpoints, plus the retry endpoint from M6.10.
+
+| Method and path | Permission | Success |
+|---|---|---|
+| `POST /api/v1/reconciliation-runs` | `RUN_CREATE` | `202` new / `200` existing |
+| `GET /api/v1/reconciliation-runs/{id}` | `RUN_READ` | `200` |
+| `GET /api/v1/reconciliation-runs/{id}/matches` | `RUN_READ` | `200`, paginated |
+| `GET /api/v1/reconciliation-runs` | `RUN_READ` | `200`, paginated |
+| `POST /api/v1/reconciliation-runs/{id}/retry` | `RUN_CREATE` | `200` |
+
+**Permission decision.** plans/authentication.plan §5 has no read permission for runs. Add `RUN_READ` to `Permission` and grant it to all four roles in `RolePermissions` (a one-line change in one file, which is the point of that design). Update the matrix in `api-design.md` (M3.7).
+
+**Why `202` and not `201`.** `201 Created` means "the resource now exists in its final form". A run is created as `PENDING` and the real work happens later, so `202 Accepted` ("I've accepted this for processing; check back") is the honest status. The body and `Location` header tell the client where to poll. Record this in the M1.12 sync/async ADR.
+
+**How.**
+
+```http
+POST /api/v1/reconciliation-runs
+Idempotency-Key: 7f9c2a10-3d1e-4b4f-9f0e-1c8a7b6d5e4f
+X-Organization-Id: 0193b9e2-…
+Content-Type: application/json
+
+{ "periodStart": "2026-10-01", "periodEnd": "2026-10-31", "currency": "AED" }
+```
+
+```http
+HTTP/1.1 202 Accepted
+Location: /api/v1/reconciliation-runs/0193c0a1-…
+
+{
+  "id": "0193c0a1-…",
+  "status": "PENDING",
+  "periodStart": "2026-10-01", "periodEnd": "2026-10-31",
+  "currency": "AED", "leftSource": "INTERNAL_LEDGER", "rightSource": "GATEWAY",
+  "progress": { "lastCompletedDate": null },
+  "summary": null,
+  "createdAt": "2026-11-01T09:12:44Z"
+}
+```
+
+`GET /{id}` returns the same shape. `summary` is `null` until `COMPLETED`, then:
+
+```json
+"summary": {
+  "matched":            { "count": 1, "amount": "1000.0000" },
+  "amountMismatch":     { "count": 1, "netDifference": "-50.0000" },
+  "unmatchedLeft":      { "count": 1, "amount": "500.0000" },
+  "unmatchedRight":     { "count": 1, "amount": "200.0000" },
+  "duplicates":         { "count": 0 },
+  "currencyMismatches": { "count": 0 }
+}
+```
+
+Serialize money as **strings**. JSON numbers are often parsed as IEEE doubles by clients (JavaScript always does), which silently loses precision on large amounts. Configure Jackson to write `BigDecimal` as a plain string (Boot 4 uses Jackson 3; check the property or `JsonMapper` customizer name in the Boot 4 docs).
+
+`GET /{id}/matches?page=0&size=50`: max `size` 200, default 50, sorted by ledger reference. One query joins both records:
+
+```sql
+SELECT m.id, m.match_type,
+       l.id AS ledger_id, l.raw_reference AS ledger_reference, l.amount AS ledger_amount, l.transaction_date AS ledger_date,
+       g.id AS gateway_id, g.raw_reference AS gateway_reference, g.amount AS gateway_amount, g.transaction_date AS gateway_date
+FROM reconciliation_match m
+JOIN transaction_record l ON l.id = m.ledger_record_id  AND l.transaction_date = m.ledger_txn_date
+JOIN transaction_record g ON g.id = m.gateway_record_id AND g.transaction_date = m.gateway_txn_date
+WHERE m.organization_id = :org AND m.run_id = :runId
+ORDER BY l.normalized_reference, m.id
+LIMIT :size OFFSET :offset;
+```
+
+Including `transaction_date` in the join lets PostgreSQL prune to one partition per lookup.
+
+`GET /reconciliation-runs?status=&from=&to=&page=&size=`: filters by status and by period overlap (`period_start <= :to AND period_end >= :from`), sorted by `created_at DESC` (served by `reconciliation_run_list_idx`).
+
+**Tenancy.** Every lookup is `WHERE id = :id AND organization_id = :org`. Another tenant's run ID gives `404` with code `not-found`, never `403` (M3.6). For `/matches`, check the run first (`404` if it isn't ours), then query the matches.
+
+Use the shared page response DTO from M2 for every list endpoint, so pagination looks the same everywhere.
+
+**Done when.** The endpoints work end to end in an integration test (upload both sample CSVs → create run → poll until `COMPLETED` → read summary and matches), and the controller tests cover `400`, `404`, `409`, `422`.
+
+---
+
+### M6.18 — Worked-example tests
+
+**What.** Engine tests that pin the exact outcome for every record in the documented examples.
+
+**Why.** These examples *are* the specification. If the engine and the docs disagree, one of them is wrong.
+
+**How.** An integration test class on the M2.16 Testcontainers base. Each test creates a **fresh organization** (audit and history tables are append-only and can't be truncated, so isolation comes from new tenants, not cleanup), inserts records directly with a fixture builder, runs the executor synchronously, and asserts.
+
+```java
+fixtures.org(org)
+    .ledger ("TXN-101", "1000.00", "INR", day1).gateway("TXN-101", "1000.00", "INR", day1)
+    .ledger ("TXN-102",  "500.00", "INR", day1)
+    .ledger ("TXN-103",  "750.00", "INR", day1).gateway("TXN-103",  "700.00", "INR", day1)
+    .ledger ("TXN-104",  "250.00", "INR", day1).gateway("TXN-104",  "250.00", "INR", day1)
+                                               .gateway("TXN-104",  "250.00", "INR", day1)
+    .ledger ("TXN-105",  "300.00", "INR", day1).gateway("TXN-105",  "300.00", "INR", day1);
+```
+
+**Example 1 (projectoverview.md §1, TXN-101..105, INR):**
+
+| Reference | Expected outcome | Linked records | `amount` | `amount_difference` |
+|---|---|---|---|---|
+| TXN-101 | `EXACT` match | 1 ledger + 1 gateway | — | 0 |
+| TXN-102 | `MISSING_IN_GATEWAY` | 1 | 500.0000 | — |
+| TXN-103 | `AMOUNT_MISMATCH` | 2 | 750.0000 | −50.0000 |
+| TXN-104 | `DUPLICATE_IN_SOURCE` | 3 | 250.0000 | — |
+| TXN-105 | `EXACT` match | 2 | — | 0 |
+
+Summary: matched 2 / 1300.0000 · mismatch 1 / −50.0000 · unmatched left 1 / 500.0000 · unmatched right 0 / 0 · duplicates 1 · currency mismatches 0.
+
+**Example 2 (projectoverview.md §5, PAY-101..104, AED):**
+
+| Reference | Expected outcome | Linked records | `amount` | `amount_difference` |
+|---|---|---|---|---|
+| PAY-101 | `EXACT` match | 2 | — | 0 |
+| PAY-102 | `MISSING_IN_GATEWAY` | 1 | 500.0000 | — |
+| PAY-103 | `AMOUNT_MISMATCH` | 2 | 750.0000 | −50.0000 |
+| PAY-104 | `MISSING_IN_LEDGER` | 1 | 200.0000 | — |
+
+Summary: matched 1 / 1000.0000 · mismatch 1 / −50.0000 · unmatched left 1 / 500.0000 · unmatched right 1 / 200.0000 · duplicates 0.
+
+The README's worked example should be one of these two tables. If it differs, copy its rows verbatim into a third test, and fix whichever document is wrong.
+
+**Edge-case tests worth one method each:**
+
+| Case | Expected |
+|---|---|
+| Ledger 31 Jan, gateway 1 Feb, run 1 Jan–28 Feb | `EXACT` match (anchor-day chunking across days) |
+| Same, run 1–31 Jan | `MISSING_IN_GATEWAY` (outside the period: documented limitation) |
+| Ledger AED, gateway USD, same reference | One `CURRENCY_MISMATCH` with key `…:AED/USD`; the USD run finds the **same** case |
+| Ledger `SUCCESS`, gateway `FAILED` | `MISSING_IN_GATEWAY`, reason `COUNTERPART_NOT_SUCCESS` |
+| Two ledger records, one gateway, different days | One `DUPLICATE_IN_SOURCE` with 3 records |
+| Same reference, `PAYMENT` and `REFUND` | Two separate groups |
+| Empty period | `COMPLETED`, all zeros |
+
+**Done when.** All of the above pass, asserting the outcome for **every** record, not just the counts.
+
+---
+
+### M6.19 — Property-based test: every record in exactly one place
+
+**What.** A jqwik property that generates random record sets and checks promise 1.
+
+**How.** Add the dependency (check the current version on Maven Central):
+
+```xml
+<dependency>
+    <groupId>net.jqwik</groupId>
+    <artifactId>jqwik</artifactId>
+    <version><!-- latest 1.9.x --></version>
+    <scope>test</scope>
+</dependency>
+```
+
+jqwik is a JUnit Platform engine, so it runs alongside JUnit Jupiter under Surefire with no extra configuration.
+
+```java
+class EveryRecordInExactlyOnePlaceProperties extends IntegrationTestBase {
+
+    @Property(tries = 100)                    // each try hits PostgreSQL; 100 is plenty
+    void everyInScopeRecordLandsInExactlyOneBucket(@ForAll("recordSets") List<RecordSpec> records) {
+        UUID org = fixtures.newOrganization();                 // fresh tenant per try: no cleanup needed
+        fixtures.insert(org, records);
+        UUID runId = runs.createAndExecute(org, PERIOD, "AED");
+
+        Set<UUID> inScope   = oracle.inScope(records, PERIOD, "AED");   // pure Java, from the rules doc
+        List<UUID> matched  = queries.matchedRecordIds(runId);          // both sides of every match
+        List<UUID> excepted = queries.exceptionLinkedRecordIds(runId);  // via exception_case_run → exception_case_record
+
+        List<UUID> all = new ArrayList<>(matched);
+        all.addAll(excepted);
+        assertThat(all).doesNotHaveDuplicates();                        // never counted twice
+        assertThat(new HashSet<>(all)).isEqualTo(inScope);              // never lost, nothing extra
+    }
+
+    @Provide
+    Arbitrary<List<RecordSpec>> recordSets() {
+        Arbitrary<String> refs     = Arbitraries.of("R1", "R2", "R3", "R4", "R5");   // few refs → many collisions
+        Arbitrary<String> currency = Arbitraries.of("AED", "AED", "AED", "USD");     // mostly the run currency
+        Arbitrary<BigDecimal> amt  = Arbitraries.of("100.00", "100.0", "99.99").map(BigDecimal::new);
+        Arbitrary<LocalDate> date  = Arbitraries.integers().between(-2, 33).map(PERIOD_START::plusDays); // some outside
+        Arbitrary<String> status   = Arbitraries.of("SUCCESS", "SUCCESS", "SUCCESS", "FAILED");
+        Arbitrary<SourceType> side = Arbitraries.of(SourceType.class);
+        return Combinators.combine(refs, currency, amt, date, status, side).as(RecordSpec::new)
+                          .list().ofMinSize(0).ofMaxSize(30);
+    }
+}
+```
+
+Design notes:
+- **Small reference pool, skewed distributions.** Random UUID references would almost never collide, and the test would only ever see "missing" outcomes. Five references across up to 30 records produce duplicates, mismatches and mixed currencies constantly.
+- `"100.0"` and `"100.00"` in the same pool exercise the `compareTo` rule inside the property.
+- Dates from −2 to +33 days put some records outside the period, checking that they're excluded.
+- The **oracle** computes only the *in-scope set*, from the scope table in M6.5. It doesn't re-implement classification. A second property can do differential testing (an in-memory classifier vs the SQL engine), but the partition property is the one that matters.
+- When jqwik finds a failure, it prints the shrunk counter-example and a seed. Turn that counter-example into a permanent example test in M6.18.
+
+**Done when.** The property passes with 100 tries, and you've seen it fail at least once by deliberately breaking the engine (for example, removing the `anchor_date = :day` filter).
+
+---
+
+### M6.20 — Running the same reconciliation twice
+
+**What.** Two tests.
+
+1. **Same key:** `POST` twice with the same body → same run ID, one job, one set of matches.
+2. **New key, same period:** a second, independent run → its own matches; the **active** exception cases are the same rows as after the first run (no new `exception_case` rows), and `exception_case_run` links both runs to them.
+
+**Done when.** `SELECT count(*) FROM exception_case WHERE organization_id = :org` is the same after the second run as after the first.
+
+---
+
+### M6.21 — Tenant isolation
+
+**What.** Organization B's records never take part in Organization A's run, and B can't see A's runs.
+
+**How.**
+- Give orgs A and B identical records (same references, amounts, dates). Run reconciliation for A. Assert every match and every linked record belongs to A, and that B's records appear nowhere in A's results.
+- Run with RLS enforced (the app's DB role, not a superuser, because superusers bypass RLS). Then temporarily drop the `organization_id` filter from the classify query in a test-only copy and assert it still returns only A's rows. That proves RLS is a real second layer.
+- API: a user of B gets `404` for `GET /reconciliation-runs/{A's run}`, for `/matches`, and for `/retry`. A's run doesn't appear in B's list. Add these to the M3.9 cross-tenant suite.
+
+**Done when.** All pass, and the cross-tenant suite lists every reconciliation endpoint.
+
+---
+
+### M6.22 — `BigDecimal` regression test
+
+**What.** `1000.0` and `1000.00` must count as equal everywhere.
+
+**How.** Three assertions:
+1. **Engine:** ledger `1000.0`, gateway `1000.00` → `EXACT` match, not `AMOUNT_MISMATCH`.
+2. **Java:** a unit test on any Java path that compares amounts (the exceptions summary mapping, test oracles) that would fail with `equals`.
+3. **Static check:** an ArchUnit rule that forbids calling `BigDecimal.equals` from production code:
+
+```java
+@ArchTest
+static final ArchRule noBigDecimalEquals =
+    noClasses().that().resideInAPackage("com.reconflow.paymentreconflow..")
+        .should().callMethod(BigDecimal.class, "equals", Object.class)
+        .because("money is compared by value: use compareTo (TASKS.md M6.22)");
+```
+
+**Done when.** All three pass, and temporarily replacing a `compareTo` with `equals` makes the build fail.
+
+---
+
+## 5. Testing strategy
+
+| Layer | What | Tooling | Where |
+|---|---|---|---|
+| Unit | `RunStatus` transitions, fingerprint and key derivation, discrepancy key building, summary mapping (left/right) | JUnit 5, AssertJ | `src/test/.../reconciliation/` |
+| Engine integration | M6.18 examples and edge cases, M6.19 property, M6.22 | Testcontainers PostgreSQL, real migrations, fixture builder | Same, `*IT` suffix if Failsafe is configured |
+| Resilience | M6.12 crash-and-retry, zombie worker fencing, concurrent identical `POST`s | Test-only `MatchingStrategy` decorator that throws on day N; `CountDownLatch` | Same |
+| API | Status codes, validation, `ProblemDetail` shape, pagination limits, permissions | `@SpringBootTest(webEnvironment = RANDOM_PORT)` + the Boot 4 HTTP test client (verify whether to use `RestTestClient` or `TestRestTemplate`) | `.../reconciliation/api/` |
+| Tenancy | M6.21 | Cross-tenant suite from M3.9 | `.../security/` |
+
+Rules:
+- **Never mock the database** for engine tests. The engine *is* SQL. A mocked `JdbcClient` tests nothing.
+- **Fresh organization per test**, not truncation. `audit_event` blocks `TRUNCATE` (V1 trigger), and M7 makes exception history append-only too.
+- Run the job executor **synchronously** in engine tests (call `RunExecutor.execute` directly) so tests don't poll. One end-to-end API test goes through the real job runner and polls with Awaitility.
+
+---
+
+## 6. Exit criteria checklist
+
+- [ ] Migration `V<next>__reconciliation_engine.sql` applied; app starts with `ddl-auto: validate`
+- [ ] `POST /reconciliation-runs` returns `202` for new, `200` for existing, `422` for a reused client key with a different body
+- [ ] Concurrent identical `POST`s create one run and one job
+- [ ] The run moves `PENDING → RUNNING → COMPLETED`, with summary columns filled
+- [ ] Both worked examples produce the exact per-record outcomes in M6.18
+- [ ] The property test passes with 100 tries
+- [ ] Crash-and-retry gives the same final state as a clean run
+- [ ] A second run with a new key creates no new active exception cases
+- [ ] Cross-tenant tests pass for every run endpoint, with RLS on
+- [ ] `BigDecimal.equals` is banned by ArchUnit
+- [ ] `docs/reconciliation-rules.md` has the scope table, the outcome precedence, the key format, the sign convention, and the "resolved case reappears" rule
+- [ ] ADRs written: anchor-day chunking; run idempotency key; `202` for run creation; exceptions-module API instead of events
+- [ ] **TASKS.md exit criterion:** upload both sample files, start a run, get the expected matches and exceptions; repeat the run, nothing changes
+
+---
+
+## 7. Interview questions this phase prepares you for
+
+**"How do you make a batch job safe to retry?"**
+Split it into chunks and commit each chunk's output together with a checkpoint in one transaction, so a crash leaves either the whole chunk or none of it. Back that up with unique constraints and `ON CONFLICT DO NOTHING`, so even a re-executed chunk can't create duplicates. The job runner gives at-least-once execution; the constraints give exactly-once effects.
+
+**"What's the difference between at-least-once and exactly-once?"**
+At-least-once means a message or job may be delivered more than once, which is what any real system with retries gives you. True exactly-once *delivery* is impossible across failures, but exactly-once *effects* are achievable by making the consumer idempotent: deduplicate on a key the database enforces. That's what the run key, the match constraints and the discrepancy key do here.
+
+**"Why process in SQL instead of Java?"**
+A month of data for a large tenant is millions of rows; loading it into Java maps costs gigabytes of heap and two network round trips per row. A set-based `GROUP BY` runs where the data is, uses hash aggregation and indexes, and never materializes objects. Java still owns orchestration, lifecycle and the rules that are awkward in SQL.
+
+**"How do you handle a race where two requests insert the same unique key?"**
+Let the database decide: `INSERT … ON CONFLICT DO NOTHING RETURNING id`, then re-read in a new statement if nothing came back. In PostgreSQL, catching the unique-violation exception inside the same transaction doesn't work, because the transaction is aborted after the error. Check-then-insert in application code always has a window between the check and the insert.
+
+**"Why `202` and not `201`?"**
+`201` says the resource was created and is complete. A reconciliation run is accepted and processed later, so `202` with a `Location` to poll is the honest answer. The client learns the outcome from the status field, not from the response code of the `POST`.
+
+**"How would you match transactions when the same reference appears twice?"**
+You don't pick one. Group by the match key, count per side, and if either side has more than one candidate, raise a duplicate exception that links every record. An arbitrary pick could hide a double charge, and it makes the result non-deterministic.
+
+**"What's a fencing token?"**
+A worker that lost its lease (GC pause, network partition) may not know it, and can wake up and keep writing after another worker took over. A fencing token is a monotonically increasing value the storage layer checks on every write, so writes from a stale owner are rejected. Here the run's checkpoint plays that role: each chunk locks the run row and refuses to write unless the checkpoint is exactly where it expects.
+
+**"Why is `new BigDecimal("1.0").equals(new BigDecimal("1.00"))` false?"**
+`equals` compares the unscaled value and the scale, and those differ (10 with scale 1 versus 100 with scale 2). Money must be compared by numeric value, so use `compareTo(...) == 0`. A common related bug is putting `BigDecimal` keys in a `HashMap` or `HashSet`, where `1.0` and `1.00` become different keys.
+
+**"What's a partial unique index and when would you use one?"**
+A unique index with a `WHERE` clause, so uniqueness applies only to rows matching the predicate. Here it means "at most one *active* case per discrepancy", while still allowing any number of resolved ones. Without it you'd need application-level checks, which race.
+
+**"What is property-based testing, and what property did you test?"**
+Instead of fixed examples, you state an invariant and let the framework generate many random inputs and shrink any failure to a minimal case. I tested that every in-scope record ends up in exactly one place, either a match or an exception, across random mixes of duplicates, currencies, statuses and dates. It found edge cases I hadn't thought to write.
+
+---
+
+## 8. Common mistakes
+
+| Mistake | Consequence | Instead |
+|---|---|---|
+| Pairing records in a loop and picking the "first" duplicate | Non-deterministic results; a double charge disappears | Group, count, classify; duplicates become cases |
+| Chunking by day and only looking within the day | Every settlement-lag payment becomes two false exceptions | Anchor-day chunking: each group processed once, in full |
+| Committing matches in one transaction and the checkpoint in another | A crash between them redoes or skips a day | Same transaction for the chunk output and the checkpoint |
+| `@Transactional` on a method called via `this.` | No transaction at all, or one giant one | `TransactionTemplate`, or call through another bean |
+| Catching `DataIntegrityViolationException` and querying in the same transaction | "current transaction is aborted" | `ON CONFLICT DO NOTHING`, then re-read |
+| Writing exceptions from an `AFTER_COMMIT` event listener | Lost exceptions after a crash; checkpoint says done | Synchronous module API in the chunk transaction |
+| Putting the period or run ID in the discrepancy key | Every run creates new active cases | Key on the discrepancy itself: type, reference, transaction type, currencies |
+| Comparing money with `equals` or `double` | `1000.0 ≠ 1000.00`, rounding drift | `compareTo`, `NUMERIC`, strings in JSON |
+| Inserting matches through JPA `saveAll` | Slow, memory-heavy, defeats set-based design | `INSERT … SELECT` |
+| Mocking the database in engine tests | Tests pass, SQL is wrong | Testcontainers with real migrations |
+| Truncating tables between tests | Fails on append-only tables; tests depend on order | Fresh organization per test |
+| Testing tenancy as superuser | RLS is silently bypassed | Run tests with the application's DB role |

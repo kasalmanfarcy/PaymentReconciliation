@@ -1,0 +1,356 @@
+# Later — v2 scope
+
+**Status:** Not started · **Tasks:** TASKS.md "Later — v2 scope" · **Depends on:** v1 shipped (M11 exit criteria met) · **Date:** 2026-11-01
+
+v1 does one thing well: deterministic one-to-one matching of two CSV sources, with a safe investigation workflow. Real payment reconciliation is messier. Settlements are aggregated, fees are deducted, money arrives days later, a third source (the bank) has the final word, and data arrives without anyone uploading it.
+
+This file sketches each v2 item well enough to plan it, estimate it and talk about it in an interview. It is **not** a build plan: each item becomes its own phase plan, in the same format as M0–M11, when you pick it up.
+
+**Two rules for every item:**
+
+1. **Update `docs/reconciliation-rules.md` first, then write an ADR.** Every item below changes what "match" means or where data comes from. If the rule isn't written down before the code, the tests have nothing to test against.
+2. **v1 ships first.** None of these is worth starting while the v1 demo (upload → run → resolve → report) isn't working end to end and deployed. A finished v1 is a stronger portfolio piece than a half-built v2.
+
+---
+
+## 1. Dependency order
+
+Some items change foundations that others build on. Build them in this order:
+
+```mermaid
+flowchart LR
+    T[2. Transaction types<br/>refunds, chargebacks, fees] --> F[3. Fee-aware matching]
+    T --> A[1. One-to-many /<br/>many-to-one matching]
+    W[4. Settlement-date windows] --> A
+    A --> B[5. Bank statement<br/>three-way]
+    F --> B
+    M[6. Manual match / unmatch] --> A
+    C[7. Per-org column mappings] --> S[8. Scheduled imports<br/>SFTP, object storage, API pulls]
+    N[9. Notifications]
+    U[10. Minimal web UI]
+    R[11. Redis: only if measured]
+```
+
+| Order | Item | Why here |
+|---|---|---|
+| 1 | Transaction types (§2) | Every later matching rule needs to know whether a row is a payment, refund, chargeback or fee |
+| 2 | Settlement-date windows (§4) | Small, self-contained, and the aggregation work needs it |
+| 3 | Manual match / unmatch (§6) | Gives investigators a way out of ambiguous cases before the automatic rules get more complex |
+| 4 | Fee-aware matching (§3) | Needs fee rows to be typed |
+| 5 | One-to-many / many-to-one (§1) | The biggest engine change; needs types, windows and manual match in place |
+| 6 | Bank statement, three-way (§5) | Builds on aggregation: a bank deposit is almost always an aggregate |
+| — | Column mappings (§7) → scheduled imports (§8) | An independent track. Automated pulls need per-org mappings, because nobody is there to fix a header |
+| — | Notifications (§9), web UI (§10) | Independent; can be done any time after v1 |
+| — | Redis (§11) | Only when a measurement says so. It may never happen |
+
+Sections below follow TASKS.md's order, not build order.
+
+---
+
+## 2. Shared schema facts to know before starting
+
+V1's schema already anticipates some of this, and blocks some of it:
+
+| Fact | Effect on v2 |
+|---|---|
+| `transaction_record.transaction_type` CHECK already allows `PAYMENT`, `REFUND`, `CHARGEBACK`, `FEE` | §2 needs no schema change for the types themselves |
+| `transaction_record.source_type` CHECK allows only `INTERNAL_LEDGER`, `GATEWAY` | §5 needs a migration to add `BANK` (on `import_batch` and `reconciliation_run`'s source columns too) |
+| `reconciliation_match` has `UNIQUE (run_id, ledger_record_id)` and `UNIQUE (run_id, gateway_record_id)`, with one ledger and one gateway column | §1 can't fit in this table. It needs a match-group model (see §1) |
+| `reconciliation_match.match_type` CHECK allows only `EXACT` | §1, §3, §6 extend it |
+| `reconciliation_match.amount_difference` exists and is always 0 for `EXACT` | §3 uses it for the fee |
+| Applied migrations are never edited | Every change above is a new migration |
+
+---
+
+## 3. The items
+
+### 3.1 One-to-many and many-to-one matching (aggregated settlements)
+
+**The business problem.** A gateway rarely pays out each payment separately. It sends one settlement line, "payout PO-5521: 48,250.00 AED", covering 312 customer payments from yesterday. The ledger has 312 rows; the gateway file has one. v1 reports 312 `MISSING_IN_GATEWAY` cases and one `MISSING_IN_LEDGER`, which is technically true and practically useless.
+
+The reverse (many-to-one) also happens: one large order paid in instalments, recorded once in the ledger and several times by the gateway.
+
+**Design sketch.**
+
+- **Linking key.** Aggregates are only matchable if something links the parts to the whole. Gateways usually provide it: a `payout_id` / `settlement_id` column on each payment row, or a separate settlement report listing which payments are in which payout. Without a linking key, the problem becomes subset-sum (see "hard parts"). **Find out what the target gateways actually provide before designing anything.**
+- **Schema** (new migration):
+
+```sql
+-- A match is now a group with members on each side, not a pair.
+CREATE TABLE reconciliation_match_group (
+    id                 UUID          PRIMARY KEY,
+    organization_id    UUID          NOT NULL REFERENCES organization (id),
+    run_id             UUID          NOT NULL REFERENCES reconciliation_run (id),
+    match_type         TEXT          NOT NULL CHECK (match_type IN ('EXACT', 'AGGREGATE', 'FEE_ADJUSTED', 'MANUAL')),
+    left_total         NUMERIC(19,4) NOT NULL,
+    right_total        NUMERIC(19,4) NOT NULL,
+    amount_difference  NUMERIC(19,4) NOT NULL,
+    created_at         TIMESTAMPTZ   NOT NULL DEFAULT now()
+);
+
+CREATE TABLE reconciliation_match_member (
+    group_id               UUID NOT NULL REFERENCES reconciliation_match_group (id),
+    run_id                 UUID NOT NULL,                      -- denormalized for the unique key
+    organization_id        UUID NOT NULL REFERENCES organization (id),
+    transaction_record_id  UUID NOT NULL,
+    transaction_date       DATE NOT NULL,
+    side                   TEXT NOT NULL CHECK (side IN ('LEFT', 'RIGHT')),
+    PRIMARY KEY (group_id, transaction_record_id),
+    UNIQUE (run_id, transaction_record_id),                    -- still: a record is matched once per run
+    FOREIGN KEY (transaction_record_id, transaction_date) REFERENCES transaction_record (id, transaction_date)
+);
+```
+
+  Keep `reconciliation_match` for v1's `EXACT` pairs, or migrate it into groups of size 1+1. Migrating gives one model for reports; keeping it avoids touching working code. Decide in the ADR. If you migrate, use the expand/contract pattern (M11): write both, backfill, switch reads, then drop.
+
+- **Engine.** A new `MatchingStrategy`, `PayoutAggregateStrategy`, running **after** `ExactReferenceStrategy` on the records it left unmatched. Set-based, like v1: `GROUP BY payout_id` on the ledger side (sum of payments) joined to the gateway's payout line. Equal totals → `AGGREGATE` group. Unequal → a new exception type `AGGREGATE_MISMATCH` linking every member.
+- **Strategy ordering becomes a rule.** "Exact first, then aggregate, then fee-adjusted" must be written in `reconciliation-rules.md`, and every record must still end up in exactly one place. The M6.19 property test extends to cover the new outcomes.
+- **API.** Matches endpoint returns groups with members; the exception detail view handles hundreds of linked records (paginate them now; v1 capped at 500).
+
+**Hard parts.**
+- **No linking key → subset-sum.** "Which of these 312 payments add up to 48,250.00?" is NP-hard in general. Real systems avoid it: they require the linking key, or narrow candidates by date and merchant and accept only a unique solution, sending everything else to manual review (§6). Don't build a subset-sum solver.
+- **Partial payouts.** The payout covers 311 of the 312 payments; one is held for risk review. That's an aggregate mismatch with a meaningful cause, so the exception needs to say *which* member is missing, not just "totals differ".
+- **Idempotency.** The discrepancy key for an aggregate case must be stable across runs: key it on the payout reference (`AGGREGATE_MISMATCH:<payout_id>:<currency>`), not on member lists that can change.
+
+**Decide or measure first.** What linking data do real gateway settlement reports contain? (Stripe payouts, Adyen settlement details, Razorpay settlements all differ.) What share of volume is aggregated?
+
+**Interview angle.** "How would you match one bank deposit to hundreds of payments?" Group by a linking key and compare totals set-based; explain why the general version is subset-sum and NP-hard, and how real systems avoid it with linking keys, narrow candidate windows and manual review.
+
+---
+
+### 3.2 Refunds, chargebacks and fees as distinct transaction types
+
+**The business problem.** v1 effectively reconciles payments. But a ledger also records refunds; a gateway file includes chargebacks (the customer's bank pulled money back) and fees. Treating all of them as `PAYMENT` produces wrong matches (a refund matching the original payment with the same reference) and wrong totals.
+
+**Design sketch.**
+- **Schema:** the types already exist in V1's CHECK. Add `related_reference` (nullable) to `transaction_record` in a new migration: a refund or chargeback points at the payment it reverses.
+- **Import:** map source columns to types per source (`type=refund`, `txn_kind=CB`, …). With §7, the mapping is per organization.
+- **Amounts:** M5 decided amounts are positive and direction comes from `transaction_type`. Write the sign table into `reconciliation-rules.md`: `PAYMENT +`, `REFUND −`, `CHARGEBACK −`, `FEE −` from the merchant's point of view. Reports apply the sign; storage never does.
+- **Engine:** v1's match key already includes `transaction_type`, so a refund only matches a refund. New rules:
+  - A chargeback in the gateway with no ledger entry → new exception type `UNRECORDED_CHARGEBACK` (common and important: money already left the account).
+  - A refund whose `related_reference` has no payment in the ledger → `ORPHAN_REFUND`.
+- **Reporting:** net settlement = payments − refunds − chargebacks − fees. M8's reports gain a by-type breakdown.
+
+**Hard parts.**
+- Chargebacks have their own lifecycle (opened, won, lost, reversed). Don't model it in v2; reconcile the money movements and leave dispute management out of scope.
+- Partial refunds: one payment, several refunds. Matching refunds to refunds is still one-to-one by refund reference; the link to the payment is informational.
+
+**Decide first.** The exact column values each target source uses for types, and the sign convention. Add sample CSVs for each type to `docs/samples/`.
+
+**Interview angle.** "How do you represent refunds: negative amounts or a type?" A type plus a positive amount, with direction derived from the type in one place. Mixed sign conventions across sources are a classic source of reconciliation bugs.
+
+---
+
+### 3.3 Fee-aware matching (gross versus net settlement)
+
+**The business problem.** The ledger records the customer paid 1,000.00. The gateway settles 971.00: 1,000.00 minus a 2.9% fee. v1 calls that an `AMOUNT_MISMATCH` every single time. With thousands of payments a day, the exception queue fills with noise, and real mismatches hide in it. (This is exactly PAY-103 in the worked example: 750 vs 700.)
+
+**Design sketch.**
+- **Two source shapes:**
+  1. The gateway file has gross, fee and net columns per payment → compare ledger amount to **gross**, record fee as `amount_difference`. Easy and exact.
+  2. The gateway file has only net → compare against an **expected fee** from a fee schedule, with a tolerance.
+- **Schema:** `transaction_record.fee_amount NUMERIC(19,4)` and `gross_amount` (nullable) for shape 1. A new `fee_schedule` table for shape 2: `(organization_id, gateway, payment_method, percent NUMERIC(7,4), fixed NUMERIC(19,4), currency, valid_from, valid_to)`.
+- **Engine:** new `FeeAdjustedStrategy` after exact matching. Shape 1: `ledger.amount = gateway.gross_amount` → `FEE_ADJUSTED` match with `amount_difference = fee`. Shape 2: `|ledger.amount − expected_fee − gateway.amount| ≤ tolerance` → `FEE_ADJUSTED`; outside tolerance → `AMOUNT_MISMATCH` with a reason code `FEE_OUTSIDE_TOLERANCE`.
+- **Rounding:** the expected fee is computed with an explicit rounding mode (the gateway's, usually `HALF_UP` or `HALF_EVEN` to the currency's minor unit). Write it in `reconciliation-rules.md`; it's the kind of detail that produces 0.01 mismatches on 3% of rows.
+- **Reporting:** total fees per run and per period become a first-class report: finance teams want to know what they paid.
+
+**Hard parts.**
+- **Tolerance is a business decision, not a technical one.** "Within 0.01" is defensible; "within 1%" will hide real problems. Make it per-organization configuration, audited when changed.
+- Fee schedules change over time and per payment method. `valid_from`/`valid_to` and the payment's date pick the right one.
+- Fees charged separately (a monthly fee line in the settlement) belong to §3.2's `FEE` type, not to per-payment matching.
+
+**Decide first.** Which target gateways report gross/fee/net per row (shape 1 is far simpler)? What tolerance would a real finance team accept?
+
+**Interview angle.** "How do you compare amounts that are supposed to differ?" Model the expected difference explicitly (a fee column or a schedule), compare with an explicit, documented tolerance and rounding mode, and record the difference on the match so it's auditable, never `Math.abs(a − b) < 0.5` hidden in code.
+
+---
+
+### 3.4 Configurable settlement-date windows
+
+**The business problem.** A payment captured at 23:58 on 31 October settles on 2 November. A run for October finds the ledger record and no gateway record, and raises `MISSING_IN_GATEWAY`. A run for November raises `MISSING_IN_LEDGER` for the gateway record. Both are false positives.
+
+**Design sketch.**
+- v1's match key already excludes the date: two records match if both are **inside the run period** (phase-M1 §3). A window extends that: the **right** side's candidate range becomes `[period_start − before, period_end + after]`.
+- **Configuration:** per organization and source pair, e.g. `gateway_settles_within_days = 3`. A table `reconciliation_settings (organization_id, left_source, right_source, window_before_days, window_after_days, …)`, changes audited.
+- **Engine:** the classify query widens the right-side date filter. Partition pruning still works: it's still a date range.
+- **Run record:** store the effective window on `reconciliation_run` (`window_before_days`, `window_after_days`) so a run's result can be explained later even if the setting changes.
+- **Idempotency:** the run's derived idempotency key (M1) must include the window, or two runs with different windows would be considered "the same run".
+
+**Hard parts.**
+- **Double use across runs.** With a window, a gateway record dated 2 November can match a ledger record in the October run *and* be a candidate in the November run. Rule: in the November run, a right-side record already matched by a `COMPLETED` run is excluded from candidates. That rule needs a query across runs; index for it.
+- Bigger windows mean more candidates and more chance of a false match on reused references. Keep windows small and per-gateway.
+
+**Decide first.** The real settlement lag distribution for each gateway. Measure it from v1 data: for matched pairs, `gateway.transaction_date − ledger.transaction_date`.
+
+**Interview angle.** "How do you reconcile data where the two sides arrive on different days?" A configurable, recorded tolerance window on one side, plus a rule preventing a record from being consumed by two runs; explain why the window must be part of the run's identity.
+
+---
+
+### 3.5 Bank statement as a third source (three-way reconciliation)
+
+**The business problem.** The gateway says it paid out 48,250.00. Did the money actually arrive in the bank account? Gateway-to-ledger matching proves the gateway agrees with you; only the bank statement proves you have the money. Three-way reconciliation is ledger ↔ gateway ↔ bank.
+
+**Design sketch.**
+- **Schema:** add `BANK` to the `source_type` CHECKs (new migration; the V1 CHECKs are on `import_batch`, `transaction_record`, `reconciliation_run.left_source`/`right_source`). Bank rows carry the payout reference in the narrative/description field, usually unstructured.
+- **Two runs, chained,** rather than one three-way run: run A matches ledger ↔ gateway (payments to payouts, via §3.1); run B matches gateway payouts ↔ bank deposits. A "three-way status" view joins them: a payment is fully reconciled when it's in a matched payout that's in a matched deposit.
+- **Formats:** banks provide CSV exports, but also ISO 20022 `camt.053` (XML) and older MT940. Start with CSV through §3.7's mapping; add a `camt.053` parser as a separate import format later.
+- **Reference extraction:** the payout ID is buried in text like `STRIPE PAYOUT PO_5521 REF 8812`. Extraction rules (regex per bank, per organization) become part of normalization and must keep the raw text.
+
+**Hard parts.**
+- **Fuzzy references.** Bank narratives are inconsistent. Exact matching on an extracted reference first, then amount + date-window candidates sent to manual review (§6). Don't auto-match on amount alone.
+- **Bank-side aggregation.** One bank deposit may combine several payouts. That's §3.1 again, one level up.
+- **Currency conversion.** A USD payout landing in an AED account needs an FX rate and a tolerance. That breaks the v1 "one currency per run" assumption; write an ADR before starting.
+
+**Decide first.** Which bank export formats the target users have. Whether FX is in scope at all.
+
+**Interview angle.** "What's three-way reconciliation and why does it matter?" Ledger vs processor proves the records agree; processor vs bank proves the cash arrived. Explain chaining two-way runs instead of one complex three-way join, and how reference extraction from unstructured bank text works.
+
+---
+
+### 3.6 Manual match and unmatch, with audit
+
+**The business problem.** The engine is deliberately strict: duplicates and ambiguous cases become exceptions, never guesses. Some of those an investigator can resolve by saying "*this* ledger row and *that* gateway row are the same payment" (a typo in the reference, a reference reformatted by the gateway). Today they can only resolve the exception with a note; the match itself never exists, so reports keep counting both records as unmatched.
+
+**Design sketch.**
+- **API:**
+  - `POST /api/v1/reconciliation-runs/{runId}/manual-matches` with `{ leftRecordIds: [...], rightRecordIds: [...], reason, exceptionId? }` → creates a `MANUAL` match group (§3.1's model).
+  - `DELETE /api/v1/manual-matches/{id}` (or `POST …/unmatch`) with a reason → removes it.
+- **Rules:**
+  - Records must belong to the run, the organization, and not already be matched in that run (the `UNIQUE (run_id, transaction_record_id)` constraint enforces it).
+  - Totals must be equal, or the difference must be explained with a reason code (`MANUAL_WITH_DIFFERENCE`).
+  - The linked exception is resolved in the same transaction with resolution code `MANUALLY_MATCHED`.
+  - Permission: a new `MATCH_MANUAL` (investigator, admin); unmatch: admin only. Four-eyes (one person proposes, another approves) is a common real-world control; consider it as a later addition.
+- **Audit:** `MATCH_CREATED_MANUALLY`, `MATCH_REMOVED`, each with the full member list.
+- **Re-runs:** a manual match must survive re-running the period. Rule: manual matches are carried forward: a new run for an overlapping period first copies `MANUAL` groups whose members are all in scope, then runs the automatic strategies on the rest.
+
+**Hard parts.**
+- **Carry-forward semantics** are the real design work. What if a carried-forward member's record was deleted by a re-import (§M5 retry)? The group becomes invalid; raise an exception rather than silently dropping it.
+- Unmatching must reopen or recreate the exception it resolved, with history.
+
+**Decide first.** Whether manual matches belong to a run or to the organization (global "these two records are the same" assertions). Per-run is simpler; global is what users expect after the second re-run. Write the ADR.
+
+**Interview angle.** "How do you let humans override an automated decision without losing auditability?" A separate match type, explicit permissions, mandatory reasons, full audit of create and remove, and a defined rule for how overrides survive re-processing.
+
+---
+
+### 3.7 Per-organization configurable CSV column mappings
+
+**The business problem.** v1 has two hard-coded CSV contracts (M1.3). Every gateway exports differently: `merchant_reference` vs `order_id` vs `Reference`; `dd/MM/yyyy` vs ISO dates; `1.234,56` vs `1,234.56`. Today an organization must reformat its files by hand before uploading.
+
+**Design sketch.**
+- **Schema:** `import_mapping (id, organization_id, name, source_type, version, definition JSONB, created_by, created_at)`. `definition` maps target fields to source columns and parsing options:
+
+```json
+{
+  "columns": {
+    "reference": "Order ID",
+    "amount": "Net Amount",
+    "currency": "Currency",
+    "transaction_type": { "column": "Type", "values": { "charge": "PAYMENT", "refund": "REFUND" } },
+    "status": { "column": "State", "values": { "paid": "SUCCESS", "failed": "FAILED" } },
+    "transaction_at": "Created (UTC)"
+  },
+  "dateFormat": "dd/MM/yyyy HH:mm",
+  "decimalSeparator": ",",
+  "delimiter": ";",
+  "encoding": "UTF-8"
+}
+```
+
+- **Versioned and immutable:** editing a mapping creates a new version. `import_batch` records the `mapping_id` + `version` it was parsed with, so any batch can be explained and reprocessed exactly.
+- **Validation:** a mapping is validated against a JSON Schema on save, and there's a "dry run" endpoint: upload a sample, get the first 20 parsed rows and any errors, no data written.
+- **Code:** the M5 validator and normalizer take a `ColumnMapping` instead of hard-coded column names. If M5 kept the parsing behind an interface (`RowReader`), this is mostly configuration.
+
+**Hard parts.**
+- Mappings are user-supplied input that controls parsing. Validate strictly: no regex from users without limits (catastrophic backtracking is a denial-of-service), bounded number of columns.
+- Changing a mapping must not change already-imported data. That's why versions are immutable.
+
+**Decide first.** Collect 3–5 real-world export formats (public sample files from gateways' docs) and check that the mapping language covers them before building it.
+
+**Interview angle.** "How do you support many input formats without a code change per customer?" Declarative, versioned mappings validated against a schema, recorded on every import for reproducibility, with a dry-run tool.
+
+---
+
+### 3.8 Scheduled imports from SFTP or object storage, and gateway API pulls
+
+**The business problem.** Finance teams don't want to download a file every morning and upload it. Gateways drop settlement files on SFTP or into a bucket overnight, or offer an API.
+
+**Design sketch.**
+- **Connections:** `import_source (id, organization_id, kind SFTP|S3|GATEWAY_API, config JSONB, credentials_ref, mapping_id, schedule cron, enabled)`. Credentials are **never** stored in the database in plain text: `credentials_ref` points to a secret manager entry (or an encrypted column with a key outside the DB as the minimum).
+- **Scheduling:** the M5 job table gains a `FETCH` job type. A scheduler (one per cluster, via a PostgreSQL advisory lock or ShedLock) enqueues `FETCH` jobs on each source's cron.
+- **Fetch job:** list remote files → skip ones already fetched (a `fetched_file (import_source_id, remote_path, remote_etag_or_mtime, content_hash)` table) → download to `FileStorage` → create the `import_batch` and `IMPORT` job exactly as an upload would. The existing content-hash duplicate rule (409 in v1) becomes "skip and record" for automated sources.
+- **API pulls:** per-gateway adapters behind one interface (`SettlementApiClient`), paging through settlements since the last cursor. Store the cursor per source; respect rate limits; retry transient errors with backoff (M9.3's classifier).
+- **Audit:** `IMPORT_FETCHED` with source and remote path; the actor is the system, with `import_source_id` in the payload.
+
+**Hard parts.**
+- **Exactly-once fetch.** Download succeeded, crash before recording it → refetched next time. The content hash makes the second import a no-op, which is why the duplicate rule must be idempotent, not an error, for automated sources.
+- **Partial files.** A file still being written to SFTP can be fetched half-done. Use the gateway's completion convention (a `.done` marker, a rename) or require the size to be stable across two listings.
+- **Outbound network calls from workers** to customer-configured hosts are an SSRF risk: allowlist hosts, block private IP ranges.
+
+**Depends on:** §3.7 (no human to fix headers when the import runs at 03:00).
+
+**Interview angle.** "How do you build a reliable scheduled ingestion pipeline?" A single scheduler via a lock, idempotent fetch tracked by remote identity and content hash, reuse of the same import pipeline as manual uploads, secrets outside the database, and SSRF protection for user-configured endpoints.
+
+---
+
+### 3.9 Notifications: assignment and ageing past an SLA
+
+**The business problem.** An exception is assigned and nobody notices. Another sits open for three weeks. Investigators shouldn't have to poll the list.
+
+**Design sketch.**
+- **Events:** `EXCEPTION_ASSIGNED` already exists in the audit log (M7). For assignment notifications, publish a domain event in the same transaction and deliver **after commit**, via the transactional outbox pattern (M9 explains it): an `outbox` row written with the change, a worker that sends and marks it sent. Spring Modulith's event publication registry implements exactly this; consider it.
+- **SLA ageing:** a daily `NOTIFY_AGEING` job queries open exceptions past per-organization thresholds (`sla_hours` by exception type), and sends one digest per assignee, not one message per case.
+- **Channels:** email first (SMTP via a provider), then Slack/Teams webhooks. A `NotificationChannel` interface; per-user preferences (`notification_preference`).
+- **Idempotency:** a `notification_sent (key, sent_at)` table with a unique key such as `ASSIGNED:<exceptionId>:<version>` or `AGEING:<userId>:<date>`, so retries never double-send.
+
+**Hard parts.**
+- Never send from inside the business transaction: if the transaction rolls back, the email was still sent. That's the dual-write problem; the outbox solves it.
+- Notification content must not leak financial details to channels that aren't access-controlled. Send a link, not the amounts.
+
+**Interview angle.** "How do you send an email when a database change commits, without losing or duplicating it?" The transactional outbox: write the intent in the same transaction, deliver asynchronously with retries, deduplicate with an idempotency key.
+
+---
+
+### 3.10 A minimal web UI for exception investigation
+
+**The business problem.** The API is complete, but finance users won't use `curl`. A small UI also makes the portfolio demo far more convincing.
+
+**Design sketch.**
+- **Scope:** login, exception list with filters, exception detail (both records side by side, notes, history), assign / resolve / reopen, run list with summary. Nothing else.
+- **Stack choice** (ADR): a separate SPA (React + TypeScript + Vite) talking to the existing API, or server-rendered pages (Thymeleaf + htmx) inside the app. The SPA showcases API design and CORS/auth handling; htmx is far less code and keeps one deployable. For a backend-focused portfolio, **htmx is the pragmatic choice**; for a full-stack role, the SPA.
+- **Auth:** with Keycloak (M10.1), use the authorization-code flow with PKCE for an SPA, or a session-backed login for server-rendered pages. Don't put tokens in `localStorage`.
+- **Concurrency UX:** the API's `409 stale-version` needs a real UI answer: "this case was changed by Alice at 10:02, reload to see the changes". This is where M7's design pays off visibly.
+
+**Hard parts.** Keeping it small. Every screen invites "just one more feature".
+
+**Interview angle.** "How does your UI handle concurrent edits?" It sends the `ETag` back as `If-Match`, and on `409` shows who changed what and offers a reload, instead of retrying blindly.
+
+---
+
+### 3.11 Redis, only if a measured need appears
+
+**The business problem.** Possibly none. docs/scalability.md decision D8 says: nothing needs caching at v1 scale. Report totals are precomputed at run completion, hot reads are indexed lookups, and coordination is done with PostgreSQL (`SKIP LOCKED`, advisory locks).
+
+**When it would be justified** (docs/scalability.md §8 style: a measured signal, not a feeling):
+
+| Signal | Possible Redis use | Alternative to try first |
+|---|---|---|
+| Rate limiting (M10.4) must be accurate across many API instances | Shared token buckets (Bucket4j has a Redis backend) | Rate limiting at the load balancer / API gateway |
+| A repeated expensive read with a stable result shows up in the top slow queries | Cache with explicit TTL and invalidation on write | A materialized view or a precomputed summary table |
+| Session storage for a server-rendered UI (§3.10) across instances | Spring Session with Redis | Spring Session JDBC in PostgreSQL |
+
+**Rule.** Write the ADR with the measurement before adding it. Caching financial data adds an invalidation problem where stale data is a correctness bug, not just a UX issue.
+
+**Interview angle.** "Why didn't you use Redis?" Because no measurement called for it: the database handles the load with headroom, report totals are precomputed, and adding a cache to financial data introduces a consistency risk. Then name the specific signal that would change the decision.
+
+---
+
+## 4. How to turn an item into a phase
+
+When you pick an item up:
+
+1. Write the `reconciliation-rules.md` change and the ADR. Get the rule right on paper with worked examples (tables like projectoverview.md §5).
+2. Add sample CSVs for the new scenarios to `docs/samples/`.
+3. Create `plans/phase-v2-<item>.plan` in the same 8-section format as M0–M11, with task IDs (`V2.1.1`, …) added to TASKS.md.
+4. Extend, don't fork, the v1 invariants: every record in exactly one place per run, idempotent runs, one active case per discrepancy, audit in the same transaction. Add each new outcome to the M6.19 property test.
+5. Update `docs/architecture.md`, `api-design.md` and the README roadmap when it ships.

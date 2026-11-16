@@ -1,0 +1,934 @@
+# Phase M1 — Requirements and system design
+
+**Status:** Not started · **Tasks:** TASKS.md M1.1–M1.12 · **Depends on:** M0 (repository on GitHub, PR workflow) · **Date:** 2026-11-01
+
+This phase produces documents, not code: five design docs, a set of sample files and a folder of Architecture Decision Records (ADRs). Every later phase implements something these documents define. If a rule isn't written here, two parts of the code will end up disagreeing about it, and the disagreement surfaces as a bug in M6 or M7.
+
+The schema in `V1__initial_schema.sql` was written before this phase, so several decisions are already made in SQL. This phase writes those decisions down with their reasons, and settles the ones the schema leaves open. Treat it as catching up the paperwork, which is common in real teams, and say so honestly if asked.
+
+---
+
+## 1. Goal
+
+At the end of this phase the repository contains:
+
+```
+docs/
+├── requirements.md            M1.1, M1.2, M1.3
+├── reconciliation-rules.md    M1.5, M1.6, M1.7, M1.8
+├── architecture.md            M1.9
+├── database-design.md         M1.10
+├── api-design.md              M1.11
+├── scalability.md             (exists)
+├── samples/                   M1.4
+│   ├── README.md              expected outcome of every sample
+│   ├── ledger-basic.csv
+│   ├── gateway-basic.csv
+│   └── … (full list in §4.4)
+└── adr/                       M1.12
+    ├── 0000-template.md
+    ├── 0001-record-architecture-decisions.md
+    └── … (full list in §4.12)
+```
+
+and the README's "Open design questions" section is replaced with links to the ADRs that answer them.
+
+**The demo that proves it:** give `docs/reconciliation-rules.md` and `docs/samples/` to someone who hasn't seen the project. Using only those, they can predict by hand the exact outcome (matched, mismatch, missing, duplicate) of every record in the samples, and their answer agrees with `docs/samples/README.md`. In M6 the engine's tests assert the same table.
+
+---
+
+## 2. Concepts to understand first
+
+### 2.1 Functional versus non-functional requirements
+
+- A **functional requirement** says *what* the system does: "An uploader can upload a gateway settlement CSV."
+- A **non-functional requirement (NFR)** says *how well*: "A 100k-row file is fully processed within 2 minutes at p95." NFRs cover performance, availability, security, auditability, recoverability and so on.
+
+Write NFRs as **measurable** statements. "The system should be fast" can't be tested; "p95 latency of list endpoints under 300 ms with 100 concurrent users" can. The numbers come from `docs/scalability.md` §6.
+
+**Interview angle:** in a system-design interview, the first five minutes are requirements. Candidates who ask "how many users, how much data, what latency, what consistency" before drawing boxes score higher than those who start with Kafka.
+
+### 2.2 Scope and assumptions
+
+An explicit **out-of-scope** list is as important as the in-scope list. It stops scope creep and gives you a ready answer to "what about refunds?" ("Out of v1 scope, deliberately; here's how v2 would handle it.") **Assumptions** are things you're treating as true without proof (one currency per transaction, CSV only, synthetic data). Writing them down means you notice when one stops being true.
+
+### 2.3 Normalization versus raw values
+
+Source files are messy: `" pay-101 "`, `"PAY-101"` and `"Pay-101"` are the same payment. **Normalization** produces a canonical form for comparison (`PAY-101`) while the **raw value** is kept untouched. You need both: the normalized value to match, and the raw value to show an investigator exactly what the file said. That's why `transaction_record` has `raw_reference`, `normalized_reference` and `raw_values JSONB`.
+
+### 2.4 State machines
+
+A **state machine** lists the states an entity can be in and the *allowed* transitions between them. Everything not listed is forbidden. Writing it as a table (from, to, who may trigger it, reason required?, audit event) turns vague behaviour into testable rules. The code then has exactly one place that enforces the table (M5.15, M6.10, M7.5).
+
+**Interview angle:** "How do you stop an exception being resolved twice?" → it can only go `IN_REVIEW → RESOLVED` or `OPEN → RESOLVED`; `RESOLVED → RESOLVED` isn't in the table, so the central transition method rejects it, and optimistic locking catches the concurrent case.
+
+### 2.5 Idempotency
+
+An operation is **idempotent** if doing it twice has the same effect as doing it once. Networks retry, users double-click, workers crash and restart, so every write that matters must be safe to repeat. The tools:
+
+| Tool | Example here |
+|---|---|
+| Natural unique key | `(batch_id, source_row_number, transaction_date)` stops a retried import inserting a row twice |
+| Content hash | `(organization_id, source_type, content_hash)` stops the same file being imported twice |
+| Client idempotency key | `Idempotency-Key` header on `POST /reconciliation-runs` |
+| Deterministic identity | `discrepancy_key` so a re-run computes the same key and the partial unique index allows only one active case |
+
+**Interview angle:** "at-least-once delivery + idempotent consumers = effectively-once processing" is one of the most-asked distributed-systems ideas.
+
+### 2.6 Money in software
+
+Binary floating point can't represent most decimals exactly: `0.1 + 0.2 == 0.30000000000000004`. Money therefore uses **decimal** types: `BigDecimal` in Java, `NUMERIC(p,s)` in PostgreSQL. Two subtleties:
+
+- `BigDecimal.equals` compares **scale** as well as value: `new BigDecimal("1000.0").equals(new BigDecimal("1000.00"))` is `false`. Use `compareTo(...) == 0`.
+- Rounding must be explicit and justified. Here, inputs with more precision than we store are **rejected**, not rounded (`RoundingMode.UNNECESSARY` throws), because silently changing a financial amount is worse than refusing it.
+
+### 2.7 Architecture Decision Records
+
+An **ADR** is a one-page document recording one significant decision: the context, the decision, its consequences, and the alternatives rejected. ADRs are immutable once accepted: if you change your mind, write a new ADR that *supersedes* the old one. Over time they answer the question every new team member asks: "why on earth is it done this way?"
+
+**Interview angle:** "Tell me about a technical decision you made and its trade-offs." An ADR is that answer, already written.
+
+### 2.8 Modular monolith
+
+One deployable application, internally split into modules with **enforced** boundaries: each module has a public API (a few classes) and hides the rest; modules may depend only in allowed directions. You get most of the design benefits of microservices (clear ownership, independent reasoning) without network calls, distributed transactions or many deployments. If one module later needs to scale independently, its clean boundary makes extracting it feasible.
+
+---
+
+## 3. Starting point
+
+| What exists | Where | Relevance |
+|---|---|---|
+| Problem statement, entity sketch, worked example, state sketches, NFR table, the §11 design questions | `projectoverview.md` | Source material for every doc |
+| Architecture, roadmap, open design questions | `README.md` | The questions M1.12 must close |
+| Full schema: tenancy, auth, audit, job queue, ingestion, partitioned transactions, runs, matches, exceptions | `V1__initial_schema.sql`, `V2`, `V3` | `database-design.md` documents it rather than designing from scratch |
+| Capacity plan with decisions D1–D9 | `docs/scalability.md` | Feeds `architecture.md`, NFRs, and several ADRs |
+| Auth design and permission matrix | `plans/authentication.plan` | `api-design.md` links to it instead of repeating it |
+
+Nothing exists yet for: requirements, rules, architecture, database design, API design, samples, ADRs.
+
+**Workflow:** one branch and PR per document (e.g. `docs/M1.5-reconciliation-rules`). Write them in the order below; each one depends on the previous.
+
+---
+
+## 4. Step by step
+
+### 4.1 M1.1 — `docs/requirements.md`
+
+**What:** the problem, the users, what they can do, how well it must work, and what's not included.
+
+**Why:** every later "should it do X?" question is answered by pointing here.
+
+**How:** use this outline.
+
+```markdown
+# ReconFlow — Requirements
+
+## 1. Problem statement
+Two or three paragraphs, adapted from projectoverview.md §1. Who suffers, what
+they do today (spreadsheets), what goes wrong (missed discrepancies, no audit
+trail), what ReconFlow changes.
+
+## 2. Personas
+| Persona | Role in the system | Goals | Typical actions |
+## 3. Functional requirements
+Numbered FR-xx, grouped by module. Each traceable to TASKS.md.
+## 4. Non-functional requirements
+Numbered NFR-xx, each measurable, with how it will be measured.
+## 5. Scope
+### 5.1 In scope for v1
+### 5.2 Out of scope for v1 (and where it goes)
+## 6. Assumptions (M1.2)
+## 7. CSV file contracts (M1.3)
+## 8. Glossary
+```
+
+**Personas** (map one-to-one onto the roles in the schema):
+
+| Persona | Role | Goals | Can |
+|---|---|---|---|
+| Uploader (ops / finance assistant) | `UPLOADER` | Get today's files in, see errors | Upload files, view import status and errors, start a run |
+| Investigator (finance analyst) | `INVESTIGATOR` | Clear the exception queue accurately | Start runs, view everything, assign, note, resolve |
+| Organization admin (finance manager) | `ORG_ADMIN` | Oversight, accountability, team management | Everything an investigator can, plus reopen, manage members, read audit log |
+| Viewer (auditor, controller) | `VIEWER` | Check results without changing anything | Read-only access |
+| Platform admin (ReconFlow operator) | `is_platform_admin` | Onboard and suspend organizations | Manage organizations only; **no** access to tenant financial data |
+
+**Functional requirements** (starting list; refine as you write):
+
+| ID | Requirement | Task |
+|---|---|---|
+| FR-01 | An org admin creates users with a temporary password; there is no self sign-up | M3.3g |
+| FR-02 | A user signs in and works within one organization at a time | M3.3, M3.4 |
+| FR-03 | An uploader uploads a ledger or gateway CSV; the system rejects files with wrong headers, wrong type, or over the size limit immediately | M5.7, M5.26 |
+| FR-04 | The system processes uploads in the background and reports status, row counts and every row error | M5.10–17 |
+| FR-05 | Uploading the same file twice is rejected and points to the original batch | M5.9 |
+| FR-06 | A failed import can be retried explicitly | M5.20 |
+| FR-07 | Users can search normalized transactions by source, date, reference, currency and batch | M5.19 |
+| FR-08 | A user starts a reconciliation run for a period, a currency and a source pair; repeating the same request returns the same run | M6.11, M6.14 |
+| FR-09 | A run produces matches and exception cases with a reason, and summary counts and totals | M6 |
+| FR-10 | Investigators assign, annotate, review and resolve exceptions; admins reopen them | M7 |
+| FR-11 | Every state change and security event is recorded in an append-only audit log, viewable per entity | M4, M7.13 |
+| FR-12 | Reports show matched/unmatched/mismatch totals, import quality, and exception ageing; exceptions can be exported to CSV | M8 |
+| FR-13 | A platform admin creates and suspends organizations | M3 |
+
+**Non-functional requirements:** copy the targets from `docs/scalability.md` §6 and projectoverview.md §9, phrased as NFRs:
+
+| ID | Category | Requirement | Measured by |
+|---|---|---|---|
+| NFR-01 | Correctness | Every imported record ends a run in exactly one outcome | Property test M6.19 |
+| NFR-02 | Integrity | No duplicate transaction records after any crash and retry | Failure-injection tests M5.25, M9.4 |
+| NFR-03 | Isolation | No user can read or change another organization's data; probing returns 404 | Cross-tenant suite M3.9 |
+| NFR-04 | Auditability | Every state change has an audit event written in the same transaction | Test M4.4 |
+| NFR-05 | Concurrency | Concurrent edits to one exception: exactly one succeeds, others get 409 | Test M7.14 |
+| NFR-06 | Performance | 100k-row import p95 < 2 min; 100k × 100k daily run p95 < 1 min; read p95 < 300 ms | Benchmarks M9.6, k6 S1–S4 |
+| NFR-07 | Availability | 99.5% monthly | Health checks (post-deploy) |
+| NFR-08 | Recoverability | A crashed job resumes or is retried with identical final state; RPO ≤ 5 min, RTO ≤ 1 h | M9.1, M9.4 |
+| NFR-09 | Security | Passwords bcrypt-hashed; 15-min access tokens; lockout after 5 failures | M3.3 tests |
+| NFR-10 | Observability | Every request has a request ID in logs and responses; key metrics exported | M2.11, M9.9 |
+
+**Scope:**
+
+| In v1 | Out of v1 → where it goes |
+|---|---|
+| Two-way reconciliation, ledger vs gateway | Bank statements, three-way → v2 |
+| Exact one-to-one matching on reference + currency + type | One-to-many / many-to-one (aggregated settlements) → v2 |
+| Payments, with refunds/chargebacks/fees stored but matched only like-for-like | Fee-aware gross vs net matching → v2 |
+| CSV upload through the API | SFTP, object-storage drops, gateway API pulls → v2 |
+| One fixed CSV format per source type | Per-org column mappings → v2 |
+| API only | Web UI → v2 |
+| In-house JWT auth | Keycloak/OIDC → M10.1 |
+
+**Done when:** every FR and NFR maps to at least one TASKS.md task, and every out-of-scope item maps to the "Later" section.
+
+### 4.2 M1.2 — Assumptions
+
+**What:** a numbered list in `requirements.md` §6.
+
+**How:**
+
+| ID | Assumption | Consequence if false |
+|---|---|---|
+| A1 | Matching is one-to-one: one ledger record corresponds to at most one gateway record | Aggregated settlements appear as MISSING/DUPLICATE until v2 |
+| A2 | Each transaction has a single currency; there's no FX conversion | Cross-currency settlement needs FX rates (v2+) |
+| A3 | A reconciliation run covers one currency, so totals are summable | See ADR 0009 |
+| A4 | Both sources carry the same business reference for a payment (the merchant's order/payment reference) | Otherwise matching needs fuzzy rules |
+| A5 | Both sources report the **payment** timestamp, not the settlement date, as the transaction date | Settlement-date windows are a v2 feature |
+| A6 | Input is CSV in the documented format; data is synthetic | Real data adds PII handling (M10.6) |
+| A7 | References are unique per payment within an organization and source (a repeat is a duplicate, not a new payment) | Reference reuse would need a date-scoped key |
+| A8 | Amounts are positive; the transaction type says the direction | Signed amounts would need a sign convention per source |
+
+### 4.3 M1.3 — CSV contracts
+
+**What:** `requirements.md` §7, the exact file formats the importer accepts.
+
+**Why:** the validator (M5.11), the samples (M1.4) and the API error messages all derive from this one table. Change the contract here first, then the code.
+
+**How:** write these sections.
+
+**General format (both sources):**
+
+| Property | Rule | Error if violated |
+|---|---|---|
+| Encoding | UTF-8. A leading byte-order mark (BOM) is accepted and stripped | `invalid-encoding` (file rejected) |
+| Delimiter | Comma | — (a semicolon file fails the header check) |
+| Quoting | RFC 4180: fields containing commas, quotes or newlines are wrapped in `"`; `"` inside is doubled | Row error `MALFORMED_ROW` |
+| Header row | Required, first line. Names are matched case-insensitively after trimming. Column order doesn't matter. Unknown columns are allowed, ignored for matching, and kept in `raw_values` | Missing required header → whole file rejected at upload (`400 missing-columns`). Duplicate header name → rejected (`400 duplicate-columns`) |
+| Line endings | LF or CRLF | — |
+| Empty lines | Skipped, not counted | — |
+| Size | ≤ 50 MB | `413 file-too-large` at upload |
+| Rows | 1 – 500,000 data rows | 0 rows → `400 empty-file`; more → batch FAILED with `too-many-rows` |
+| Content type | `text/csv`, `application/vnd.ms-excel` (what Windows browsers send for .csv) or `application/octet-stream` with a `.csv` filename | `415 unsupported-media-type` |
+| Dates | ISO-8601. `transaction_at`: date-time with offset, e.g. `2026-10-01T09:15:00+04:00` or `…Z`. `transaction_date`: `YYYY-MM-DD` | Row error `INVALID_DATE` |
+| Amounts | Dot decimal separator, no thousands separators, no currency symbol, optional leading `+`, max 15 integer digits and 4 decimal places, must be > 0 | Row error `INVALID_AMOUNT`, `AMOUNT_SCALE_EXCEEDED`, `AMOUNT_NOT_POSITIVE` |
+| Currency | ISO-4217 alphabetic code; case-insensitive in the file, upper-cased on import; must be in the JDK's `Currency.getAvailableCurrencies()` | Row error `INVALID_CURRENCY` |
+
+**Internal ledger columns (`source_type = INTERNAL_LEDGER`):**
+
+| Column | Required | Example | Maps to |
+|---|---|---|---|
+| `reference` | Yes | `PAY-101` | `raw_reference`, `normalized_reference` |
+| `amount` | Yes | `1000.00` | `amount` |
+| `currency` | Yes | `AED` | `currency` |
+| `status` | Yes | `SUCCESS` | `status` (via status mapping) |
+| `transaction_at` | One of these two | `2026-10-01T09:15:00+04:00` | `transaction_at`; `transaction_date` = its UTC date |
+| `transaction_date` | One of these two | `2026-10-01` | `transaction_date` (used when `transaction_at` is absent) |
+| `transaction_type` | No (default `PAYMENT`) | `REFUND` | `transaction_type` |
+| `description`, `order_id`, `customer_id` | No | | `raw_values` only |
+
+**Gateway settlement columns (`source_type = GATEWAY`):**
+
+| Column | Required | Example | Maps to |
+|---|---|---|---|
+| `merchant_reference` | Yes | `PAY-101` | `raw_reference`, `normalized_reference` |
+| `amount` | Yes | `1000.00` | `amount` (gross amount; fees are not deducted in v1) |
+| `currency` | Yes | `aed` | `currency` |
+| `status` | Yes | `captured` | `status` (via status mapping) |
+| `transaction_at` | Yes | `2026-10-01T05:15:00Z` | `transaction_at`, `transaction_date` |
+| `transaction_type` | No (default `PAYMENT`) | `refund` | `transaction_type` |
+| `gateway_transaction_id`, `fee_amount`, `settlement_date` | No | | `raw_values` only (fee-aware matching is v2) |
+
+Note the gateway uses `merchant_reference`. Real gateways name it differently from your ledger, and making the contract show that is more realistic than pretending both files are identical. Per-org column mapping is v2.
+
+**Done when:** the validator in M5.11 can be written from this section alone.
+
+### 4.4 M1.4 — Sample CSVs in `docs/samples/`
+
+**What:** small, hand-checkable files covering every scenario, plus a `README.md` stating the expected outcome of each record.
+
+**Why:** they're the shared truth for docs, tests (M5.22, M6.18) and the demo (M11.9). Keep them tiny (≤ 15 rows) so a human can verify them.
+
+**How:** create these files.
+
+| File | Purpose | Contents |
+|---|---|---|
+| `ledger-basic.csv` | Happy path + every engine outcome, ledger side | The projectoverview.md §5 example, extended (below) |
+| `gateway-basic.csv` | The matching gateway file | Below |
+| `ledger-malformed.csv` | Row validation | One valid row, then one row per error code: bad amount `1,000.00`, 5 decimals `10.12345`, negative `-5.00`, currency `XYZ`, date `01/10/2026`, unknown status, empty reference, unbalanced quote |
+| `gateway-duplicates.csv` | Within-file duplicates (M5.13) | Same `merchant_reference` 3 times, identical; another twice with different amounts |
+| `gateway-currency-mismatch.csv` | `CURRENCY_MISMATCH` | `PAY-201` in USD where the ledger has AED |
+| `gateway-wrong-headers.csv` | Rejection at upload | `ref,amt,ccy,...` |
+| `ledger-header-only.csv` | Empty file | Header line, no data |
+| `ledger-bom-crlf.csv` | Encoding edge case | UTF-8 BOM, CRLF line endings, upper/lower-case headers in a different order; must import exactly like `ledger-basic.csv` |
+| `README.md` | Expected outcome table for every record in every file | |
+
+`ledger-basic.csv`:
+
+```csv
+reference,amount,currency,status,transaction_at,transaction_type
+PAY-101,1000.00,AED,SUCCESS,2026-10-01T09:15:00+04:00,PAYMENT
+PAY-102,500.00,AED,SUCCESS,2026-10-01T10:00:00+04:00,PAYMENT
+PAY-103,750.00,AED,SUCCESS,2026-10-01T11:30:00+04:00,PAYMENT
+PAY-104,250.00,AED,SUCCESS,2026-10-02T09:00:00+04:00,PAYMENT
+PAY-105,300.00,AED,SUCCESS,2026-10-02T12:00:00+04:00,PAYMENT
+ pay-106 ,120.5,aed,SUCCESS,2026-10-02T13:00:00+04:00,PAYMENT
+PAY-107,80.00,AED,FAILED,2026-10-02T14:00:00+04:00,PAYMENT
+```
+
+`gateway-basic.csv`:
+
+```csv
+merchant_reference,amount,currency,status,transaction_at,gateway_transaction_id
+PAY-101,1000.00,aed,captured,2026-10-01T05:15:00Z,gw_0001
+PAY-103,700.00,aed,captured,2026-10-01T07:30:00Z,gw_0003
+PAY-104,250.00,aed,captured,2026-10-02T05:00:00Z,gw_0004
+PAY-104,250.00,aed,captured,2026-10-02T05:00:00Z,gw_0004b
+PAY-105,300.0,AED,settled,2026-10-02T08:00:00Z,gw_0005
+PAY-106,120.50,AED,captured,2026-10-02T09:00:00Z,gw_0006
+PAY-108,200.00,AED,captured,2026-10-02T10:00:00Z,gw_0008
+```
+
+Expected outcome (this table goes in `samples/README.md`; run for AED, 2026-10-01 to 2026-10-02):
+
+| Reference | Ledger | Gateway | Outcome | Why |
+|---|---|---|---|---|
+| PAY-101 | 1000.00 | 1000.00 | **Matched** | Same reference, currency, type, amount |
+| PAY-102 | 500.00 | — | **MISSING_IN_GATEWAY** | Only in ledger |
+| PAY-103 | 750.00 | 700.00 | **AMOUNT_MISMATCH**, difference −50.00 | Reference matches, amount doesn't |
+| PAY-104 | 250.00 | 250.00 ×2 | **DUPLICATE_IN_SOURCE** (gateway), all 3 records linked | Two gateway candidates: never pick one arbitrarily |
+| PAY-105 | 300.00 | 300.0 | **Matched** | `compareTo` equality: `300.00` = `300.0` |
+| PAY-106 | ` pay-106 `, 120.5 | 120.50 | **Matched** | Reference trimmed + upper-cased; amount scale-insensitive |
+| PAY-107 | 80.00 FAILED | — | **Excluded** (not SUCCESS) | Only SUCCESS records are reconciled |
+| PAY-108 | — | 200.00 | **MISSING_IN_LEDGER** | Only in gateway |
+
+Run summary: matched 3 (1,420.50 AED), mismatch 1 (net −50.00), missing in gateway 1 (500.00), missing in ledger 1 (200.00), duplicate groups 1, excluded 1.
+
+**Pitfalls:** write the expected table *before* any engine code exists. If you write it after, you'll unconsciously copy what the code does instead of what the rules say.
+
+**Done when:** every row of every sample file appears in `samples/README.md` with an outcome and a reason.
+
+### 4.5 M1.5 — `docs/reconciliation-rules.md`: normalization, match key, mismatches, duplicates
+
+**What:** the rulebook for the importer and the engine.
+
+**How:** outline:
+
+```markdown
+# Reconciliation rules (v1)
+## 1. Normalization
+## 2. Which records take part in a run
+## 3. The match key
+## 4. Outcomes, evaluated in order
+## 5. Exception types and reason codes        (M1.6)
+## 6. Discrepancy identity (discrepancy_key)
+## 7. State machines                          (M1.7)
+## 8. Money handling                          (M1.8)
+## 9. Worked examples                          (link to samples/README.md)
+```
+
+**§1 Normalization** — every rule gets an ID so tests can name it (`N1`, `N2`, …; M5.21 has one test per rule):
+
+| ID | Field | Rule | Example |
+|---|---|---|---|
+| N1 | reference | Trim leading/trailing whitespace (including non-breaking space U+00A0) | `" pay-106 "` → `"pay-106"` |
+| N2 | reference | Unicode NFKC normalization | full-width `ＰＡＹ` → `PAY` |
+| N3 | reference | Upper-case with `Locale.ROOT` (never the default locale: Turkish `i` → `İ`) | `pay-106` → `PAY-106` |
+| N4 | reference | Internal characters are **not** removed in v1. `PAY-101` and `PAY101` are different references | — |
+| N5 | currency | Trim, upper-case, must be a valid ISO-4217 code | `aed` → `AED` |
+| N6 | amount | Parse with `new BigDecimal(String)` (never via `double`); reject > 4 decimal places; store at scale 4 | `120.5` → `120.5000` |
+| N7 | timestamp | `transaction_at` parsed as `OffsetDateTime`, stored as UTC `TIMESTAMPTZ`; `transaction_date` = `transaction_at` converted to UTC, then `.toLocalDate()` | `2026-10-01T02:00+04:00` → date `2026-09-30` |
+| N8 | date only | If only `transaction_date` is given, use it as-is; `transaction_at` is NULL | |
+| N9 | status | Map with the table below, case-insensitively; unknown → row error `UNKNOWN_STATUS` | `captured` → `SUCCESS` |
+| N10 | transaction_type | Upper-case; must be `PAYMENT`, `REFUND`, `CHARGEBACK` or `FEE`; empty → `PAYMENT` | |
+| N11 | raw values | The original row is stored unchanged as JSON (`raw_values`), keyed by the original header names | |
+
+Status mapping (both sources):
+
+| Normalized | Accepted source values |
+|---|---|
+| `SUCCESS` | `success`, `succeeded`, `captured`, `settled`, `paid`, `completed` |
+| `PENDING` | `pending`, `processing`, `authorized` |
+| `FAILED` | `failed`, `declined`, `error` |
+| `REVERSED` | `reversed`, `refunded`, `voided`, `cancelled` |
+
+Explain N7 explicitly with the example: a payment at 02:00 Dubai time on 1 October is 22:00 UTC on 30 September. Both sources must be converted the same way, or the same payment lands on different dates.
+
+**§2 Participation.** A record takes part in a run when *all* hold:
+
+- same `organization_id` as the run;
+- `source_type` is the run's left or right source;
+- `currency` equals the run's currency (except the cross-currency lookup for `CURRENCY_MISMATCH`, §4);
+- `transaction_date` is within `[period_start, period_end]`, inclusive;
+- `status = SUCCESS`. Other statuses are **excluded** and counted separately in the run report, never silently dropped.
+
+**§3 Match key.** Two records are candidates for each other when they have the same `(normalized_reference, transaction_type)`, both participate in the run, and they come from opposite sources. **The transaction date is not part of the key.** A payment on 1 October in the ledger and 2 October in the gateway (a cross-midnight timestamp, or a late file) still matches if both dates fall in the run period. If the counterpart is outside the period, the record is reported as missing; a later run with a wider period will match it and the earlier case can be resolved with code `TIMING_DIFFERENCE`.
+
+**§4 Outcomes, evaluated in this order** for each reference group (all participating records with the same key):
+
+1. **Duplicate.** If either side has more than one record in the group → one `DUPLICATE_IN_SOURCE` exception linking *every* record in the group (both sides). No record in the group is matched or reported missing.
+2. **Currency mismatch.** If one side has the record and the other side has a record with the same reference and type in a *different* currency within the period → `CURRENCY_MISMATCH`.
+3. **Amount mismatch.** One record each side, `amount.compareTo(other) != 0` → `AMOUNT_MISMATCH`, with `amount_difference = gateway − ledger`. Never counted as matched.
+4. **Matched.** One record each side, equal amounts → a `reconciliation_match` row (`match_type = EXACT`, `amount_difference = 0`).
+5. **Missing.** Only one side has a record → `MISSING_IN_GATEWAY` or `MISSING_IN_LEDGER`.
+
+**Invariant (NFR-01):** every participating record ends in exactly one of: matched, mismatched, missing, duplicate. Every non-participating record is excluded. Total in = matched×2 + mismatched×2 + missing + records in duplicate groups + excluded. The M6.19 property test asserts this.
+
+**Tie-breaking:** there isn't any. When a choice would be arbitrary (two candidates), the rules raise an exception for a human instead. Say this explicitly: it's the rule interviewers like most.
+
+### 4.6 M1.6 — Exception types and reason codes
+
+**What:** the closed list of exception types (matching the `CHECK` constraint on `exception_case.type`) and resolution codes.
+
+**How:**
+
+| Type | Raised when | Records linked | `amount_difference` |
+|---|---|---|---|
+| `MISSING_IN_GATEWAY` | Ledger record, no gateway counterpart | 1 ledger | NULL |
+| `MISSING_IN_LEDGER` | Gateway record, no ledger counterpart | 1 gateway | NULL |
+| `AMOUNT_MISMATCH` | One each side, amounts differ | 1 + 1 | gateway − ledger |
+| `CURRENCY_MISMATCH` | Same reference and type, different currencies | 1 + 1 | NULL |
+| `DUPLICATE_IN_SOURCE` | More than one record for the key on either side | all in the group | NULL |
+
+`reason_code` on the case is optional, a sub-classification set by the engine where it knows more (e.g. `DUPLICATE_IN_SOURCE` with reason `IDENTICAL_ROWS` vs `DIFFERENT_AMOUNTS`).
+
+**Resolution codes** (required to resolve; validated against this list):
+
+| Code | Meaning | Note required? |
+|---|---|---|
+| `TIMING_DIFFERENCE` | Counterpart arrives in a later period | No |
+| `GATEWAY_FEE` | Difference is a fee deducted by the gateway | No |
+| `DATA_ENTRY_ERROR` | Source record was wrong and has been corrected upstream | Yes |
+| `DUPLICATE_CONFIRMED` | A genuine double charge, refunded or being refunded | Yes |
+| `DUPLICATE_FILE_ARTIFACT` | Duplicate caused by the provider's export, not a real double charge | No |
+| `WRITTEN_OFF` | Accepted loss, approved | Yes |
+| `FALSE_POSITIVE` | Not a real discrepancy | Yes |
+| `OTHER` | Anything else | Yes |
+
+**Discrepancy identity (§6 of the rules doc):** `discrepancy_key = <TYPE>:<normalized_reference>:<transaction_type>:<sorted currencies joined by '/'>`, e.g. `AMOUNT_MISMATCH:PAY-103:PAYMENT:AED` or `CURRENCY_MISMATCH:PAY-207:PAYMENT:AED/USD` (format finalized in phase-M6 §M6.6). The transaction type is in it because a payment and a refund with the same reference are separate discrepancies; the currency *set* is in it so every currency's run computes the same key. It deliberately excludes the run ID and the period, so re-running reconciliation (or running a second currency that sees the same `CURRENCY_MISMATCH`) produces the same key, and `exception_case_active_uk` allows only one active case. Explain what happens when the outcome changes between runs: if PAY-103 later matches (the gateway sent a corrected record), the open `AMOUNT_MISMATCH:PAY-103` case is not auto-resolved in v1; the run report lists "open cases whose discrepancy no longer reproduces", and an investigator resolves them with `DATA_ENTRY_ERROR`. Auto-resolution is a candidate for v2.
+
+### 4.7 M1.7 — State machines
+
+**What:** a table per entity listing every allowed transition. Anything not listed is rejected.
+
+**How:**
+
+**Import batch** (`import_batch.status`):
+
+| From | To | Triggered by | Reason? | Audit event |
+|---|---|---|---|---|
+| — | `RECEIVED` | Uploader (POST /imports) | No | `IMPORT_RECEIVED` |
+| `RECEIVED` | `PROCESSING` | Worker claims the job | No | — (logged, not audited) |
+| `PROCESSING` | `COMPLETED` | Worker, 0 row errors | No | `IMPORT_COMPLETED` |
+| `PROCESSING` | `COMPLETED_WITH_ERRORS` | Worker, ≥ 1 row error and ≥ 1 valid row | No | `IMPORT_COMPLETED` |
+| `PROCESSING` | `FAILED` | Worker: unreadable file, too many rows, all rows invalid, or attempts exhausted | `failure_reason` | `IMPORT_FAILED` |
+| `PROCESSING` | `PROCESSING` | Sweeper re-queues after an expired lease; resumes from `last_committed_row` | No | — |
+| `FAILED` | `RECEIVED` | Uploader or org admin (POST /imports/{id}/retry) | Yes | `IMPORT_RETRY_REQUESTED` |
+
+**Reconciliation run** (`reconciliation_run.status`):
+
+| From | To | Triggered by | Reason? | Audit event |
+|---|---|---|---|---|
+| — | `PENDING` | Uploader/investigator/admin (POST /reconciliation-runs) | No | `RUN_REQUESTED` |
+| `PENDING` | `RUNNING` | Worker | No | `RUN_STARTED` |
+| `RUNNING` | `COMPLETED` | Worker | No | `RUN_COMPLETED` (payload: summary) |
+| `RUNNING` | `FAILED` | Worker | `failure_reason` | `RUN_FAILED` |
+| `FAILED` | `PENDING` | Same roles as create (POST …/retry); resumes after `last_completed_date` | Yes | `RUN_RETRY_REQUESTED` |
+
+**Exception case** (`exception_case.status`):
+
+| From | To | Who (permission) | Reason? | Audit event |
+|---|---|---|---|---|
+| — | `OPEN` | System (engine) | No | `EXCEPTION_CREATED` |
+| `OPEN` | `IN_REVIEW` | `EXCEPTION_UPDATE` | No | `EXCEPTION_STATUS_CHANGED` |
+| `IN_REVIEW` | `OPEN` | `EXCEPTION_UPDATE` | Yes | `EXCEPTION_STATUS_CHANGED` |
+| `OPEN` or `IN_REVIEW` | `RESOLVED` | `EXCEPTION_RESOLVE` | Resolution code (+ note where required) | `EXCEPTION_RESOLVED` |
+| `RESOLVED` | `OPEN` | `EXCEPTION_REOPEN` (org admin) | Yes | `EXCEPTION_REOPENED` |
+| any | same | Assignment change, `EXCEPTION_UPDATE` | No | `EXCEPTION_ASSIGNED` |
+| any | same | Note added, `EXCEPTION_UPDATE` | — (the note is the content) | `EXCEPTION_NOTE_ADDED` |
+
+Reopening when another active case with the same `discrepancy_key` already exists (a later run created a new one) violates `exception_case_active_uk`. The rule: the reopen is rejected with `409 active-case-exists` pointing to the existing case.
+
+**Job** (`job.status`, internal): `QUEUED → RUNNING → DONE`; `RUNNING → QUEUED` (lease expired or transient failure with attempts left, `run_after` backed off); `RUNNING → FAILED` (attempts exhausted or non-retryable error). Not audited; observable through metrics.
+
+Draw each machine as a Mermaid `stateDiagram-v2` above its table, e.g.:
+
+```mermaid
+stateDiagram-v2
+    [*] --> OPEN
+    OPEN --> IN_REVIEW
+    IN_REVIEW --> OPEN
+    OPEN --> RESOLVED
+    IN_REVIEW --> RESOLVED
+    RESOLVED --> OPEN : reopen (admin, reason)
+```
+
+### 4.8 M1.8 — Money handling
+
+**What:** `reconciliation-rules.md` §8.
+
+**How:** state these rules, each with its reason:
+
+| Rule | Reason |
+|---|---|
+| Java type: `BigDecimal`. DB type: `NUMERIC(19,4)` | 15 integer digits covers any realistic single transaction; 4 decimals covers every ISO-4217 currency (max 3 minor units, e.g. KWD, BHD) plus headroom for computed differences |
+| Parse from the **string** in the CSV with `new BigDecimal(text)`; never `Double.parseDouble` or `BigDecimal.valueOf(double)` | A double can't hold `0.1` exactly |
+| Inputs with more than 4 decimal places are rejected (`AMOUNT_SCALE_EXCEEDED`); store with `setScale(4, RoundingMode.UNNECESSARY)` | `UNNECESSARY` throws instead of rounding; we never change a financial amount silently |
+| Compare with `compareTo(...) == 0`, never `equals` | `equals` compares scale: `1000.0` ≠ `1000.00` |
+| Don't validate against the currency's minor units in v1 (e.g. `JPY 100.50` is accepted) | Some ledgers carry sub-unit precision; flag as a v2 rule |
+| Sums are computed in SQL (`SUM(amount)` on `NUMERIC` is exact) | No accumulation in Java doubles; no loading rows to add them |
+| JSON: amounts are serialized as **strings** in plain notation (`"1000.0000"`), never as JSON numbers | JavaScript clients parse JSON numbers as binary doubles; strings are lossless. Configure once in the Jackson config (M2) |
+| Never use `BigDecimal.toString()` for output; use `toPlainString()` | `toString()` can produce `1E+3` |
+
+**Done when:** a reviewer can answer "how do you store and compare money?" from this section in under a minute.
+
+### 4.9 M1.9 — `docs/architecture.md`
+
+**What:** modules, their allowed dependencies, request flows, and the background processing design.
+
+**How:** outline:
+
+```markdown
+# Architecture
+## 1. Context (C4 level 1): users, ReconFlow, PostgreSQL, object storage
+## 2. Containers (C4 level 2): api instances, worker instances, PostgreSQL, MinIO/S3
+## 3. Modules and ownership
+## 4. Allowed dependencies
+## 5. Request flows (sequence diagrams)
+## 6. Background processing
+## 7. Cross-cutting: security, tenancy, audit, errors, observability
+## 8. Deployment profiles (api / worker / local / test / prod)
+```
+
+**§3 Modules and the tables each owns.** A table is written only by its owning module; other modules read it through the owner's public API or, for reporting, through read-only SQL.
+
+| Module (package) | Responsibility | Owns tables |
+|---|---|---|
+| `organization` | Organizations (create, suspend, list for platform admins) | `organization` |
+| `security` | Users, membership, login, tokens, tenant context implementation, permissions (layout: authentication.plan §6) | `app_user`, `membership`, `refresh_token` |
+| `ingestion` | Upload, file storage, parse, validate, normalize, import status | `import_batch`, `import_row_error` |
+| `ledger` | The normalized transaction store and its search API | `transaction_record` (+ partitions) |
+| `reconciliation` | Runs, matching engine, matches | `reconciliation_run`, `reconciliation_match` |
+| `exceptions` | Cases, workflow, notes, history | `exception_case`, `exception_case_record`, `exception_case_run` (added in M6), `exception_note`, `exception_status_history` |
+| `reporting` | Read-only aggregate queries and exports | none |
+| `audit` | `AuditService`, audit timeline API | `audit_event` |
+| `shared` | Cross-cutting building blocks: IDs (UUIDv7), money helpers, errors/ProblemDetail, pagination, the job queue (`shared.jobs`), request ID, and the **interfaces** `TenantContext`, `CurrentUser`, `TenantScope`, `Permission` (implemented in `security`; see phase-M3) | `job` |
+
+**§4 Allowed dependencies** (arrow = "may call"):
+
+```
+ingestion      ──▶ ledger, audit, shared
+reconciliation ──▶ ledger, exceptions, audit, shared
+exceptions     ──▶ audit, shared, security (user-directory API only: assignee checks, display names)
+reporting      ──▶ shared                                   (reads via SQL, no module APIs)
+organization   ──▶ audit, shared
+security       ──▶ organization, audit, shared
+audit          ──▶ shared
+ledger         ──▶ shared
+shared         ──▶ (nothing)
+```
+
+Modules get the caller's identity and tenant through the `shared` interfaces, never by importing `security`. That's what breaks the `security → audit → security` cycle that would otherwise appear (audit needs the current user; security needs to audit logins).
+
+Key rules to state and justify:
+
+- **No cycles.** `reconciliation → exceptions` is allowed; `exceptions → reconciliation` is not. When an exception needs run information, the reconciliation module passes it in.
+- **The engine creates exceptions by calling `exceptions`' public API** (`DiscrepancyRecorder`, designed in phase-M6) inside the same transaction as the chunk's matches, so a chunk commits matches and cases atomically. An event-based design is noted as the alternative.
+- **`security` exposes almost nothing.** Identity and tenant come through the `shared` interfaces; the only `security` API other modules may call is the user directory (membership and display-name lookups).
+- These rules become `ApplicationModules.verify()` tests in M2.9.
+
+**§5 Request flows.** Mermaid sequence diagrams for: upload (sync header check → store file → insert batch + job in one transaction → `202`), import job (claim → stream → chunk commit → status), run request (idempotency check → insert run + job → `202`), resolve exception (`If-Match` → version check → transition → history + audit → `200`). Example:
+
+```mermaid
+sequenceDiagram
+    actor U as Uploader
+    participant API as api instance
+    participant S3 as Object storage
+    participant DB as PostgreSQL
+    participant W as worker instance
+    U->>API: POST /imports (multipart)
+    API->>API: auth, tenant, size/type/header checks
+    API->>S3: put original file (key = org/batch-id)
+    API->>DB: BEGIN; insert import_batch(RECEIVED), job(IMPORT), audit; COMMIT
+    API-->>U: 202 Accepted, Location: /imports/{id}
+    W->>DB: claim job (FOR UPDATE SKIP LOCKED)
+    W->>S3: stream file
+    loop every 5,000 rows
+        W->>DB: insert records + row errors, update last_committed_row; COMMIT
+    end
+    W->>DB: set COMPLETED / COMPLETED_WITH_ERRORS, audit; job DONE
+```
+
+Note the ordering: the file is stored **before** the DB transaction. If storage succeeds and the transaction fails, you have an orphan file (harmless; a cleanup job can remove it). The reverse order would give a batch pointing to a missing file (harmful).
+
+**§6 Background processing:** summarize `docs/scalability.md` §4 and link to it. State that the job table is a v1 requirement (moved into M5), and that Kafka is deferred until a measurement in M9 justifies it.
+
+### 4.10 M1.10 — `docs/database-design.md`
+
+**What:** documents and justifies the schema that already exists.
+
+**How:** outline:
+
+```markdown
+# Database design
+## 1. Conventions (copy and expand the V1 header comment)
+## 2. ERD
+## 3. Tables (one subsection each: purpose, owner module, key columns, constraints, indexes)
+## 4. Constraints that enforce idempotency and integrity
+## 5. Partitioning and retention
+## 6. Tenancy: organization_id everywhere, RLS (planned M3.5)
+## 7. Migration policy
+```
+
+**§2 ERD** in Mermaid (renders on GitHub):
+
+```mermaid
+erDiagram
+    ORGANIZATION ||--o{ MEMBERSHIP : has
+    APP_USER ||--o{ MEMBERSHIP : has
+    APP_USER ||--o{ REFRESH_TOKEN : owns
+    ORGANIZATION ||--o{ IMPORT_BATCH : owns
+    IMPORT_BATCH ||--o{ IMPORT_ROW_ERROR : reports
+    IMPORT_BATCH ||--o{ TRANSACTION_RECORD : contains
+    ORGANIZATION ||--o{ RECONCILIATION_RUN : owns
+    RECONCILIATION_RUN ||--o{ RECONCILIATION_MATCH : produces
+    TRANSACTION_RECORD ||--o{ RECONCILIATION_MATCH : "ledger side"
+    TRANSACTION_RECORD ||--o{ RECONCILIATION_MATCH : "gateway side"
+    RECONCILIATION_RUN ||--o{ EXCEPTION_CASE : raises
+    EXCEPTION_CASE ||--o{ EXCEPTION_CASE_RECORD : links
+    TRANSACTION_RECORD ||--o{ EXCEPTION_CASE_RECORD : "linked by"
+    EXCEPTION_CASE ||--o{ EXCEPTION_NOTE : has
+    EXCEPTION_CASE ||--o{ EXCEPTION_STATUS_HISTORY : has
+    ORGANIZATION ||--o{ AUDIT_EVENT : scopes
+    ORGANIZATION ||--o{ JOB : queues
+
+    TRANSACTION_RECORD {
+        uuid id PK
+        date transaction_date PK "partition key"
+        uuid organization_id FK
+        uuid batch_id FK
+        text source_type
+        text normalized_reference
+        numeric amount "19,4"
+        char currency
+        text status
+        jsonb raw_values
+    }
+```
+
+Add attribute blocks for the other main tables in the same style.
+
+**§4 Constraints that enforce behaviour** is the most interview-relevant section. One row per constraint, with the scenario it prevents:
+
+| Constraint | Prevents | Task |
+|---|---|---|
+| `import_batch_content_uk (organization_id, source_type, content_hash)` | Same file imported twice | M5.4, ADR 0005 |
+| `transaction_record UNIQUE (batch_id, source_row_number, transaction_date)` | A retried batch inserting a row twice | M5.5 |
+| `import_row_error UNIQUE NULLS NOT DISTINCT (batch_id, row_number, column_name, error_code)` | A retried batch reporting an error twice | M5.25 |
+| `reconciliation_run UNIQUE (organization_id, idempotency_key)` | Two runs for the same request | M6.3, ADR 0006 |
+| `reconciliation_match UNIQUE (run_id, ledger_record_id)` and `(run_id, gateway_record_id)` | A record matched twice in a run | M6.3 |
+| `exception_case_active_uk (organization_id, discrepancy_key) WHERE status <> 'RESOLVED'` | Two active cases for one discrepancy, even under concurrent runs | M7.3 |
+| `exception_case CHECK ((status = 'RESOLVED') = (resolution fields set))` | A resolved case without a resolution, or a stale resolution on an open case | M7.4 |
+| `exception_case.version` | Lost updates (used by `@Version`) | M7.8, ADR 0007 |
+| `audit_event` triggers | Any UPDATE, DELETE or TRUNCATE of audit history | M4.2 |
+| `job CHECK (status <> 'RUNNING' OR (locked_by, lease_until set))` | A running job with no owner the sweeper could recover | M9.1 |
+| `refresh_token` revocation CHECKs (V3) | Inconsistent revocation state that would break reuse detection | M3.3c |
+
+**Document the known gap:** because the partition key must be part of every unique constraint, `(batch_id, source_row_number, transaction_date)` doesn't stop the same source row being inserted twice with *different* dates. That can only happen if a retry parses the row differently (e.g. after a normalizer change). Mitigation: the retry path deletes the batch's rows beyond `last_committed_row` (or, for a full reprocess, all of the batch's rows) before re-importing, in the same transaction that resets the checkpoint. State this in §4 and link to M5.20.
+
+**§5 Partitioning and retention:** monthly range partitions, the `create_transaction_record_partition` function, the default partition and its alert, 13 months hot / archive to Parquet (link to scalability.md §5).
+
+**§7 Migration policy:** applied migrations are never edited (Flyway checksums; V3's header is the example); every migration has a rollback note in its header (M11.5); repeatable `R__` scripts only for seed data in `local`.
+
+### 4.11 M1.11 — `docs/api-design.md`
+
+**What:** the contract every controller follows.
+
+**How:** outline:
+
+```markdown
+# API design
+## 1. Conventions (base path /api/v1, JSON, UUIDs, timestamps, money)
+## 2. Authentication and tenant selection
+## 3. Error model
+## 4. Pagination, sorting, filtering
+## 5. Idempotency
+## 6. Concurrency control
+## 7. Sync vs async: 201 / 202 / 200
+## 8. Endpoint reference
+## 9. Authorization matrix (link to authentication.plan §5, filled in during M3.7)
+```
+
+**§1 Conventions:**
+
+- Base path `/api/v1`. Resource names plural, kebab-case (`/reconciliation-runs`).
+- IDs are UUID strings. Timestamps are ISO-8601 UTC with `Z` (`2026-10-01T05:15:00Z`). Dates are `YYYY-MM-DD`.
+- Money: strings (see §4.8), always with a sibling `currency` field.
+- Enums are upper-case strings matching the DB values.
+- JSON field names are camelCase.
+
+**§2 Auth and tenant:** `Authorization: Bearer <access JWT>`; `X-Organization-Id: <uuid>` selects the organization on every org-scoped route; missing header → `400 organization-required`; not a member → `404`. Link to authentication.plan.
+
+**§3 Error model (RFC 9457 `ProblemDetail`):**
+
+```http
+HTTP/1.1 409 Conflict
+Content-Type: application/problem+json
+
+{
+  "type": "https://reconflow.dev/problems/duplicate-file",
+  "title": "File already imported",
+  "status": 409,
+  "detail": "This file was already imported as batch 01928c7e-....",
+  "instance": "/api/v1/imports",
+  "code": "duplicate-file",
+  "requestId": "4f1c2a9e8b7d4c3a",
+  "existingBatchId": "01928c7e-..."
+}
+```
+
+Validation errors add an `errors` array:
+
+```json
+"errors": [
+  { "field": "periodEnd", "code": "must-not-be-before-start", "message": "periodEnd must be on or after periodStart" }
+]
+```
+
+Write the full error catalogue as a table: `code`, HTTP status, when it's returned. Starting list:
+
+| code | Status | When |
+|---|---|---|
+| `validation-failed` | 400 | Bean validation failure on a request body or parameter |
+| `organization-required` | 400 | No `X-Organization-Id` on an org-scoped route |
+| `missing-columns`, `duplicate-columns`, `empty-file`, `invalid-encoding` | 400 | Upload checks |
+| `unauthenticated` | 401 | Missing, expired or invalid token |
+| `forbidden` | 403 | Authenticated member without the permission |
+| `not-found` | 404 | Unknown ID **or another tenant's ID** |
+| `duplicate-file` | 409 | Same content already imported (`existingBatchId`) |
+| `stale-version` | 409 | `If-Match` doesn't match the current version |
+| `invalid-transition` | 409 | Transition not allowed from the current state |
+| `active-case-exists` | 409 | Reopen would create a second active case |
+| `idempotency-key-reused` | 422 | Same `Idempotency-Key`, different request body |
+| `file-too-large` | 413 | Over 50 MB |
+| `unsupported-media-type` | 415 | Wrong upload content type |
+| `precondition-required` | 428 | `If-Match` missing on a versioned update |
+| `rate-limited` | 429 | M3.3f, M10.4; with `Retry-After` |
+| `internal-error` | 500 | Anything unexpected; no stack trace or SQL in the body |
+
+**§4 Pagination:** `?page=0&size=50&sort=createdAt,desc`. Default size 50, max 200 (values above are clamped, not rejected). Sort fields are whitelisted per endpoint; unknown → `400`. Response shape:
+
+```json
+{
+  "content": [ … ],
+  "page": { "number": 0, "size": 50, "totalElements": 1234, "totalPages": 25 }
+}
+```
+
+(This is Spring Data's stable `PagedModel` shape. Never return a raw `PageImpl`; its JSON isn't a stable contract.) Filters are query parameters named after fields: `?status=OPEN&type=AMOUNT_MISMATCH&assignedTo=me&from=2026-10-01&to=2026-10-31&minAmount=100`.
+
+**§5 Idempotency:** `POST /reconciliation-runs` accepts `Idempotency-Key` (max 128 chars). Rules: same key + same body → the existing run with `200 OK`; same key + different body → `422 idempotency-key-reused`; no key → the server derives `sha256(org | period_start | period_end | left_source | right_source | currency)`, so "the same run" means the same organization, period, sources and currency. Uploads don't need a key: the content hash is their natural idempotency key.
+
+**§6 Concurrency control:** responses for exceptions include `ETag: "<version>"`. `PATCH`, `/resolve` and `/reopen` require `If-Match: "<version>"`. Missing → `428 precondition-required`; mismatch → `409 stale-version` with the current version in the body. (HTTP strictly says `412 Precondition Failed` for a failed `If-Match`; the project uses `409` per TASKS.md M7.8 and records `412` as the alternative in ADR 0007.)
+
+**§7 Status codes for creates:**
+
+| Endpoint | Status | Body / headers |
+|---|---|---|
+| `POST /imports` | `202 Accepted` | Batch (status `RECEIVED`), `Location: /api/v1/imports/{id}` |
+| `POST /imports/{id}/retry` | `202 Accepted` | Batch |
+| `POST /reconciliation-runs` (new) | `202 Accepted` | Run (status `PENDING`), `Location` |
+| `POST /reconciliation-runs` (idempotent repeat) | `200 OK` | Existing run |
+| `POST /exceptions/{id}/notes` | `201 Created` | Note, `Location` |
+| `POST /exceptions/{id}/resolve`, `/reopen`, `PATCH` | `200 OK` | Updated case with new `ETag` |
+| `POST /auth/login` | `200 OK` | Tokens |
+
+`202` means "accepted for processing, not done". The client polls the `Location` URL until the status is terminal.
+
+**§8 Endpoint reference:** for each endpoint from projectoverview.md §7 and TASKS.md M5–M8: method + path, permission, request (params/body with types), response, error codes, example. Start with the import endpoints; add the rest as each milestone lands (the doc grows with the API).
+
+### 4.12 M1.12 — Architecture Decision Records
+
+**What:** `docs/adr/`, one file per decision.
+
+**How:** first the template, `docs/adr/0000-template.md`:
+
+```markdown
+# NNNN. <Decision title, as a short statement>
+
+- **Status:** Proposed | Accepted | Superseded by NNNN
+- **Date:** YYYY-MM-DD
+- **Tasks:** TASKS.md M…
+
+## Context
+What forces are at play: requirements, constraints, numbers. Neutral; no
+decision yet.
+
+## Decision
+"We will …" One clear statement, then the details needed to implement it.
+
+## Consequences
+What becomes easier, what becomes harder, what we must now do. Include the
+negatives honestly.
+
+## Alternatives considered
+For each: what it is, why it was rejected (or under what condition we'd
+switch to it).
+```
+
+Then one ADR per decision. Write each from the summary below; 1–2 pages each.
+
+| # | Title | Decision | Main alternatives | Answers README question? |
+|---|---|---|---|---|
+| 0001 | Record architecture decisions | Use ADRs in `docs/adr/`, immutable once accepted | Wiki pages; nothing | |
+| 0002 | Modular monolith | One Spring Boot app, modules enforced by Spring Modulith tests; one jar run with `api` or `worker` profile | Microservices (distributed transactions, ops cost, no load-based need: scalability.md §2.1) | |
+| 0003 | Asynchronous imports and runs | Imports and runs return `202 Accepted` + `Location`; work happens in a worker; client polls | Synchronous `201` (a 100k-row import takes 10–30 s: too long for an HTTP request, scalability.md §2.3) | Sync vs async ✓ |
+| 0004 | PostgreSQL job queue | `job` table claimed with `FOR UPDATE SKIP LOCKED`, 2-minute leases with heartbeat, sweeper, per-org cap of 2 running jobs, exponential backoff. Enqueue in the same transaction as the business row | Kafka (solves a throughput problem we don't have; dual-write problem without an outbox), `@Async` in-memory (lost on restart), Quartz | |
+| 0005 | Duplicate-import policy | SHA-256 of the file bytes; unique `(organization_id, source_type, content_hash)`; duplicate → `409 duplicate-file` with `existingBatchId`. A FAILED batch is reprocessed via `POST /imports/{id}/retry`, never re-uploaded. Replacing a completed import is out of v1 scope | Natural key per row only (catches overlapping files too, but can't distinguish a deliberate correction); allow re-import with a `replace=true` flag (needs a supersede model for records and matches: v2) | Duplicate imports ✓ |
+| 0006 | Reconciliation-run idempotency | Client `Idempotency-Key` if given; otherwise `sha256(org \| period_start \| period_end \| left_source \| right_source \| currency)`. Same key → existing run (`200`). Exceptions deduplicated across runs by `discrepancy_key` + `exception_case_active_uk` | Always create a new run (duplicates matches/cases); supersede the previous run (more complex; keep as v2 option for "re-run after new data") | Run idempotency ✓ |
+| 0007 | Optimistic locking on exceptions | `@Version` column; `ETag`/`If-Match`; missing → `428`, stale → `409` | Pessimistic `SELECT … FOR UPDATE` (holds locks across user think time: impossible over HTTP); last-write-wins (silent lost updates); `412` instead of `409` (more HTTP-correct; chosen `409` for consistency with TASKS.md) | Concurrency ✓ |
+| 0008 | Tenant isolation | Shared schema with `organization_id` on every tenant-owned table; request-scoped `TenantContext`; every repository method takes `organizationId`; PostgreSQL RLS as defense in depth via `SET LOCAL app.org_id`; cross-tenant IDs return `404` | Schema-per-tenant, DB-per-tenant (migration fan-out and connection explosion at 100 tenants); Hibernate `@TenantId` filter alone (one forgotten native query leaks data) | Tenant enforcement ✓ |
+| 0009 | A run is pinned to one currency | `reconciliation_run.currency`; records in other currencies are excluded except for the `CURRENCY_MISMATCH` lookup | Multi-currency runs (totals become meaningless without FX; summary columns would need per-currency rows) | Multi-currency ✓ |
+| 0010 | UUIDv7 primary keys, generated in the application | Time-ordered UUIDs: globally unique, safe to expose in URLs (not guessable sequences), and insert-friendly for B-tree indexes unlike random UUIDv4 | `BIGSERIAL` (exposes counts, enumerable, needs DB round-trip before insert batching); UUIDv4 (random inserts fragment indexes); DB-generated (`uuidv7()` only arrives in PostgreSQL 18) | |
+| 0011 | Monthly partitioning of `transaction_record` | Range partitions by `transaction_date`, created 3 months ahead, default partition with an alert, retention by detaching partitions | Single table (550M rows/year: vacuum and index bloat, expensive deletes); partition by organization (uneven sizes; doesn't help retention) | |
+| 0012 | Set-based matching in SQL | Exact matching runs as `INSERT … SELECT … JOIN` in PostgreSQL, chunked by ledger-side `transaction_date` with a `last_completed_date` checkpoint; Java orchestrates and applies the ordered rules | In-memory `Map` matching (monthly runs for a large tenant don't fit in heap) | |
+
+The in-house authentication ADR (M3.3) and the Keycloak comparison ADR (M10.1) are written in those phases, not here. The Kafka ADR (M9.12) is written in M9.
+
+**Replacing the README section:** delete "Open design questions" and add:
+
+```markdown
+## Design decisions
+
+| Question | Decision |
+|---|---|
+| Duplicate imports | [ADR 0005](docs/adr/0005-duplicate-import-policy.md) |
+| Reconciliation-run idempotency | [ADR 0006](docs/adr/0006-reconciliation-run-idempotency.md) |
+| Sync vs async processing | [ADR 0003](docs/adr/0003-asynchronous-imports-and-runs.md) |
+| Concurrency on exceptions | [ADR 0007](docs/adr/0007-optimistic-locking-on-exceptions.md) |
+| Tenant enforcement | [ADR 0008](docs/adr/0008-tenant-isolation.md) |
+| Currencies per run | [ADR 0009](docs/adr/0009-run-pinned-to-one-currency.md) |
+
+All decisions: [docs/adr/](docs/adr/).
+```
+
+Also fix the README's "Flyway applies V1 and V2" (there are three migrations) while you're there, and update the "Documentation" section to link the five docs.
+
+**Done when:** the README has no open questions left, and every ADR is `Accepted`.
+
+### 4.13 Bookkeeping: update TASKS.md
+
+While writing the docs, apply the `docs/scalability.md` §9 changes to TASKS.md (they're decisions, and decisions belong in this phase):
+
+- M2.4: add MinIO. M2.8: add `api`/`worker` profiles.
+- M3.5: add RLS + `SET LOCAL app.org_id`.
+- M5.3: note `transaction_record` is already partitioned (V1).
+- M5.8: `FileStorage` on S3-compatible storage.
+- M5.10–14: streaming, 5,000-row chunks, resume checkpoint.
+- M6.4–9: set-based SQL, chunked by day.
+- M9.2: move the job table work into M5 (new task, e.g. M5.0 "Job queue").
+- M9.5–6: load scenarios S1–S6.
+- New tasks: partition-maintenance job, archival job, quarterly restore drill.
+- Fix the M2 exit criterion: `V1__baseline.sql` → `V1__initial_schema.sql` (and V2, V3).
+
+---
+
+## 5. Testing strategy
+
+Documents can't be unit-tested, but they can be checked:
+
+| Check | How |
+|---|---|
+| Rules are complete | For each sample record, the rules doc alone determines the outcome. Do the "stranger test" from §1 |
+| Rules are consistent with the schema | Every enum/status/type in the docs exists in a `CHECK` constraint, and vice versa: `grep -o "'[A-Z_]*'" src/main/resources/db/migration/V1__initial_schema.sql \| sort -u` against the docs |
+| Every requirement is traceable | Each FR/NFR names a TASKS.md task; each task in M3–M8 is covered by an FR/NFR |
+| Samples are valid against the contract | Visually now; in M5.22 an integration test imports every sample |
+| Mermaid diagrams render | Push the branch and view the files on GitHub |
+| Links work | Click every link in the PR's rich diff view |
+
+The real tests of this phase come later: M5.21 (one test per normalization rule ID), M5.22 (samples import as documented), M6.18 (engine reproduces `samples/README.md`), M6.19 (the invariant).
+
+---
+
+## 6. Exit criteria checklist
+
+- [ ] `docs/requirements.md` with personas, FR-xx, NFR-xx, scope, assumptions A1–A8, CSV contracts
+- [ ] `docs/samples/` with every file in §4.4 and `samples/README.md` giving every record's expected outcome
+- [ ] `docs/reconciliation-rules.md` with N1–N11, participation, match key, ordered outcomes, invariant, exception types, resolution codes, `discrepancy_key`, state machines, money rules
+- [ ] `docs/architecture.md` with module/table ownership, allowed dependencies, sequence diagrams
+- [ ] `docs/database-design.md` with ERD, constraint table, known partition-key gap, partitioning, migration policy
+- [ ] `docs/api-design.md` with conventions, error catalogue, pagination, idempotency, concurrency, status codes
+- [ ] `docs/adr/0000`–`0012` merged, all `Accepted`
+- [ ] README "Open design questions" replaced by the decisions table
+- [ ] TASKS.md updated with the scalability.md §9 changes and the corrected M2 exit criterion
+- [ ] `ls docs/*.md docs/adr/*.md docs/samples/* | wc -l` matches the expected file count
+
+---
+
+## 7. Interview questions this phase prepares you for
+
+**Q: Walk me through how your reconciliation engine decides an outcome.**
+Records are normalized first: trimmed, upper-cased references, ISO currency, UTC dates. Only SUCCESS records in the run's period and currency participate. They're grouped by normalized reference and transaction type. In order: more than one record on either side is a duplicate; a different currency is a currency mismatch; one each side with different amounts is an amount mismatch; equal amounts is a match; one side only is missing. Every record lands in exactly one outcome, and a property test checks that.
+
+**Q: What happens when there are two gateway records for one ledger record?**
+The engine never picks one. It raises a single duplicate exception linking all three records and leaves it for a human. Arbitrary tie-breaking in a financial system silently hides a possible double charge.
+
+**Q: How do you represent money?**
+`BigDecimal` in Java and `NUMERIC(19,4)` in PostgreSQL, parsed from the original string, never via `double`. Inputs with more than four decimals are rejected rather than rounded. Comparison uses `compareTo`, because `equals` treats `1000.0` and `1000.00` as different. Amounts go over JSON as strings so JavaScript clients don't parse them into binary floats.
+
+**Q: Why return 202 instead of 201 for an upload?**
+Processing a large file takes tens of seconds, too long to hold an HTTP request. `202 Accepted` says "I've durably accepted this and will process it", returns the batch ID and a `Location` to poll. `201` would imply the resource is complete. The file and the job row are committed before the response, so the work can't be lost.
+
+**Q: How do you make "start reconciliation" idempotent?**
+The client can send an `Idempotency-Key`; otherwise the server derives one from the organization, period, sources and currency. A unique constraint on `(organization_id, idempotency_key)` means a repeat returns the existing run instead of creating a second. Exceptions are also deduplicated across runs by a deterministic discrepancy key with a partial unique index that only applies to active cases.
+
+**Q: Why a modular monolith rather than microservices?**
+The load is small (about 35 requests per second at peak), the hard problems are data correctness and transactions, and microservices would turn local transactions into distributed ones. A modular monolith with enforced boundaries gives the same separation of concerns and keeps the option to extract a module later. The decision is recorded with its alternatives in an ADR.
+
+**Q: What's an ADR and why use them?**
+A short, immutable record of one decision: context, decision, consequences, alternatives. It captures *why* while the reasons are fresh, so later readers don't undo a decision without knowing what it protected against. Changing your mind means a new ADR that supersedes the old.
+
+**Q: Why UUIDv7 rather than auto-increment IDs or UUIDv4?**
+Auto-increment IDs leak business volume and are enumerable, and they need a database round trip before batching inserts. Random UUIDv4 keys scatter inserts across the B-tree, causing page splits and cache misses at scale. UUIDv7 puts a timestamp in the high bits, so it's both unguessable enough to expose and roughly sequential for the index.
+
+---
+
+## 8. Common mistakes
+
+- **Writing the expected sample outcomes after writing the engine.** You'll document what the code does instead of what it should do.
+- **Leaving "TBD" in the rules.** Every TBD becomes an inconsistent assumption in two places in the code.
+- **Making NFRs unmeasurable.** "Fast", "secure" and "scalable" aren't requirements.
+- **Forgetting the timezone rule.** Converting one source to UTC and not the other shifts payments across midnight and creates false "missing" exceptions.
+- **Tie-breaking duplicates** (e.g. "take the first one"). It hides double charges.
+- **Using `equals` for `BigDecimal` anywhere in the examples.** Readers copy examples.
+- **ADRs without alternatives.** An ADR that lists no rejected alternative isn't a decision record, it's a description.
+- **Editing an accepted ADR.** Supersede it with a new one.
+- **Duplicating the auth design** in `api-design.md`. Link to `plans/authentication.plan` and keep one source of truth.
+- **Over-designing v2.** One sentence per v2 feature in "out of scope" is enough.

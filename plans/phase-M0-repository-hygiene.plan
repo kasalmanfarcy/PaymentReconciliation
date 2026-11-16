@@ -1,0 +1,526 @@
+# Phase M0 — Repository hygiene
+
+**Status:** Not started · **Tasks:** TASKS.md M0.1–M0.6 · **Depends on:** nothing · **Date:** 2026-11-01
+
+This phase turns a folder of code on one laptop into a repository that someone else can clone, build, understand and contribute to under clear rules. None of it is glamorous, but every later phase relies on it. CI can't protect `main` until `main` lives on GitHub, commit messages can't reference task IDs until there's a convention, and a reviewer can't trust the build until `./mvnw test` passes on a machine that isn't yours.
+
+---
+
+## 1. Goal
+
+At the end of this phase:
+
+- Every commit on your laptop is pushed to `github.com/kasalmanfarcy/PaymentReconciliation`.
+- `pom.xml` describes the project accurately: name, description, URL, license, developer, SCM.
+- `LICENSE`, `CONTRIBUTING.md` and `.editorconfig` exist at the repository root.
+- `main` is protected: nobody, including you, pushes to it directly. Changes arrive through pull requests.
+- A fresh clone on a machine with only Java 25 and Docker passes `./mvnw test`.
+
+**The demo that proves it:**
+
+```bash
+cd "$(mktemp -d)"
+git clone https://github.com/kasalmanfarcy/PaymentReconciliation.git reconflow
+cd reconflow
+./mvnw -q test        # passes, with no .env and no local PostgreSQL
+git push origin HEAD:main   # rejected: "protected branch"
+```
+
+---
+
+## 2. Concepts to understand first
+
+### 2.1 Reproducible builds
+
+A build is *reproducible* when the same source produces the same result on any machine. Three things break that in Java projects:
+
+| Breaker | Example | Fix used here |
+|---|---|---|
+| Tool version drift | You have Maven 3.9, CI has 3.6 | The **Maven wrapper** (`./mvnw`) downloads the exact Maven version recorded in `.mvn/wrapper/maven-wrapper.properties` |
+| Hidden local state | The test passes because *your* PostgreSQL is running with *your* `.env` | Tests start their own database with **Testcontainers** (pulled forward from M2.3, see §4.7) |
+| Line endings and encodings | A Windows checkout turns `mvnw` into CRLF and it fails with `/bin/sh^M: bad interpreter` | `.gitattributes` (already present) and `.editorconfig` (M0.6) |
+
+**Interview angle:** "It works on my machine" is a reproducibility failure. The answer is to pin tool versions (wrapper, Docker image tags) and remove dependencies on machine state (Testcontainers instead of a shared dev database).
+
+### 2.2 Branch protection and the pull-request workflow
+
+Branch protection is a GitHub rule set attached to a branch. For `main` we want:
+
+- **Require a pull request before merging.** Direct pushes are rejected.
+- **Require status checks to pass.** The CI job must be green before the merge button works.
+- **Require branches to be up to date.** The PR must be tested against the *current* `main`, not the `main` from when you branched.
+- **Block force pushes and deletion.**
+
+Why bother on a one-person project? Because the habits are what you're demonstrating. A reviewer looking at your GitHub sees a history of small, titled PRs with green checks, and that tells them more than any README claim.
+
+**Interview angle:** "How do you keep `main` deployable?" Every change goes through a PR, CI runs the full test suite (including integration tests against a real database) on the merged result, and `main` can't be changed any other way.
+
+### 2.3 Commit conventions
+
+**Conventional Commits** is a lightweight format for commit messages:
+
+```
+<type>(<scope>): <task-id> <summary in the imperative>
+
+<optional body: why, not what>
+
+<optional footer: BREAKING CHANGE:, Refs:, Co-Authored-By:>
+```
+
+| Type | Use for |
+|---|---|
+| `feat` | New behaviour visible to a user or API client |
+| `fix` | A bug fix |
+| `docs` | Documentation only |
+| `test` | Tests only |
+| `refactor` | Code change with no behaviour change |
+| `build` | Maven, Docker, dependencies |
+| `ci` | GitHub Actions |
+| `chore` | Anything else (formatting, housekeeping) |
+
+The scope is the module (`ingestion`, `reconciliation`, `security`, …). The task ID (`M5.11`) links the commit to TASKS.md, so `git log --grep M5.11` finds every commit for that task.
+
+**Interview angle:** structured commit messages make `git log` a usable changelog, let tools generate release notes, and let reviewers see intent at a glance.
+
+### 2.4 Open-source licenses
+
+Code with no license is *not* free to use: by default, copyright law reserves every right to the author. A license grants permissions explicitly.
+
+| | MIT | Apache-2.0 |
+|---|---|---|
+| Length | ~20 lines | ~200 lines |
+| Permits commercial use, modification, distribution | Yes | Yes |
+| Requires keeping the copyright notice | Yes | Yes, plus a `NOTICE` file if you have one |
+| **Explicit patent grant** | No | **Yes**: contributors grant users a license to any patents their contribution uses, and lose it if they sue |
+| Requires stating changes in modified files | No | Yes |
+| Common in | JS, small libraries | Java and the Spring ecosystem, Kubernetes, Kafka |
+
+**Recommendation: Apache-2.0.** It's the license of Spring Boot itself and most of the Java ecosystem, so it reads as natural on a Java portfolio project, and the patent grant is the kind of detail an interviewer at a fintech might ask about. MIT is also perfectly fine if you prefer brevity; the important thing is having *a* license.
+
+### 2.5 EditorConfig
+
+`.editorconfig` is a tiny file that most editors (VS Code with the extension, all JetBrains IDEs natively) read to set indentation, final newline, trailing whitespace and line endings per file type. It stops diffs filling with whitespace noise when two editors disagree. It does *not* reformat code. That's Spotless's job in M2.13. The two must agree, or the formatter and the editor will fight.
+
+---
+
+## 3. Starting point
+
+| Item | State |
+|---|---|
+| Git history | 6 commits on local `main`. `origin/main` is at `6a80e51 schema`, so **3 commits are unpushed**: `c478f0b`, `d083d94`, `a2a7bfc`. |
+| Remote | `origin` = `https://github.com/kasalmanfarcy/PaymentReconciliation.git` exists |
+| `pom.xml` | Spring Initializr placeholders: empty `<name/>`, `<description/>`, `<url/>`, `<licenses>`, `<developers>`, `<scm>` |
+| `LICENSE`, `CONTRIBUTING.md`, `.editorconfig` | Missing |
+| `.gitattributes` | Present: `mvnw` forced to LF, `*.cmd` to CRLF |
+| `.gitignore` | Present; `.env` is ignored, `.env.example` is tracked |
+| Tests | One: `PaymentreconflowApplicationTests.contextLoads()`, a `@SpringBootTest` that needs a live PostgreSQL and `DB_USER`/`DB_PASSWORD`. **It fails on a fresh clone.** |
+| CI | None |
+| Untracked folders | `modelmemory/`, `modelsmemory/`, `target/` exist locally. `target/` is ignored; check the other two (§4.1) |
+
+M0.1 ("make the initial commit") is already done: `cb67a13 Initial commit`. Tick it in TASKS.md.
+
+---
+
+## 4. Step by step
+
+The order below differs slightly from the task numbering because pushing comes first: everything after it happens through PRs.
+
+### 4.1 M0.4 (part 1) — Push `main`
+
+**What:** get the 3 unpushed commits onto GitHub.
+
+**Why:** branch protection can only be set up once the history it protects is on GitHub. After protection is on, these commits could only arrive via a PR, so push them now while direct pushes still work.
+
+**How:**
+
+```bash
+git status                 # must be clean
+git log --oneline origin/main..main   # shows the 3 commits you're about to push
+git ls-files | grep -E '\.env$'       # must print nothing: .env must never be pushed
+git push origin main
+```
+
+Before pushing, decide about `modelmemory/` and `modelsmemory/`. They look like tool scratch folders, not project files. If they shouldn't be public, add them to `.gitignore`:
+
+```gitignore
+# Local assistant memory, not part of the project
+modelmemory/
+modelsmemory/
+```
+
+**Pitfalls:**
+
+- If `git push` is rejected with "non-fast-forward", someone (you, from another machine or the GitHub UI) changed `origin/main`. Run `git pull --rebase origin main`, resolve, then push. **Never** `git push --force` to `main`.
+- Check the GitHub repo's default branch is `main` (Settings → General → Default branch).
+
+**Done when:** `git rev-list --count origin/main..main` prints `0`.
+
+### 4.2 M0.2 — Fill in the `pom.xml` metadata
+
+**What:** replace the Initializr placeholders with real values.
+
+**Why:** the metadata appears in the generated JAR's `META-INF/maven/.../pom.xml`, in `/actuator/info` if you expose build info, and in any published artifact. Empty tags look unfinished; a reviewer opening `pom.xml` sees them first.
+
+**How:** a branch and PR from here on (protection isn't on yet, but practise the workflow):
+
+```bash
+git switch -c chore/M0.2-pom-metadata
+```
+
+Replace the block from `<name/>` to the closing `</scm>` with:
+
+```xml
+<name>ReconFlow</name>
+<description>
+    Multi-tenant payment reconciliation service: imports internal-ledger and
+    payment-gateway settlement files, matches them, and manages the resulting
+    exceptions through to an audited resolution.
+</description>
+<url>https://github.com/kasalmanfarcy/PaymentReconciliation</url>
+
+<licenses>
+    <license>
+        <name>Apache License, Version 2.0</name>
+        <url>https://www.apache.org/licenses/LICENSE-2.0</url>
+        <distribution>repo</distribution>
+    </license>
+</licenses>
+
+<developers>
+    <developer>
+        <id>kasalmanfarcy</id>
+        <name><!-- your name as you want it shown --></name>
+        <url>https://github.com/kasalmanfarcy</url>
+    </developer>
+</developers>
+
+<scm>
+    <connection>scm:git:https://github.com/kasalmanfarcy/PaymentReconciliation.git</connection>
+    <developerConnection>scm:git:git@github.com:kasalmanfarcy/PaymentReconciliation.git</developerConnection>
+    <url>https://github.com/kasalmanfarcy/PaymentReconciliation</url>
+    <tag>HEAD</tag>
+</scm>
+```
+
+TASKS.md says "remove the empty blocks". Filling them with real values is better than removing them, provided every value is real. If you don't want to publish a developer entry, delete that block entirely rather than leaving it empty.
+
+**Why `<licenses>` even if you never publish to Maven Central:** Spring Boot's parent POM *inherits* metadata into child POMs. An empty `<licenses><license/></licenses>` is the Initializr's trick to *stop* Spring Boot's own Apache license being inherited into your project. Once you put a real license there, the trick is no longer needed.
+
+**Pitfalls:**
+
+- Don't put an email address in `<developers>` unless you want it scraped.
+- Keep `<description>` to what exists or is committed to; it's not a marketing paragraph.
+
+**Done when:** `./mvnw -q help:evaluate -Dexpression=project.name -DforceStdout` prints `ReconFlow`, and `./mvnw -q validate` passes.
+
+### 4.3 M0.3 — Add `LICENSE`
+
+**What:** a `LICENSE` file at the root with the full license text.
+
+**Why:** see §2.4. GitHub detects the file and shows the license in the repo sidebar.
+
+**How:** the easiest correct way is GitHub's UI (Add file → Create new file → name it `LICENSE` → "Choose a license template" → Apache 2.0), but since `main` should only change via PR, do it locally:
+
+```bash
+curl -fsSL https://www.apache.org/licenses/LICENSE-2.0.txt -o LICENSE
+```
+
+Then fill in the appendix's copyright line if you want one (the Apache text's appendix is a template for *per-file* headers; it's optional). Put the copyright line `Copyright 2026 <your name>` in a short `NOTICE` file, or leave it out. For MIT instead, copy the text from https://opensource.org/license/mit and set the year and name.
+
+Make `pom.xml`'s `<licenses>` match whichever you pick.
+
+**Pitfalls:** don't write a license from memory or paraphrase it; use the canonical text unmodified.
+
+**Done when:** GitHub's repo page shows "Apache-2.0 license" in the About sidebar after merge.
+
+### 4.4 M0.6 — Add `.editorconfig`
+
+**What:** editor settings for every file type in the repo.
+
+**Why:** see §2.5.
+
+**How:** create `.editorconfig` at the root:
+
+```ini
+# https://editorconfig.org
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+# Spotless (M2.13) formats Java; keep the editor consistent with it.
+[*.java]
+indent_size = 4
+max_line_length = 120
+
+[*.{yml,yaml,json}]
+indent_size = 2
+
+[*.xml]
+indent_size = 4
+
+[*.sql]
+indent_size = 4
+
+# Markdown uses two trailing spaces as a line break; don't strip them.
+[*.{md,plan}]
+trim_trailing_whitespace = false
+
+# Windows scripts need CRLF; .gitattributes enforces the same in Git.
+[*.{cmd,bat}]
+end_of_line = crlf
+
+[Makefile]
+indent_style = tab
+```
+
+Check the existing `pom.xml` and migration files: the pom uses tabs (Initializr default). Either set `[pom.xml] indent_style = tab` to match, or reformat the pom to spaces in this same PR. Pick one; the point is that the file and the rule agree. Converting to spaces is simplest because Spotless (M2.13) can then check XML too.
+
+**Pitfalls:**
+
+- `.editorconfig` and `.gitattributes` must agree on line endings. Here both say LF everywhere except `.cmd`.
+- If the Java indentation you choose here differs from the Spotless formatter you pick in M2.13, the editor and the formatter will fight. Palantir Java Format uses 4 spaces and a 120-column limit, which matches the settings above; Google Java Format uses 2 spaces.
+
+**Done when:** opening a `.java` file and a `.yml` file in VS Code (with the EditorConfig extension) gives 4-space and 2-space indentation respectively.
+
+### 4.5 M0.5 — Agree a branch and commit convention, record it in `CONTRIBUTING.md`
+
+**What:** a `CONTRIBUTING.md` explaining how changes are made.
+
+**Why:** you'll follow the rules more reliably if they're written down, and a reviewer reads this file to see how disciplined the project is.
+
+**How:** create `CONTRIBUTING.md`:
+
+````markdown
+# Contributing to ReconFlow
+
+## Workflow
+
+1. Pick a task from [TASKS.md](TASKS.md). Don't start a milestone until the
+   previous one's exit criteria hold.
+2. Branch from an up-to-date `main`:
+   `git switch main && git pull && git switch -c <type>/<task-id>-<slug>`
+   e.g. `feat/M5.11-row-validator`, `fix/M7.8-stale-version-409`, `docs/M1.5-rules`.
+3. Commit in small steps using the message format below.
+4. Open a pull request into `main`. CI must pass before merging.
+5. Merge with **squash and merge**. The PR title becomes the commit message, so
+   it must follow the format too.
+6. Tick the task in TASKS.md in the same PR that completes it.
+
+## Commit messages
+
+[Conventional Commits](https://www.conventionalcommits.org/) with a task ID:
+
+    <type>(<scope>): <task-id> <imperative summary, max 72 chars>
+
+    <body: why the change was needed, wrapped at 72 columns>
+
+Types: feat, fix, docs, test, refactor, build, ci, chore.
+Scopes: the module (organization, ingestion, ledger, reconciliation, exceptions,
+reporting, audit, security, shared) or `repo` for repository-wide changes.
+
+Examples:
+
+    feat(ingestion): M5.11 validate amount scale and ISO currency
+    fix(exceptions): M7.8 return 409 when If-Match is stale
+    docs(repo): M1.5 add reconciliation rules
+    build(repo): M2.3 add Testcontainers
+
+## Definition of done (every PR)
+
+- [ ] `./mvnw verify` passes locally
+- [ ] Money is BigDecimal / NUMERIC, compared with compareTo
+- [ ] Every tenant-owned query is scoped by organizationId
+- [ ] New endpoints have cross-tenant and authorization tests
+- [ ] State changes go through the central transition logic and emit an audit event
+- [ ] Schema changes are a new Flyway migration; applied migrations are never edited
+- [ ] List endpoints paginate
+- [ ] Docs in docs/ are updated when behaviour changes
+
+## Local setup
+
+See the README's "Getting started".
+````
+
+The "Definition of done" list is the cross-cutting checklist at the bottom of TASKS.md. Putting it in `CONTRIBUTING.md` and, later, in `.github/pull_request_template.md` means you see it on every PR:
+
+```bash
+mkdir -p .github
+# Copy the Definition of done list into .github/pull_request_template.md,
+# with a "## What and why" and "## Task" heading above it.
+```
+
+**Why squash-merge:** each PR becomes one commit on `main` with a clean, conventional title, while the branch can contain as many "wip" commits as you like. The alternative, rebase-merge, keeps every branch commit, which is only worth it if every commit is individually meaningful.
+
+In the GitHub repo settings (Settings → General → Pull Requests), allow **squash merging only**, set the default message to "Pull request title and description", and tick "Automatically delete head branches".
+
+**Pitfalls:** the six existing commits don't follow the convention. Don't rewrite history to fix them; `main` is shared. The convention starts now.
+
+**Done when:** `CONTRIBUTING.md` is merged, and the repo only offers "Squash and merge".
+
+### 4.6 M0.4 (part 2) — Protect `main`
+
+**What:** a branch protection rule (or the newer *ruleset*) on `main`.
+
+**Why:** see §2.2.
+
+**How, in the GitHub UI:**
+
+1. Repo → **Settings** → **Rules** → **Rulesets** → **New ruleset** → **New branch ruleset**.
+   (The older Settings → Branches → "Add branch protection rule" also works; rulesets are the current mechanism.)
+2. Name: `main protection`. Enforcement status: **Active**.
+3. Target branches → **Add target** → **Include default branch**.
+4. Rules:
+   - ✅ **Restrict deletions**
+   - ✅ **Require a pull request before merging**. Required approvals: **0** (you're the only contributor; 1 would block you from merging your own PRs). Tick "Require conversation resolution before merging".
+   - ✅ **Block force pushes**
+   - ⏳ **Require status checks to pass**. Leave this **off for now**: the only check that can be selected is one that has already run at least once, and no CI workflow exists until M2.15. Add a reminder in M2.15 to come back and turn it on, selecting the `build` job and ticking "Require branches to be up to date before merging".
+5. Bypass list: leave empty. If you add yourself, protection becomes advisory.
+
+**How, with the GitHub CLI** (equivalent to the classic protection rule, useful to keep the setting reproducible):
+
+```bash
+gh auth status   # must be logged in with repo admin rights
+
+gh api -X PUT repos/kasalmanfarcy/PaymentReconciliation/branches/main/protection \
+  -H "Accept: application/vnd.github+json" \
+  --input - <<'JSON'
+{
+  "required_status_checks": null,
+  "enforce_admins": true,
+  "required_pull_request_reviews": {
+    "required_approving_review_count": 0,
+    "dismiss_stale_reviews": true
+  },
+  "restrictions": null,
+  "required_conversation_resolution": true,
+  "allow_force_pushes": false,
+  "allow_deletions": false
+}
+JSON
+```
+
+After M2.15, set `required_status_checks` to `{"strict": true, "contexts": ["build"]}` (the job name from the workflow).
+
+`enforce_admins: true` matters: without it, you as the repo admin can still push straight to `main`, and you will, on a tired evening.
+
+**Pitfalls:**
+
+- Branch protection on **private** repositories requires a paid GitHub plan; on public repos it's free. A portfolio project should be public anyway.
+- Requiring 1 approval on a solo repo makes every PR unmergeable. Use 0.
+
+**Done when:**
+
+```bash
+git switch main && git commit --allow-empty -m "test: protection" && git push origin main
+# → remote: error: GH006: Protected branch update failed
+git reset --hard origin/main   # discard the test commit
+```
+
+### 4.7 Exit-criterion fix — make `./mvnw test` pass on a fresh clone
+
+This isn't a numbered M0 task, but the M0 exit criterion can't be met without it.
+
+**What:** the only test, `contextLoads()`, starts the whole application, which connects to PostgreSQL with `DB_USER`/`DB_PASSWORD`. On a fresh clone there's no `.env` and usually no database, so it fails.
+
+**Options:**
+
+| Option | Effort | Verdict |
+|---|---|---|
+| A. Delete or `@Disabled` the test | 1 min | Hides the problem; the build "passes" but proves nothing |
+| B. Exclude DataSource/Flyway auto-config in tests | 5 min | The test passes but no longer checks that migrations apply and entities validate, which is the most useful thing it could check |
+| C. Document "start PostgreSQL first" | 1 min | Fails the criterion: a fresh clone still fails |
+| **D. Pull M2.3 + M2.16 forward: Testcontainers** | 30 min | **Recommended.** The test starts its own PostgreSQL 16 in Docker, Flyway applies V1–V3, Hibernate validates. Needs only Docker on the machine |
+
+**How (option D):** this is the M2.3/M2.16 work done early. Full detail is in `phase-M2-project-foundation.plan` §4 (M2.3, M2.16). In short:
+
+1. Add to `pom.xml` (test scope): `spring-boot-testcontainers`, `org.testcontainers:testcontainers-postgresql` (artifact name changed in Testcontainers 2.x; verify against the Boot 4 dependency management), `org.testcontainers:testcontainers-junit-jupiter`.
+2. Create `src/test/java/com/reconflow/paymentreconflow/TestcontainersConfiguration.java`:
+
+```java
+@TestConfiguration(proxyBeanMethods = false)
+public class TestcontainersConfiguration {
+
+    @Bean
+    @ServiceConnection
+    PostgreSQLContainer postgres() {
+        return new PostgreSQLContainer(DockerImageName.parse("postgres:16.4-alpine"));
+    }
+}
+```
+
+3. Annotate the existing test with `@Import(TestcontainersConfiguration.class)`.
+
+`@ServiceConnection` overrides `spring.datasource.url`, `username` and `password` from the running container, so the `${DB_USER}` placeholders never need resolving.
+
+There's one remaining trap: `application.yml` has `username: ${DB_USER}` with **no default**. Spring resolves placeholders when it binds properties; `@ServiceConnection` replaces the connection details bean, so the unresolved property is usually never read, but if it is, startup fails with "Could not resolve placeholder 'DB_USER'". If you see that, give the placeholders empty defaults (`${DB_USER:}`) and let the `local`/`prod` profiles in M2.5 require them.
+
+**Done when:** in a fresh clone with Docker running and no `.env`, `./mvnw test` passes, and the log shows Flyway "Successfully applied 3 migrations".
+
+---
+
+## 5. Testing strategy
+
+M0 has almost no code, so "testing" means verifying the repository behaves as configured:
+
+| Check | Command or action | Expected |
+|---|---|---|
+| Fresh clone builds | Demo script in §1 | `BUILD SUCCESS` |
+| No secrets committed | `git log --all -p -- .env` and `git grep -nI -E 'password\s*[:=]\s*[^$ {]'` | Nothing (only `${DB_PASSWORD}` style references) |
+| Protection works | Direct push in §4.6 | `GH006: Protected branch update failed` |
+| Line endings | `git ls-files --eol mvnw mvnw.cmd` | `i/lf w/lf` for `mvnw`, `crlf` in working tree for `mvnw.cmd` |
+| Metadata | `./mvnw help:effective-pom \| grep -A3 '<licenses>'` | Your chosen license |
+
+---
+
+## 6. Exit criteria checklist
+
+- [ ] `git rev-list --count origin/main..main` → `0`
+- [ ] `pom.xml` has real `<name>`, `<description>`, `<url>`, `<licenses>`, `<scm>`; no empty placeholder tags remain: `grep -nE '<(name|description|url|license|developer|tag)/>' pom.xml` prints nothing
+- [ ] `LICENSE` exists and GitHub shows it in the sidebar
+- [ ] `CONTRIBUTING.md` and `.github/pull_request_template.md` merged
+- [ ] `.editorconfig` merged and consistent with the pom's indentation
+- [ ] `main` rejects direct pushes (§4.6); only squash-merge is allowed
+- [ ] Fresh clone + Docker → `./mvnw test` passes (§4.7)
+- [ ] TASKS.md: M0.1–M0.6 ticked, with a note on M0.4 that "CI must pass" is switched on in M2.15
+
+---
+
+## 7. Interview questions this phase prepares you for
+
+**Q: How do you make sure a Java build works the same everywhere?**
+Pin the build tool with the Maven or Gradle wrapper, pin the JDK version in CI and the README, and pin every container image to a specific tag. Then remove hidden dependencies on the developer's machine: integration tests start their own PostgreSQL through Testcontainers instead of assuming one is running. CI on a clean runner is the proof that it works.
+
+**Q: What does your branching and merge strategy look like?**
+Trunk-based: short-lived feature branches off `main`, one PR per task, squash-merged so `main` has one conventional commit per change. `main` is protected: PR required, CI required, branch must be up to date, no force pushes. That keeps `main` always releasable and the history readable.
+
+**Q: Why squash merge rather than merge commits or rebase?**
+Squash gives one commit per reviewed change, so `git log` on `main` reads like a changelog and `git revert` undoes a whole feature in one step. The cost is losing the individual commits from the branch, which is fine when they're mostly "wip" commits. Rebase-merge is better when every commit is deliberately crafted and you want `git bisect` granularity.
+
+**Q: Why Apache-2.0 over MIT?**
+Both are permissive. Apache-2.0 adds an explicit patent grant from contributors and terminates it for anyone who sues over patents, which protects users of the code. It's also the license of Spring and most of the Java ecosystem, so it's the conventional choice there.
+
+**Q: Why does a Spring Initializr pom contain an empty `<licenses>` block?**
+Maven inherits metadata from the parent POM. Without the empty block, your project would inherit Spring Boot's Apache-2.0 license declaration, claiming a license you never chose. The empty element overrides the inherited one. Once you declare your own license, the trick isn't needed.
+
+**Q: What would you check before making a repository public?**
+That no secrets are in *any* commit, not just the latest: `.env` files, keys, passwords in config. Deleting a file in a later commit doesn't remove it from history; if a secret was ever committed, rotate it and rewrite history with `git filter-repo` before publishing. Also check that a license exists and the README explains how to run the project.
+
+---
+
+## 8. Common mistakes
+
+- **Turning on protection before pushing.** Then the 3 unpushed commits have to go through a PR. Not fatal, just annoying. Push first.
+- **Requiring 1 approval on a solo repo.** Every PR becomes unmergeable. Use 0 approvals and rely on required status checks.
+- **Leaving yourself on the bypass list, or `enforce_admins: false`.** Protection that the only contributor can skip isn't protection.
+- **Selecting a required status check that has never run.** GitHub only offers checks it has seen. Wait for M2.15.
+- **"Fixing" the fresh-clone failure by disabling the test.** The build goes green but proves nothing. Use Testcontainers.
+- **Rewriting old commit messages to fit the new convention.** Rewriting pushed history on `main` breaks every other clone. Start the convention now.
+- **Copying a license from memory or editing its text.** Use the canonical text.
+- **`.editorconfig` that disagrees with the formatter.** Pick the formatter style in M2.13 that matches, or change both together.
+- **Committing local tool folders** (`modelmemory/`, IDE folders). Check `git status` before the first public push and extend `.gitignore`.

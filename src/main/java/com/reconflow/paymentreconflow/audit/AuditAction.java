@@ -36,6 +36,8 @@ public enum AuditAction {
     RUN_STARTED,
     RUN_COMPLETED,
     RUN_FAILED,
+    RUN_REQUESTED,
+    RUN_RETRY_REQUESTED,
     // M7: exceptions
     EXCEPTION_CREATED,
     EXCEPTION_ASSIGNED,

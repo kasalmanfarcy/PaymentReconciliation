@@ -131,6 +131,9 @@ public class JobRunner {
         } catch (LeaseLostException e) {
             // Someone else owns the job now; whatever this worker had in flight was rolled back.
             log.warn("Lease lost on job {}; another worker owns it now", job.id());
+        } catch (JobDeferredException e) {
+            store.defer(job.id(), job.workerId(), e.delay(), e.getMessage());
+            log.info("Deferred job {} by {}: {}", job.id(), e.delay(), e.getMessage());
         } catch (JobStoppedException e) {
             store.release(job.id(), job.workerId());
             log.info("Released job {} on shutdown", job.id());

@@ -2,6 +2,7 @@ package com.reconflow.paymentreconflow.ingestion.domain;
 
 import com.reconflow.paymentreconflow.ledger.SourceType;
 import jakarta.persistence.LockModeType;
+import java.util.Collection;
 import java.util.Optional;
 import java.util.UUID;
 import org.springframework.data.jpa.repository.Lock;
@@ -52,6 +53,9 @@ public interface ImportBatchRepository extends Repository<ImportBatch, UUID> {
             @Param("lastRow") int lastRow,
             @Param("validRows") int validRows,
             @Param("errorRows") int errorRows);
+
+    /** Is any batch of the organization in one of these statuses? (ImportActivity) */
+    boolean existsByOrganizationIdAndStatusIn(UUID organizationId, Collection<ImportBatchStatus> statuses);
 
     /** For the orphan sweeper: is any batch of this organization still pointing at the object? */
     boolean existsByOrganizationIdAndStorageKey(UUID organizationId, String storageKey);

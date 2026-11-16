@@ -154,6 +154,22 @@ class JobStore {
                 == 1;
     }
 
+    /**
+     * The handler can't start yet (JobDeferredException): back in the queue after {@code delay},
+     * without spending the attempt this claim counted.
+     */
+    boolean defer(UUID jobId, String workerId, Duration delay, String reason) {
+        return jdbc.update(
+                        "UPDATE job SET status = 'QUEUED', locked_by = NULL, lease_until = NULL,"
+                                + " run_after = now() + make_interval(secs => ?), attempts = greatest(attempts - 1, 0),"
+                                + " last_error = ?, updated_at = now() WHERE id = ? AND locked_by = ? AND status = 'RUNNING'",
+                        seconds(delay),
+                        truncate("deferred: " + reason),
+                        jobId,
+                        workerId)
+                == 1;
+    }
+
     /** Expired leases with attempts left go back to the queue; returns their ids. */
     List<UUID> requeueExpired() {
         return jdbc.queryForList("""

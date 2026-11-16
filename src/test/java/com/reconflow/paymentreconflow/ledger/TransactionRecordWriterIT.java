@@ -22,7 +22,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * M5.3: rows land in their monthly partitions (missing ones are created first) and never in the
- * default.
+ * default; M5.5: the row-level guard absorbs a repeated insert of the same source rows.
  */
 class TransactionRecordWriterIT extends AbstractIntegrationTest {
 
@@ -70,6 +70,24 @@ class TransactionRecordWriterIT extends AbstractIntegrationTest {
                         "transaction_record_2025_03=3", "transaction_record_2025_04=2", "transaction_record_2026_10=5");
         assertThat(jdbc.queryForObject("SELECT count(*) FROM transaction_record_default", Long.class))
                 .isZero();
+    }
+
+    @Test
+    void aRepeatedInsertOfTheSameSourceRowsIsAbsorbed() {
+        UUID org = data().newOrganization();
+        UUID batch = batch(org);
+        List<NewTransactionRecord> rows = List.of(
+                record(batch, 1, "PAY-1", "1.0000", LocalDate.of(2026, 10, 1)),
+                record(batch, 2, "PAY-2", "2.0000", LocalDate.of(2026, 10, 1)));
+        tx.executeWithoutResult(s -> writer.insert(org, rows));
+
+        // A resumed chunk re-reads the same rows: new UUIDs, same (batch, row, date).
+        List<NewTransactionRecord> again = List.of(
+                record(batch, 1, "PAY-1", "1.0000", LocalDate.of(2026, 10, 1)),
+                record(batch, 3, "PAY-3", "3.0000", LocalDate.of(2026, 10, 1)));
+        tx.executeWithoutResult(s -> writer.insert(org, again));
+
+        assertThat((long) tx.execute(s -> writer.countBatch(org, batch))).isEqualTo(3);
     }
 
     @Test

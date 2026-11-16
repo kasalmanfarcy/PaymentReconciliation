@@ -1,0 +1,10 @@
+# Demo data for the containerised stack (M11.2): `docker compose --profile full up` runs the app with
+# prod config, where the local profile (and its seeder) is never active. This turns on the same
+# seeder: two organizations, a user per role, linked by Keycloak id to the realm's demo accounts.
+# Run as prod,api,demo on one api instance only.
+reconflow:
+  seed:
+    enabled: true
+    # Guard: refuse to seed if the database holds any organization that isn't a demo one, so `demo`
+    # switched on by mistake against a real database creates nothing (security.seed.LocalSeeder).
+    only-into-demo-database: true

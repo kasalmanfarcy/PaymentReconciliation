@@ -1,0 +1,33 @@
+# Role profile: apply the Flyway migrations, then exit (M11.2, M11.5). Run as `prod,migrate`, once
+# per deploy, before any api or worker instance of the new version starts:
+#
+#   docker compose run --rm migrate       (compose.yaml, deploy/compose.prod.yaml)
+#
+# Only this step needs the migrator's credentials.
+spring:
+  main:
+    # No web server, and no api/worker beans (those switch on with the role profiles): once Flyway
+    # and the context have started there is nothing left running, and MigrateAndExit closes it with
+    # Flyway's outcome as the exit code (0, or non-zero when a migration fails).
+    web-application-type: none
+  datasource:
+    # The context's own pool (Hibernate validates the entities against the new schema) connects as
+    # the migrator too, so this step doesn't need the application's password at all.
+    username: ${DB_MIGRATOR_USER}
+    password: ${DB_MIGRATOR_PASSWORD}
+    hikari:
+      maximum-pool-size: 2
+  flyway:
+    user: ${DB_MIGRATOR_USER}
+    password: ${DB_MIGRATOR_PASSWORD}
+
+reconflow:
+  # Overrides prod's list: this step needs the database and nothing else (no Keycloak, no storage).
+  required-properties: DB_URL, DB_MIGRATOR_USER, DB_MIGRATOR_PASSWORD
+  # Never seed or bootstrap from the migrate step, even if the deploy's environment says so: that is
+  # the api's job, as the application role.
+  seed:
+    enabled: false
+  bootstrap:
+    admin-email: ""
+  migrate-and-exit: true

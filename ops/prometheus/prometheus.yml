@@ -1,4 +1,6 @@
-# Scrapes ReconFlow's management port (M9.10). Local only: the target is the app on the host.
+# Scrapes ReconFlow's management port (M9.10). Local only. Two jobs: the app on the host
+# (`./mvnw spring-boot:run`), and the api and worker containers of compose's full profile (M11.2).
+# Whichever isn't running shows as a down target; no alert depends on `up`.
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
@@ -9,3 +11,10 @@ scrape_configs:
     metrics_path: /actuator/prometheus
     static_configs:
       - targets: ['host.docker.internal:8081']
+  - job_name: reconflow-compose
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ['api:8081']
+        labels: { role: api }
+      - targets: ['worker:8081']
+        labels: { role: worker }

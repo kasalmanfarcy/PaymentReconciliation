@@ -6,12 +6,15 @@ import com.reconflow.paymentreconflow.security.user.AppUserRepository;
 import com.reconflow.paymentreconflow.security.user.Membership;
 import com.reconflow.paymentreconflow.security.user.MembershipRepository;
 import com.reconflow.paymentreconflow.shared.context.Role;
+import com.reconflow.paymentreconflow.shared.context.TenantDirectory;
 import com.reconflow.paymentreconflow.shared.context.TenantScope;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBooleanProperty;
@@ -31,9 +34,14 @@ import org.springframework.transaction.support.TransactionTemplate;
  * also run in production, and going through the same services as real code (OrganizationService and
  * its audit row, TenantScope for RLS) shapes the data exactly like real data.
  *
- * <p>On only where {@code reconflow.seed.enabled=true}, which only application-local.yml sets.
- * Tests create their own fixtures and never depend on seed data. Idempotent: does nothing once
- * {@code admin@acme.test} exists.
+ * <p>On only where {@code reconflow.seed.enabled=true}, which application-local.yml and the
+ * {@code demo} profile (application-demo.yml, M11.2: the containerised demo runs with {@code prod}
+ * config) set. Tests create their own fixtures and never depend on seed data. Idempotent: does
+ * nothing once {@code admin@acme.test} exists.
+ *
+ * <p>The {@code demo} profile also sets {@code reconflow.seed.only-into-demo-database}: if any
+ * organization other than the two demo ones exists, it refuses, so turning {@code demo} on by
+ * mistake against a real database creates nothing.
  */
 @Component
 @ConditionalOnBooleanProperty("reconflow.seed.enabled")
@@ -66,18 +74,24 @@ public class LocalSeeder implements ApplicationRunner {
     private final MembershipRepository memberships;
     private final TenantScope tenantScope;
     private final TransactionTemplate tx;
+    private final TenantDirectory tenants;
+    private final boolean onlyIntoDemoDatabase;
 
     public LocalSeeder(
             OrganizationService organizations,
             AppUserRepository users,
             MembershipRepository memberships,
             TenantScope tenantScope,
-            TransactionTemplate tx) {
+            TransactionTemplate tx,
+            TenantDirectory tenants,
+            @Value("${reconflow.seed.only-into-demo-database:false}") boolean onlyIntoDemoDatabase) {
         this.organizations = organizations;
         this.users = users;
         this.memberships = memberships;
         this.tenantScope = tenantScope;
         this.tx = tx;
+        this.tenants = tenants;
+        this.onlyIntoDemoDatabase = onlyIntoDemoDatabase;
     }
 
     @Override
@@ -89,6 +103,11 @@ public class LocalSeeder implements ApplicationRunner {
     public boolean seed() {
         if (users.findByEmailIgnoreCase(MARKER_EMAIL).isPresent()) {
             log.info("Local seed data already present");
+            return false;
+        }
+        if (onlyIntoDemoDatabase && hasNonDemoOrganizations()) {
+            log.warn("Demo seed skipped: this database holds organizations other than the demo ones,"
+                    + " so it is not a demo database. Turn the demo profile off.");
             return false;
         }
         UUID consultant = tenantScope.call(
@@ -121,6 +140,10 @@ public class LocalSeeder implements ApplicationRunner {
                 ACME_ID,
                 GLOBEX_ID);
         return true;
+    }
+
+    private boolean hasNonDemoOrganizations() {
+        return !Set.of(ACME_ID, GLOBEX_ID).containsAll(tenants.organizationIds());
     }
 
     private void seedOrganization(UUID id, String name, String domain) {

@@ -8,6 +8,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import com.reconflow.paymentreconflow.organization.OrganizationService;
 import com.reconflow.paymentreconflow.security.user.AppUserRepository;
 import com.reconflow.paymentreconflow.security.user.MembershipRepository;
+import com.reconflow.paymentreconflow.shared.context.TenantDirectory;
 import com.reconflow.paymentreconflow.shared.context.TenantScope;
 import com.reconflow.paymentreconflow.support.AbstractIntegrationTest;
 import com.reconflow.paymentreconflow.support.TestTokens;
@@ -15,7 +16,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.UUID;
+import org.junit.jupiter.api.MethodOrderer;
+import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestMethodOrder;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.transaction.support.TransactionTemplate;
 import tools.jackson.databind.JsonNode;
@@ -24,6 +29,8 @@ import tools.jackson.databind.JsonNode;
  * The seeder is off in the test profile (tests make their own fixtures), so it is built by hand.
  * It uses fixed IDs and emails, so this is the only test that may run it.
  */
+// The guard test must run before the seed exists (fixed ids: once seeded, every seed() is a no-op).
+@TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class LocalSeederIT extends AbstractIntegrationTest {
 
     @Autowired
@@ -41,9 +48,34 @@ class LocalSeederIT extends AbstractIntegrationTest {
     @Autowired
     TransactionTemplate tx;
 
+    @Autowired
+    TenantDirectory tenants;
+
+    /**
+     * The demo profile (M11.2) runs with prod config, so it must never seed into a real database: any
+     * organization that isn't a demo one means "not a demo database".
+     */
     @Test
+    @Order(1)
+    void theDemoGuardRefusesADatabaseWithOtherOrganizations() {
+        UUID customer = UUID.randomUUID();
+        tenantScope.run(
+                customer, () -> tx.executeWithoutResult(s -> organizations.create(customer, "A customer", null)));
+        var guarded = new LocalSeeder(organizations, users, memberships, tenantScope, tx, tenants, true);
+
+        assertThat(guarded.seed()).isFalse();
+        assertThat(jdbc.queryForObject(
+                        "select count(*) from organization where id in (?, ?)",
+                        Integer.class,
+                        LocalSeeder.ACME_ID,
+                        LocalSeeder.GLOBEX_ID))
+                .isZero();
+    }
+
+    @Test
+    @Order(2)
     void seedsOnceAndTheSeededUsersAreTheRealmsAccounts() throws Exception {
-        var seeder = new LocalSeeder(organizations, users, memberships, tenantScope, tx);
+        var seeder = new LocalSeeder(organizations, users, memberships, tenantScope, tx, tenants, false);
 
         assertThat(seeder.seed()).isTrue();
         assertThat(seeder.seed()).isFalse(); // a second start seeds nothing

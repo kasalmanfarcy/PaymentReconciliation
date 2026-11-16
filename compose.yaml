@@ -4,9 +4,43 @@
 #   docker compose up -d
 #   docker compose ps         # postgres, minio and keycloak: "healthy"; minio-init: exited (0)
 #
+# The whole stack in containers (M11.2), the app built from the Dockerfile and run with prod config:
+#
+#   docker compose --profile full up -d --build     # + migrate (exits 0), api :8080, worker
+#   docker compose --profile full --profile observability up -d   # + Prometheus, Grafana
+#
+# scripts/demo.sh does that and then walks the demo. Services without a `profiles:` key always
+# start; profiled ones only when asked.
+#
 # Data lives in named volumes and survives `docker compose down`.
 # `docker compose down -v` wipes it (a fresh database re-runs every migration).
 name: reconflow
+
+# The application containers (M11.2): one image, three roles. Built once (the shared image name means
+# compose builds it for the first service and reuses it). Each role gets only the environment it
+# needs: api and worker the application role's database password, migrate the migrator's; neither
+# gets the superuser's. Nothing is read from a .env inside the container (prod never imports one).
+x-app: &app
+  image: reconflow:local
+  build: .
+  restart: unless-stopped
+  # The heap is 75% of this (Dockerfile); without a limit each JVM would size itself from the whole VM.
+  mem_limit: 768m
+
+x-app-env: &app-env
+  DB_URL: jdbc:postgresql://postgres:5432/paymentreconflow
+  S3_ENDPOINT: http://minio:9000
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+  S3_SECRET_KEY: ${S3_SECRET_KEY}
+  S3_BUCKET: ${S3_BUCKET:-reconflow-imports}
+  S3_REGION: ${S3_REGION:-us-east-1}
+  # Tokens say iss=http://localhost:8180/... (KC_HOSTNAME below, what curl on the host sees), and
+  # the app compares that string. It fetches the signing keys over the compose network instead, so
+  # it never needs "localhost" to mean Keycloak from inside a container.
+  OIDC_ISSUER_URI: http://localhost:8180/realms/reconflow
+  SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_JWKSETURI: http://keycloak:8180/realms/reconflow/protocol/openid-connect/certs
+  KEYCLOAK_BASE_URL: http://keycloak:8180
+  KEYCLOAK_ADMIN_CLIENT_SECRET: ${KEYCLOAK_ADMIN_CLIENT_SECRET}
 
 services:
   postgres:
@@ -108,9 +142,65 @@ services:
       timeout: 5s
       retries: 30
 
+  # --- The application in containers (M11.2): `docker compose --profile full up -d --build` ---------
+
+  # One-off: applies the migrations as reconflow_migrator, then exits 0 (M11.5). api and worker wait
+  # for it to complete successfully, so a failed migration starts nothing new.
+  migrate:
+    <<: *app
+    profiles: [full]
+    restart: "no"
+    mem_limit: 512m
+    environment:
+      SPRING_PROFILES_ACTIVE: prod,migrate
+      DB_URL: jdbc:postgresql://postgres:5432/paymentreconflow
+      DB_MIGRATOR_USER: ${DB_MIGRATOR_USER:-reconflow_migrator}
+      DB_MIGRATOR_PASSWORD: ${DB_MIGRATOR_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    profiles: [full]
+    environment:
+      <<: *app-env
+      # demo: seeds the two demo organizations linked to the realm's accounts (application-demo.yml).
+      SPRING_PROFILES_ACTIVE: prod,api,demo
+      DB_APP_USER: ${DB_APP_USER:-reconflow_app}
+      DB_APP_PASSWORD: ${DB_APP_PASSWORD}
+      DB_MIGRATOR_USER: ${DB_MIGRATOR_USER:-reconflow_migrator}
+      DB_MIGRATOR_PASSWORD: ${DB_MIGRATOR_PASSWORD}
+    # Only the public port. The management port (8081: probes, metrics) stays on the compose network.
+    ports:
+      - "8080:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+      keycloak:
+        condition: service_healthy
+
+  worker:
+    <<: *app
+    profiles: [full]
+    environment:
+      <<: *app-env
+      SPRING_PROFILES_ACTIVE: prod,worker
+      DB_APP_USER: ${DB_APP_USER:-reconflow_app}
+      DB_APP_PASSWORD: ${DB_APP_PASSWORD}
+      DB_MIGRATOR_USER: ${DB_MIGRATOR_USER:-reconflow_migrator}
+      DB_MIGRATOR_PASSWORD: ${DB_MIGRATOR_PASSWORD}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+
   # --- Observability (M9.10): `docker compose --profile observability up -d` -------------------
   # Off by default, so a plain `docker compose up` stays light. Scrapes the app running on the host
-  # (its management port, 8081). Docker Desktop resolves host-gateway to the host; on Colima set
+  # (its management port, 8081) and, with the full profile, the api and worker containers. Docker Desktop resolves host-gateway to the host; on Colima set
   # HOST_GATEWAY=192.168.5.2 (host.lima.internal) in .env.
   prometheus:
     image: prom/prometheus:v3.5.0

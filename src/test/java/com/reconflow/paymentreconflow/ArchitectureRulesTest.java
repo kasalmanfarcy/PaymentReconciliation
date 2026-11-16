@@ -12,6 +12,8 @@ import com.reconflow.paymentreconflow.shared.context.RequiresPermission;
 import com.tngtech.archunit.core.domain.JavaClasses;
 import com.tngtech.archunit.core.importer.ClassFileImporter;
 import com.tngtech.archunit.core.importer.ImportOption;
+import com.tngtech.archunit.lang.ArchRule;
+import java.math.BigDecimal;
 import org.junit.jupiter.api.Test;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -130,5 +132,23 @@ class ArchitectureRulesTest {
                         .or(target(name("fail")))
                         .and(target(owner(type(ReconciliationRun.class)))))
                 .check(classes);
+    }
+
+    /**
+     * M6.22 / rule MN2: money is compared by value. {@code new BigDecimal("1000.0").equals(new
+     * BigDecimal("1000.00"))} is false (the scale differs), so a single {@code equals} on an amount
+     * turns a match into a mismatch. {@code Objects.equals} and BigDecimal hash keys hide the same
+     * trap and can't be caught statically; reviews and the engine tests cover those.
+     */
+    static final ArchRule NO_BIG_DECIMAL_EQUALS = noClasses()
+            .that()
+            .resideInAPackage(ROOT + "..")
+            .should()
+            .callMethod(BigDecimal.class, "equals", Object.class)
+            .because("money is compared by value: use compareTo (reconciliation-rules.md MN2, TASKS.md M6.22)");
+
+    @Test
+    void moneyIsNeverComparedWithEquals() {
+        NO_BIG_DECIMAL_EQUALS.check(classes);
     }
 }

@@ -21,6 +21,9 @@ public final class TenantFixture {
     private final UUID orgB;
     private final TestUser orgAAdmin;
     private final Map<Role, TestUser> orgBMembers = new EnumMap<>(Role.class);
+    private final UUID orgBBatch;
+    private final UUID orgBFailedBatch;
+    private final UUID orgBRecord;
 
     private TenantFixture(JdbcTemplate jdbc) {
         this.jdbc = jdbc;
@@ -31,6 +34,23 @@ public final class TenantFixture {
         for (Role role : Role.values()) {
             orgBMembers.put(role, data.newMember(orgB, role));
         }
+        // Org B's financial data: a completed import with a record and a row error, and a failed
+        // import (retryable), so every ingestion and ledger endpoint has something of B to aim at.
+        UUID uploader = orgBMembers.get(Role.UPLOADER).id();
+        orgBBatch = data.newImportBatch(orgB, uploader, "INTERNAL_LEDGER", "COMPLETED");
+        orgBFailedBatch = data.newImportBatch(orgB, uploader, "GATEWAY", "FAILED");
+        orgBRecord = UUID.randomUUID();
+        jdbc.update("""
+                INSERT INTO transaction_record (id, organization_id, batch_id, source_type, source_row_number,
+                       raw_reference, normalized_reference, amount, currency, status, transaction_date, raw_values)
+                VALUES (?, ?, ?, 'INTERNAL_LEDGER', 1, 'PAY-B', 'PAY-B', 10.0000, 'AED', 'SUCCESS',
+                        DATE '2026-10-01', '{}'::jsonb)""", orgBRecord, orgB, orgBBatch);
+        jdbc.update(
+                "INSERT INTO import_row_error (id, organization_id, batch_id, row_number, column_name, error_code,"
+                        + " message) VALUES (?, ?, ?, 2, 'amount', 'INVALID_AMOUNT', 'bad')",
+                UUID.randomUUID(),
+                orgB,
+                orgBBatch);
     }
 
     public static TenantFixture twoOrgs(JdbcTemplate jdbc) {
@@ -53,15 +73,32 @@ public final class TenantFixture {
         return orgBMembers.get(role);
     }
 
+    /** Org B's completed import (with one record and one row error). */
+    public UUID orgBBatch() {
+        return orgBBatch;
+    }
+
+    /** Org B's failed, retryable import. */
+    public UUID orgBFailedBatch() {
+        return orgBFailedBatch;
+    }
+
+    public UUID orgBRecord() {
+        return orgBRecord;
+    }
+
     /** Every ID of org B that must never appear in a response to org A. */
     public List<UUID> orgBIds() {
         List<UUID> ids = new ArrayList<>();
         ids.add(orgB);
+        ids.add(orgBBatch);
+        ids.add(orgBFailedBatch);
+        ids.add(orgBRecord);
         orgBMembers.values().forEach(u -> ids.add(u.id()));
         return ids;
     }
 
-    /** Org B's row, its memberships and its members' accounts, as plain values. */
+    /** Org B's row, memberships, members' accounts, imports, records and jobs, as plain values. */
     public List<Map<String, Object>> snapshotOrgB() {
         List<Map<String, Object>> rows = new ArrayList<>();
         rows.addAll(jdbc.queryForList("select name, status from organization where id = ?", orgB));
@@ -72,6 +109,15 @@ public final class TenantFixture {
                  where m.organization_id = ?
                  order by m.user_id
                 """, orgB));
+        rows.addAll(jdbc.queryForList("""
+                select id, status, total_rows, valid_rows, error_rows, last_committed_row, failure_reason
+                  from import_batch where organization_id = ? order by id
+                """, orgB));
+        rows.addAll(jdbc.queryForList("""
+                select (select count(*) from transaction_record where organization_id = ?) as records,
+                       (select count(*) from import_row_error where organization_id = ?) as row_errors,
+                       (select count(*) from job where organization_id = ?) as jobs
+                """, orgB, orgB, orgB));
         return rows;
     }
 }

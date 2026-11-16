@@ -2,6 +2,7 @@ package com.reconflow.paymentreconflow.tenancy;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 
@@ -9,6 +10,7 @@ import com.reconflow.paymentreconflow.security.authz.RolePermissions;
 import com.reconflow.paymentreconflow.shared.context.Permission;
 import com.reconflow.paymentreconflow.shared.context.Role;
 import com.reconflow.paymentreconflow.support.AbstractIntegrationTest;
+import java.nio.charset.StandardCharsets;
 import java.util.UUID;
 import java.util.function.Function;
 import java.util.stream.Stream;
@@ -17,7 +19,8 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.springframework.http.MediaType;
 import org.springframework.mock.web.MockHttpServletResponse;
-import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
+import org.springframework.mock.web.MockMultipartFile;
+import org.springframework.test.web.servlet.request.AbstractMockHttpServletRequestBuilder;
 
 /**
  * M3.7: endpoint × role, each expectation taken from the matrix (api-design.md §9) and the
@@ -26,7 +29,8 @@ import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilde
  */
 class AuthorizationMatrixIT extends AbstractIntegrationTest {
 
-    record Endpoint(String name, Permission required, Function<UUID, MockHttpServletRequestBuilder> request) {
+    record Endpoint(
+            String name, Permission required, Function<UUID, AbstractMockHttpServletRequestBuilder<?>> request) {
         @Override
         public String toString() {
             return name;
@@ -56,6 +60,18 @@ class AuthorizationMatrixIT extends AbstractIntegrationTest {
                 "POST /members/{userId}/disable",
                 Permission.MEMBER_MANAGE,
                 target -> post("/api/v1/members/" + target + "/disable")),
+        new Endpoint(
+                "POST /imports",
+                Permission.IMPORT_CREATE,
+                target -> multipart("/api/v1/imports")
+                        .file(new MockMultipartFile(
+                                "file",
+                                "ledger.csv",
+                                "text/csv",
+                                ("reference,amount,currency,status,transaction_date\nPAY-" + UUID.randomUUID()
+                                                + ",1.00,AED,SUCCESS,2026-10-01\n")
+                                        .getBytes(StandardCharsets.UTF_8)))
+                        .param("sourceType", "INTERNAL_LEDGER")),
     };
 
     static Stream<Arguments> endpointByRole() {

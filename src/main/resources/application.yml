@@ -55,9 +55,11 @@ spring:
 
   servlet:
     multipart:
-      # CSV contract limit (requirements: 50 MB); enforced again in code in M10.3.
+      # CSV contract limit (requirements: 50 MB); checked again in code by ImportReceiver
+      # (reconflow.import.max-file-size), and hardened further in M10.3.
       max-file-size: 50MB
-      max-request-size: 51MB
+      max-request-size: 51MB        # the file plus the sourceType form field
+      file-size-threshold: 1MB      # larger uploads are buffered to a temp file, not the heap
 
 server:
   port: ${PORT:8080}
@@ -90,6 +92,13 @@ reconflow:
   bootstrap:
     # One-time: creates the first platform admin in a fresh environment (security.bootstrap).
     admin-email: ${RECONFLOW_BOOTSTRAP_ADMIN_EMAIL:}
+  import:
+    max-rows: 500000
+    chunk-size: 5000                # rows per transaction, and the checkpoint granularity
+    max-stored-errors: 10000        # per batch; error_rows still counts every bad row
+    oldest-transaction-date: P2Y    # rows dated further back are DATE_OUT_OF_RANGE
+    newest-transaction-date: P31D   # ...and further ahead
+    max-file-size: 50MB             # keep equal to spring.servlet.multipart.max-file-size
   storage:
     endpoint: ${S3_ENDPOINT:}
     region: ${S3_REGION:us-east-1}

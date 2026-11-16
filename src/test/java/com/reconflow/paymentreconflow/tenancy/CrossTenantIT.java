@@ -1,6 +1,7 @@
 package com.reconflow.paymentreconflow.tenancy;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.request;
 
 import com.reconflow.paymentreconflow.support.AbstractIntegrationTest;
@@ -14,7 +15,9 @@ import org.junit.jupiter.api.TestFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.MediaType;
 import org.springframework.mock.web.MockHttpServletResponse;
-import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
+import org.springframework.mock.web.MockMultipartFile;
+import org.springframework.test.web.servlet.request.AbstractMockHttpServletRequestBuilder;
+import org.springframework.test.web.servlet.request.MockMultipartHttpServletRequestBuilder;
 import org.springframework.web.util.UriTemplate;
 
 /**
@@ -80,11 +83,18 @@ class CrossTenantIT extends AbstractIntegrationTest {
 
     private MockHttpServletResponse call(TenantFixture f, CrossTenantCase c, UUID orgHeader) throws Exception {
         Map<String, Object> vars = c.orgBTarget().apply(f);
-        MockHttpServletRequestBuilder req = request(c.method(), new UriTemplate(c.pathTemplate()).expand(vars))
+        AbstractMockHttpServletRequestBuilder<?> req = request(
+                        c.method(), new UriTemplate(c.pathTemplate()).expand(vars))
                 .with(as(f.orgAAdmin().id()))
                 .with(org(orgHeader));
         @Nullable Object body = c.body() == null ? null : c.body().apply(f);
-        if (body != null) {
+        if (body instanceof MultipartBody part) {
+            MockMultipartHttpServletRequestBuilder multipart = multipart(
+                            c.method(), new UriTemplate(c.pathTemplate()).expand(vars))
+                    .file(new MockMultipartFile("file", part.fileName(), part.contentType(), part.content()));
+            part.params().forEach(multipart::param);
+            req = multipart.with(as(f.orgAAdmin().id())).with(org(orgHeader));
+        } else if (body != null) {
             req.contentType(MediaType.APPLICATION_JSON).content(jsonMapper.writeValueAsString(body));
         }
         return mockMvc.perform(req).andReturn().getResponse();

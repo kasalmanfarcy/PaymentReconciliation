@@ -70,6 +70,12 @@ spring:
 
 server:
   port: ${PORT:8080}
+  tomcat:
+    # When an upload exceeds the multipart limit, Tomcat stops reading the body; past this many
+    # unread bytes it resets the connection, and the client sees a network error instead of the
+    # 413 file-too-large ProblemDetail (UploadSizeLimitIT). Twice the 50 MB limit covers honest
+    # mistakes; anything larger is cut off rather than read for nothing (M10.3 revisits this).
+    max-swallow-size: 100MB
   # On SIGTERM, stop accepting requests and let in-flight ones finish.
   shutdown: graceful
 

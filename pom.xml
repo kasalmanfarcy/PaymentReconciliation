@@ -47,6 +47,10 @@
         <palantir-java-format.version>2.103.0</palantir-java-format.version>
         <!-- 0.8.14+ is needed to instrument Java 25 class files. -->
         <jacoco-maven-plugin.version>0.8.16</jacoco-maven-plugin.version>
+        <!-- M5 ingestion. Boot manages none of these, so they are pinned here. -->
+        <commons-csv.version>1.14.1</commons-csv.version>
+        <commons-io.version>2.22.0</commons-io.version>
+        <awssdk.version>2.59.1</awssdk.version>
     </properties>
     <dependencyManagement>
         <dependencies>
@@ -54,6 +58,14 @@
                 <groupId>org.springframework.modulith</groupId>
                 <artifactId>spring-modulith-bom</artifactId>
                 <version>${spring-modulith.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <!-- Keeps every AWS SDK module (s3, apache-client, auth, ...) on one version. -->
+            <dependency>
+                <groupId>software.amazon.awssdk</groupId>
+                <artifactId>bom</artifactId>
+                <version>${awssdk.version}</version>
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>
@@ -116,6 +128,33 @@
             <version>${uuid-creator.version}</version>
         </dependency>
 
+        <!-- RFC 4180 CSV parsing (quotes, embedded commas and newlines), streamed record by
+             record (M5.10). Never split lines on commas by hand. -->
+        <dependency>
+            <groupId>org.apache.commons</groupId>
+            <artifactId>commons-csv</artifactId>
+            <version>${commons-csv.version}</version>
+        </dependency>
+        <!-- BOMInputStream: strips the UTF-8 byte-order mark Excel writes (M5.10). -->
+        <dependency>
+            <groupId>commons-io</groupId>
+            <artifactId>commons-io</artifactId>
+            <version>${commons-io.version}</version>
+        </dependency>
+        <!-- S3 API client for FileStorage (M5.8): MinIO locally and in tests, S3 in production.
+             The synchronous client uses the Apache HTTP client; the Netty client is only for the
+             async API, which we don't use, so it is excluded to keep the jar smaller. -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>s3</artifactId>
+            <exclusions>
+                <exclusion>
+                    <groupId>software.amazon.awssdk</groupId>
+                    <artifactId>netty-nio-client</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-devtools</artifactId>
@@ -158,6 +197,12 @@
         <dependency>
             <groupId>org.testcontainers</groupId>
             <artifactId>testcontainers-postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- Real S3-compatible storage in integration tests (M5.8). -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-minio</artifactId>
             <scope>test</scope>
         </dependency>
     </dependencies>

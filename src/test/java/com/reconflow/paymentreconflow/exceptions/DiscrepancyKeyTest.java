@@ -28,10 +28,13 @@ class DiscrepancyKeyTest {
         String key = Discrepancy.key(ExceptionType.MISSING_IN_LEDGER, "INV:2026:7", "REFUND", List.of("AED"));
         assertThat(key).isEqualTo("MISSING_IN_LEDGER:INV:2026:7:REFUND:AED");
         // Read the type from the left and the last two fields from the right; the rest is the reference.
-        int first = key.indexOf(':');
-        int last = key.lastIndexOf(':');
-        int secondLast = key.lastIndexOf(':', last - 1);
-        assertThat(key.substring(first + 1, secondLast)).isEqualTo("INV:2026:7");
+        assertThat(Discrepancy.referenceOf(key)).isEqualTo("INV:2026:7");
+        assertThat(Discrepancy.referenceOf("AMOUNT_MISMATCH:PAY-103:PAYMENT:AED"))
+                .isEqualTo("PAY-103");
+        assertThat(Discrepancy.referenceOf("CURRENCY_MISMATCH:PAY-201:PAYMENT:AED/USD"))
+                .isEqualTo("PAY-201");
+        assertThatThrownBy(() -> Discrepancy.referenceOf("AMOUNT_MISMATCH:PAY-103"))
+                .isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test

@@ -26,6 +26,8 @@ public final class TenantFixture {
     private final UUID orgBRecord;
     private final UUID orgBRun;
     private final UUID orgBFailedRun;
+    private final UUID orgBCase;
+    private final UUID orgBResolvedCase;
 
     private TenantFixture(JdbcTemplate jdbc) {
         this.jdbc = jdbc;
@@ -67,6 +69,53 @@ public final class TenantFixture {
                 INSERT INTO reconciliation_match (id, organization_id, run_id, ledger_record_id, ledger_txn_date,
                        gateway_record_id, gateway_txn_date)
                 VALUES (uuid_generate_v7(), ?, ?, ?, DATE '2026-10-01', ?, DATE '2026-10-01')""", orgB, orgBRun, orgBRecord, gatewayRecord);
+        // Org B's exception cases (M7.18): an open one linked to its record, assigned to its
+        // investigator, and a resolved one, so every exception endpoint has something of B to aim at.
+        orgBCase = newCase(orgB, orgBRun, "AMOUNT_MISMATCH:PAY-B:PAYMENT:AED", "OPEN");
+        jdbc.update(
+                "UPDATE exception_case SET assigned_to = ? WHERE id = ?",
+                orgBMembers.get(Role.INVESTIGATOR).id(),
+                orgBCase);
+        jdbc.update(
+                "INSERT INTO exception_case_record (exception_id, transaction_record_id, transaction_date,"
+                        + " organization_id) VALUES (?, ?, DATE '2026-10-01', ?)",
+                orgBCase,
+                orgBRecord,
+                orgB);
+        orgBResolvedCase = newCase(orgB, orgBRun, "MISSING_IN_LEDGER:PAY-B2:PAYMENT:AED", "RESOLVED");
+    }
+
+    /** A case of org B with its creation history row and run link, as DiscrepancyRecorder writes them. */
+    private UUID newCase(UUID org, UUID run, String key, String status) {
+        UUID id = UUID.randomUUID();
+        boolean resolved = status.equals("RESOLVED");
+        UUID resolver = orgBMembers.get(Role.INVESTIGATOR).id();
+        jdbc.update(
+                """
+                INSERT INTO exception_case (id, organization_id, run_id, type, discrepancy_key, status, currency,
+                       amount, resolution_code, resolved_by, resolved_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'AED', 10.0000, ?, ?, ?)""",
+                id,
+                org,
+                run,
+                key.substring(0, key.indexOf(':')),
+                key,
+                status,
+                resolved ? "GATEWAY_FEE" : null,
+                resolved ? resolver : null,
+                resolved ? java.sql.Timestamp.from(java.time.Instant.now()) : null);
+        jdbc.update(
+                "INSERT INTO exception_status_history (id, organization_id, exception_id, from_status, to_status)"
+                        + " VALUES (?, ?, ?, NULL, 'OPEN')",
+                UUID.randomUUID(),
+                org,
+                id);
+        jdbc.update(
+                "INSERT INTO exception_case_run (exception_id, run_id, organization_id, created) VALUES (?, ?, ?, true)",
+                id,
+                run,
+                org);
+        return id;
     }
 
     /** A run row of org B in the given status, written with SQL as the API would have. */
@@ -123,6 +172,16 @@ public final class TenantFixture {
         return orgBFailedRun;
     }
 
+    /** Org B's OPEN case, assigned to its investigator and linked to {@link #orgBRecord()}. */
+    public UUID orgBCase() {
+        return orgBCase;
+    }
+
+    /** Org B's RESOLVED case, reopenable by an admin of B. */
+    public UUID orgBResolvedCase() {
+        return orgBResolvedCase;
+    }
+
     /** Every ID of org B that must never appear in a response to org A. */
     public List<UUID> orgBIds() {
         List<UUID> ids = new ArrayList<>();
@@ -132,11 +191,13 @@ public final class TenantFixture {
         ids.add(orgBRecord);
         ids.add(orgBRun);
         ids.add(orgBFailedRun);
+        ids.add(orgBCase);
+        ids.add(orgBResolvedCase);
         orgBMembers.values().forEach(u -> ids.add(u.id()));
         return ids;
     }
 
-    /** Org B's row, memberships, members' accounts, imports, runs, records and jobs, as plain values. */
+    /** Org B's row, memberships, members' accounts, imports, runs, records, jobs, cases, notes, history and audit, as plain values. */
     public List<Map<String, Object>> snapshotOrgB() {
         List<Map<String, Object>> rows = new ArrayList<>();
         rows.addAll(jdbc.queryForList("select name, status from organization where id = ?", orgB));
@@ -155,6 +216,15 @@ public final class TenantFixture {
                 select id, status, last_completed_date, failure_reason, matched_count
                   from reconciliation_run where organization_id = ? order by id
                 """, orgB));
+        rows.addAll(jdbc.queryForList("""
+                select id, status, version, assigned_to, resolution_code, resolution_note, updated_at
+                  from exception_case where organization_id = ? order by id
+                """, orgB));
+        rows.addAll(jdbc.queryForList("""
+                select (select count(*) from exception_note where organization_id = ?) as notes,
+                       (select count(*) from exception_status_history where organization_id = ?) as history,
+                       (select count(*) from audit_event where organization_id = ?) as audit_events
+                """, orgB, orgB, orgB));
         rows.addAll(jdbc.queryForList("""
                 select (select count(*) from transaction_record where organization_id = ?) as records,
                        (select count(*) from import_row_error where organization_id = ?) as row_errors,

@@ -53,4 +53,18 @@ public record Discrepancy(
         return type.name() + ":" + normalizedReference + ":" + transactionType + ":"
                 + String.join("/", new TreeSet<>(currencies));
     }
+
+    /**
+     * The normalized reference inside a key: everything between the first field and the last two
+     * (rules §6, "Parsing"). The one place keys are parsed; the reference itself may contain ':'.
+     */
+    public static String referenceOf(String discrepancyKey) {
+        int first = discrepancyKey.indexOf(':');
+        int last = discrepancyKey.lastIndexOf(':');
+        int secondLast = last < 0 ? -1 : discrepancyKey.lastIndexOf(':', last - 1);
+        if (first < 0 || secondLast <= first) {
+            throw new IllegalArgumentException("Not a discrepancy key: " + discrepancyKey);
+        }
+        return discrepancyKey.substring(first + 1, secondLast);
+    }
 }

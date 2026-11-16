@@ -12,6 +12,8 @@ import org.springframework.http.HttpMethod;
  *     by a query string; the completeness meta-test matches on the part before {@code ?}
  * @param orgBTarget the path variables, pointing at org B's resources (created by the fixture)
  * @param body the request body, or null
+ * @param headers extra request headers, e.g. {@code If-Match} for a versioned update (M7), or a
+ *     {@code Content-Type} other than JSON for the body
  */
 public record CrossTenantCase(
         String name,
@@ -19,7 +21,18 @@ public record CrossTenantCase(
         String pathTemplate,
         Function<TenantFixture, Map<String, Object>> orgBTarget,
         @Nullable Function<TenantFixture, Object> body,
-        Expectation expect) {
+        Expectation expect,
+        Map<String, String> headers) {
+
+    public CrossTenantCase(
+            String name,
+            HttpMethod method,
+            String pathTemplate,
+            Function<TenantFixture, Map<String, Object>> orgBTarget,
+            @Nullable Function<TenantFixture, Object> body,
+            Expectation expect) {
+        this(name, method, pathTemplate, orgBTarget, body, expect, Map.of());
+    }
 
     public enum Expectation {
         /** 404 not-found, exactly as for an ID that never existed. */

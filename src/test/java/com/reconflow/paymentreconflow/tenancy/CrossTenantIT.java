@@ -97,6 +97,14 @@ class CrossTenantIT extends AbstractIntegrationTest {
         } else if (body != null) {
             req.contentType(MediaType.APPLICATION_JSON).content(jsonMapper.writeValueAsString(body));
         }
+        AbstractMockHttpServletRequestBuilder<?> withHeaders = req;
+        c.headers().forEach((name, value) -> {
+            if (name.equalsIgnoreCase("Content-Type")) {
+                withHeaders.contentType(value);
+            } else {
+                withHeaders.header(name, value);
+            }
+        });
         return mockMvc.perform(req).andReturn().getResponse();
     }
 }

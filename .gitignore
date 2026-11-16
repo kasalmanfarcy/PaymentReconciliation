@@ -40,4 +40,4 @@ modelmemory/
 .env.*
 !.env.example
 
-projectoverview.md
+projectoverview.md.jqwik-database

@@ -51,6 +51,8 @@
         <commons-csv.version>1.14.1</commons-csv.version>
         <commons-io.version>2.22.0</commons-io.version>
         <awssdk.version>2.59.1</awssdk.version>
+        <!-- M6.19 property tests. 1.10.x is the line that runs on the JUnit Platform Boot 4 ships. -->
+        <jqwik.version>1.10.2</jqwik.version>
     </properties>
     <dependencyManagement>
         <dependencies>
@@ -199,6 +201,14 @@
         <dependency>
             <groupId>org.testcontainers</groupId>
             <artifactId>testcontainers-postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- Property-based tests (M6.19): a JUnit Platform engine, run by Surefire and Failsafe
+             next to Jupiter with no extra configuration. -->
+        <dependency>
+            <groupId>net.jqwik</groupId>
+            <artifactId>jqwik</artifactId>
+            <version>${jqwik.version}</version>
             <scope>test</scope>
         </dependency>
         <!-- Real S3-compatible storage in integration tests (M5.8). -->

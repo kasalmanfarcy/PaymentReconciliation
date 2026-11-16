@@ -224,6 +224,7 @@ account: [docs/runbooks/deploy.md](docs/runbooks/deploy.md) §9.
 | [security.md](docs/security.md) | Every security control, its threat, enforcement and proof |
 | [scalability.md](docs/scalability.md) | Capacity plan and SLOs |
 | [benchmarks.md](docs/benchmarks.md) | Measured numbers only |
+| [trade-offs.md](docs/trade-offs.md) | What was chosen and what it cost, what waited, what changes at 100×, lessons |
 | [adr/](docs/adr/) | 15 Architecture Decision Records |
 | [runbooks/](docs/runbooks/) | Deploy, restore drill, archival, default partition |
 | [plans/](plans/README.md) | How each phase was built, and where the code differs from the plan |

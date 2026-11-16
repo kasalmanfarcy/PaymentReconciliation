@@ -72,7 +72,44 @@ public class ExceptionStatusHistory implements Persistable<UUID> {
 
     protected ExceptionStatusHistory() {} // JPA
 
-    static ExceptionStatusHistory of(
+    /**
+     * The row for each kind of transition (phase-M7 §M7.4). Only the resolve row and the reopen row
+     * carry a resolution: the code and note that were just set, or the ones a reopen is about to
+     * clear. {@code resolved_by}/{@code resolved_at} are not copied: they are the resolve row's
+     * {@code actor_id} and {@code created_at}.
+     *
+     * <table>
+     *   <tr><th>Transition</th><th>from</th><th>to</th><th>reason</th><th>resolution</th></tr>
+     *   <tr><td>start review</td><td>OPEN</td><td>IN_REVIEW</td><td>—</td><td>—</td></tr>
+     *   <tr><td>back to open</td><td>IN_REVIEW</td><td>OPEN</td><td>required</td><td>—</td></tr>
+     *   <tr><td>resolve</td><td>OPEN/IN_REVIEW</td><td>RESOLVED</td><td>—</td><td>new code, note</td></tr>
+     *   <tr><td>reopen</td><td>RESOLVED</td><td>OPEN</td><td>required</td><td>previous code, note</td></tr>
+     * </table>
+     */
+    static ExceptionStatusHistory statusChange(
+            ExceptionCase c, ExceptionStatus from, ExceptionStatus to, @Nullable String reason, UUID actorId) {
+        return row(c, from, to, reason, null, null, actorId);
+    }
+
+    static ExceptionStatusHistory resolved(
+            ExceptionCase c, ExceptionStatus from, ResolutionCode code, @Nullable String note, UUID actorId) {
+        return row(c, from, ExceptionStatus.RESOLVED, null, code, note, actorId);
+    }
+
+    /**
+     * Copying the previous resolution onto the reopen row is redundant (the resolve row has it), but
+     * it makes the row self-explanatory: "reopened a case resolved as GATEWAY_FEE because ...".
+     */
+    static ExceptionStatusHistory reopened(
+            ExceptionCase c,
+            String reason,
+            @Nullable ResolutionCode previousCode,
+            @Nullable String previousNote,
+            UUID actorId) {
+        return row(c, ExceptionStatus.RESOLVED, ExceptionStatus.OPEN, reason, previousCode, previousNote, actorId);
+    }
+
+    private static ExceptionStatusHistory row(
             ExceptionCase c,
             ExceptionStatus from,
             ExceptionStatus to,

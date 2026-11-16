@@ -1,0 +1,43 @@
+# Dependabot (M10.5): weekly update PRs. It only *proposes* upgrades; blocking a vulnerable version
+# is dependency-review's job (dependency-review.yml), and finding new CVEs in what we already ship
+# is the weekly OWASP Dependency-Check (dependency-check.yml). Three tools, three questions.
+#
+# "Dependabot security updates" (immediate PRs for a vulnerable version, outside this schedule) is a
+# repository setting, not part of this file: Settings → Code security → Dependabot security updates.
+version: 2
+updates:
+  - package-ecosystem: maven
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    # Grouped so the Spring BOM and its friends move together; a half-upgraded Spring is worse
+    # than either version.
+    groups:
+      spring:
+        patterns: ["org.springframework*"]
+      testing:
+        patterns: ["org.testcontainers*", "org.junit*", "org.assertj*", "net.jqwik*"]
+      aws:
+        patterns: ["software.amazon.awssdk*"]
+    commit-message:
+      prefix: "build(repo)"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "ci(repo)"
+
+  # The pinned image tags in compose.yaml (postgres, minio, keycloak, prometheus, grafana). The
+  # Dockerfile arrives in M11.1; add a `docker` entry then.
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "build(repo)"

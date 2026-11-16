@@ -1,0 +1,12 @@
+# gitleaks configuration (M10.5): the default rule set, plus reviewed false positives.
+# Every allowlist entry says what it matches and why that can never be a secret. Never allowlist
+# a whole file or directory: a real key added there later would be missed.
+title = "ReconFlow gitleaks config"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Idempotency-Key example values in the API docs and plans: client-chosen UUIDs, not credentials"
+regexTarget = "line"
+regexes = ['''Idempotency-Key:\s*[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}''']

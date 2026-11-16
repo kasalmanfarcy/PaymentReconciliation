@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  OWASP Dependency-Check suppressions (M10.5).
+
+  Rules for every entry:
+    - <notes> says why the CVE does not apply to ReconFlow (not "it's a false positive": say what
+      the vulnerable code path is and why we never reach it), or what mitigates it.
+    - until="YYYY-MM-DD" (at most three months out), so the suppression comes back for review
+      instead of hiding a real problem forever.
+  An empty file is the goal.
+-->
+<suppressions xmlns="https://jeremylong.github.io/DependencyCheck/dependency-suppression.1.3.xsd">
+</suppressions>

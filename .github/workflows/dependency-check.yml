@@ -1,0 +1,69 @@
+# Full OWASP Dependency-Check scan, weekly (M10.5): "has anything we already ship become vulnerable
+# since we last looked?" New CVEs are published for old versions all the time, so a PR-time gate
+# alone is not enough. Not run per PR: most of its minutes go into downloading the NVD data.
+#
+# Needs the repository secret NVD_API_KEY (free, https://nvd.nist.gov/developers/request-an-api-key).
+# Without it the NVD download is throttled to the point of timing out.
+name: owasp-dependency-check
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"   # Mondays 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: dependency-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+      # The NVD mirror lives inside ~/.m2; caching it turns a ~20 minute download into an update.
+      - uses: actions/cache@v6
+        with:
+          path: ~/.m2/repository/org/owasp/dependency-check-data
+          key: dc-data-${{ github.run_id }}
+          restore-keys: dc-data-
+      # Plugin version, CVSS threshold and the suppression file are configured in pom.xml, so a
+      # local `./mvnw dependency-check:check` runs exactly what CI runs.
+      - name: Dependency-Check
+        run: ./mvnw -B -ntp dependency-check:check -DnvdApiKey=${{ secrets.NVD_API_KEY }}
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: dependency-check-report
+          path: target/dependency-check-report.html
+          retention-days: 30
+
+  # Trivy reads the packaged jar (every library inside it, with exact versions) against its own
+  # advisory database: a second opinion that needs no API key. M11 adds an image scan next to it,
+  # because the base image's OS packages are code we ship too.
+  trivy:
+    name: trivy-jar
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+      - run: ./mvnw -B -ntp -DskipTests package
+      - uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: rootfs
+          scan-ref: target
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          timeout: 20m

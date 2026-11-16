@@ -53,6 +53,8 @@
         <awssdk.version>2.59.1</awssdk.version>
         <!-- M6.19 property tests. 1.10.x is the line that runs on the JUnit Platform Boot 4 ships. -->
         <jqwik.version>1.10.2</jqwik.version>
+        <!-- M10.5: the weekly vulnerability scan (.github/workflows/dependency-check.yml). -->
+        <dependency-check-maven.version>13.0.0</dependency-check-maven.version>
     </properties>
     <dependencyManagement>
         <dependencies>
@@ -320,6 +322,34 @@
                         <phase>verify</phase>
                     </execution>
                 </executions>
+            </plugin>
+            <!-- OWASP Dependency-Check (M10.5). Declared here, not bound to a phase: it is slow (it
+                 mirrors the NVD) and runs weekly in CI, or on demand with
+                 `./mvnw dependency-check:check -DnvdApiKey=...`. Configured here so the local run
+                 and CI apply the same threshold and suppressions. -->
+            <plugin>
+                <groupId>org.owasp</groupId>
+                <artifactId>dependency-check-maven</artifactId>
+                <version>${dependency-check-maven.version}</version>
+                <configuration>
+                    <!-- CVSS 7+ (high, critical) fails the scan; the same bar as dependency review. -->
+                    <failBuildOnCVSS>7</failBuildOnCVSS>
+                    <!-- Every suppression has a reason and an expiry (see the file). -->
+                    <suppressionFiles>
+                        <suppressionFile>config/dependency-check-suppressions.xml</suppressionFile>
+                    </suppressionFiles>
+                    <formats>
+                        <format>HTML</format>
+                        <format>JSON</format>
+                    </formats>
+                    <!-- Test-only dependencies never ship in the jar. -->
+                    <skipTestScope>true</skipTestScope>
+                    <!-- Analyzers that need services or tools we don't use (.NET, Node audit
+                         upload, OSS Index account). -->
+                    <assemblyAnalyzerEnabled>false</assemblyAnalyzerEnabled>
+                    <nodeAuditAnalyzerEnabled>false</nodeAuditAnalyzerEnabled>
+                    <ossindexAnalyzerEnabled>false</ossindexAnalyzerEnabled>
+                </configuration>
             </plugin>
         </plugins>
     </build>

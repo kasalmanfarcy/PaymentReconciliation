@@ -29,8 +29,11 @@ import org.springframework.test.web.servlet.request.AbstractMockHttpServletReque
  */
 class AuthorizationMatrixIT extends AbstractIntegrationTest {
 
-    /** What a request may aim at, all in the caller's organization: a member, a FAILED import and run. */
-    record Target(UUID userId, UUID batchId, UUID runId) {}
+    /**
+     * What a request may aim at, all in the caller's organization: a member, a FAILED import and run,
+     * an OPEN exception case and a RESOLVED one (both at version 0).
+     */
+    record Target(UUID userId, UUID batchId, UUID runId, UUID openCaseId, UUID resolvedCaseId) {}
 
     record Endpoint(
             String name, Permission required, Function<Target, AbstractMockHttpServletRequestBuilder<?>> request) {
@@ -108,6 +111,42 @@ class AuthorizationMatrixIT extends AbstractIntegrationTest {
                 target -> post("/api/v1/reconciliation-runs/" + target.runId() + "/retry")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"reason\":\"database restarted\"}")),
+        new Endpoint("GET /exceptions", Permission.EXCEPTION_READ, target -> get("/api/v1/exceptions")),
+        new Endpoint(
+                "GET /exceptions/{id}",
+                Permission.EXCEPTION_READ,
+                target -> get("/api/v1/exceptions/" + target.openCaseId())),
+        new Endpoint(
+                "PATCH /exceptions/{id}",
+                Permission.EXCEPTION_UPDATE,
+                target -> patch("/api/v1/exceptions/" + target.openCaseId())
+                        .contentType("application/merge-patch+json")
+                        .header("If-Match", "\"0\"")
+                        .content("{\"status\":\"IN_REVIEW\"}")),
+        new Endpoint(
+                "POST /exceptions/{id}/notes",
+                Permission.EXCEPTION_UPDATE,
+                target -> post("/api/v1/exceptions/" + target.openCaseId() + "/notes")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"body\":\"checked with the gateway\"}")),
+        new Endpoint(
+                "POST /exceptions/{id}/resolve",
+                Permission.EXCEPTION_RESOLVE,
+                target -> post("/api/v1/exceptions/" + target.openCaseId() + "/resolve")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .header("If-Match", "\"0\"")
+                        .content("{\"resolutionCode\":\"GATEWAY_FEE\"}")),
+        new Endpoint(
+                "POST /exceptions/{id}/reopen",
+                Permission.EXCEPTION_REOPEN,
+                target -> post("/api/v1/exceptions/" + target.resolvedCaseId() + "/reopen")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .header("If-Match", "\"0\"")
+                        .content("{\"reason\":\"the fee was wrong\"}")),
+        new Endpoint(
+                "GET /audit-events",
+                Permission.AUDIT_READ,
+                target -> get("/api/v1/audit-events?entityType=EXCEPTION_CASE&entityId=" + target.openCaseId())),
         new Endpoint(
                 "GET /imports/{id}/errors",
                 Permission.IMPORT_READ,
@@ -132,8 +171,11 @@ class AuthorizationMatrixIT extends AbstractIntegrationTest {
                        period_start, period_end, currency, status, triggered_by, failure_reason)
                 VALUES (?, ?, ?, ?, DATE '2026-09-01', DATE '2026-09-30', 'AED', 'FAILED', ?, 'internal-error')""", run, org, "client:" + run, "0".repeat(64), target.id());
 
+        UUID openCase = newCase(org, run, "OPEN", target.id());
+        UUID resolvedCase = newCase(org, run, "RESOLVED", target.id());
+
         MockHttpServletResponse response = mockMvc.perform(endpoint.request()
-                        .apply(new Target(target.id(), batch, run))
+                        .apply(new Target(target.id(), batch, run, openCase, resolvedCase))
                         .with(as(caller.id())))
                 .andReturn()
                 .getResponse();
@@ -144,5 +186,25 @@ class AuthorizationMatrixIT extends AbstractIntegrationTest {
             assertThat(response.getStatus()).isEqualTo(403);
             assertThat(response.getContentAsString()).contains("\"code\":\"forbidden\"");
         }
+    }
+
+    /** A case as DiscrepancyRecorder would have created it (and, if RESOLVED, someone resolved it). */
+    private UUID newCase(UUID org, UUID run, String status, UUID resolver) {
+        UUID id = UUID.randomUUID();
+        boolean resolved = status.equals("RESOLVED");
+        jdbc.update(
+                """
+                INSERT INTO exception_case (id, organization_id, run_id, type, discrepancy_key, status, currency, amount,
+                       resolution_code, resolved_by, resolved_at)
+                VALUES (?, ?, ?, 'MISSING_IN_LEDGER', ?, ?, 'AED', 10, ?, ?, CASE WHEN ? THEN now() END)""",
+                id,
+                org,
+                run,
+                "MISSING_IN_LEDGER:PAY-" + id + ":PAYMENT:AED",
+                status,
+                resolved ? "GATEWAY_FEE" : null,
+                resolved ? resolver : null,
+                resolved);
+        return id;
     }
 }

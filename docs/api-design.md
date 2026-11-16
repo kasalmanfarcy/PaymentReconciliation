@@ -99,6 +99,8 @@ Validation errors add an `errors` array, one entry per problem:
 | `password-change-required` | 403 | A temporary password must be changed first |
 | `not-found` | 404 | Unknown ID **or another tenant's ID**: the two are indistinguishable on purpose |
 | `organization-not-found` | 404 | `X-Organization-Id` names an organization the user isn't a member of, or a suspended one |
+| `method-not-allowed` | 405 | The path exists but not with this HTTP method (added in M2.10) |
+| `not-acceptable` | 406 | The `Accept` header asks for a representation the endpoint can't produce (added in M2.10) |
 | `duplicate-file` | 409 | Upload: same content already imported (`existingBatchId`) |
 | `import-in-progress` | 409 | Run request while the organization has an import `RECEIVED` or `PROCESSING` |
 | `stale-version` | 409 | `If-Match` doesn't match the current version (`currentVersion`) |
@@ -113,6 +115,8 @@ Validation errors add an `errors` array, one entry per problem:
 | `precondition-required` | 428 | `If-Match` missing on a versioned update |
 | `rate-limited` | 429 | Too many requests (login: M3.3f; uploads and runs: M10.4); with `Retry-After` |
 | `internal-error` | 500 | Anything unexpected; no details in the body |
+
+The codes live in one class, `shared.error.ProblemCodes`, kept in sync with this table. An error Spring raises itself with a status that has no row here gets `http-<status>` (for example `http-408`); clients should fall back on the HTTP status for any code they don't recognise.
 
 Why `400` and not `422` for upload content errors: `400` is the general "your request is wrong" status, and splitting hairs between 400 and 422 per check helps nobody. `422` is kept for the two cases where the request is well-formed but conflicts with semantics the client couldn't check itself (a reused key, an assignee who can't take the case).
 

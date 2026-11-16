@@ -50,6 +50,13 @@ spring:
         default-page-size: 50
         max-page-size: 200
 
+  modulith:
+    moments:
+      # Spring Modulith's Moments (time-passing events, unused here) puts @EnableScheduling on
+      # every node. Scheduled work (sweepers, partition maintenance, the job poller) must run on
+      # worker nodes only, where WorkerSchedulingConfig enables scheduling.
+      enabled: false
+
   mvc:
     problemdetails:
       # Spring MVC's own exceptions render as RFC 9457 ProblemDetail (GlobalExceptionHandler adds code/requestId).

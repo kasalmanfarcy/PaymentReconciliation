@@ -48,6 +48,11 @@ spring:
       # Spring MVC's own exceptions render as RFC 9457 ProblemDetail (GlobalExceptionHandler adds code/requestId).
       enabled: true
 
+  lifecycle:
+    # Graceful shutdown: in-flight requests finish, and job workers hand their jobs back at the next
+    # chunk boundary (JobWorker.stop) within this budget.
+    timeout-per-shutdown-phase: 30s
+
   servlet:
     multipart:
       # CSV contract limit (requirements: 50 MB); enforced again in code in M10.3.
@@ -92,6 +97,14 @@ reconflow:
     access-key: ${S3_ACCESS_KEY:}
     secret-key: ${S3_SECRET_KEY:}
   jobs:
+    # The DB-backed queue (ADR 0004, shared.jobs). Times are the database's clock.
+    poll-interval: 1s        # how often an idle worker looks for work
+    lease: 2m                # a claim is valid this long without a heartbeat or a chunk fence
+    heartbeat: 30s           # live workers extend their leases this often
+    sweep-interval: 30s      # how often expired leases are recovered
+    per-org-max-running: 2   # fairness: one tenant can't occupy every worker thread
+    base-backoff: 10s        # first retry delay after a transient failure; doubles per attempt
+    max-backoff: 10m
     worker:
       # The worker profile turns this on. Roles switch beans through this property,
       # not @Profile annotations, so profile names live only in YAML.

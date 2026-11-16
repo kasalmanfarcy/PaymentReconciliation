@@ -1,0 +1,273 @@
+package com.reconflow.paymentreconflow.shared.jobs;
+
+import com.reconflow.paymentreconflow.shared.context.TenantScope;
+import java.lang.management.ManagementFactory;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicBoolean;
+import org.jspecify.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.dao.RecoverableDataAccessException;
+import org.springframework.dao.TransientDataAccessException;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.CannotCreateTransactionException;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.transaction.support.TransactionTemplate;
+
+/**
+ * Claims and runs jobs, classifies failures, and recovers expired leases. The worker (JobWorker,
+ * worker nodes only) drives it from a thread pool on a schedule; tests drive it synchronously with
+ * {@link #runAllQueued}, so they read "upload, run the queue, assert" with no sleeping.
+ *
+ * <p>The claim is its own short statement, never part of the work's transaction: a lock held for a
+ * whole import would hide the job from the sweeper, and a dead worker's job could never be
+ * recovered. The work then runs in transactions of its own (one per chunk), each fenced.
+ */
+@Component
+public class JobRunner {
+
+    private static final Logger log = LoggerFactory.getLogger(JobRunner.class);
+
+    static final String INTERNAL_ERROR = "internal-error";
+
+    private final JobStore store;
+    private final JobProperties props;
+    private final TenantScope tenantScope;
+    private final TransactionTemplate tx;
+    private final Map<String, JobHandler> handlers = new HashMap<>();
+    private final AtomicBoolean stopping = new AtomicBoolean();
+    private final String node;
+
+    JobRunner(
+            JobStore store,
+            JobProperties props,
+            TenantScope tenantScope,
+            TransactionTemplate tx,
+            ObjectProvider<JobHandler> handlers) {
+        this.store = store;
+        this.props = props;
+        this.tenantScope = tenantScope;
+        this.tx = tx;
+        for (JobHandler h : handlers.orderedStream().toList()) {
+            if (this.handlers.put(h.type(), h) != null) {
+                throw new IllegalStateException("Two job handlers for type " + h.type());
+            }
+        }
+        this.node = hostname() + ":" + ManagementFactory.getRuntimeMXBean().getPid();
+    }
+
+    /** {@code host:pid:<slot>}: exactly which worker holds a job, as stored in {@code locked_by}. */
+    String workerId(String slot) {
+        return node + ":" + slot;
+    }
+
+    /**
+     * Claims and runs queued jobs on the calling thread until none is runnable; returns how many ran.
+     * A job rescheduled into the future (transient failure) is not runnable, so this terminates.
+     */
+    public int runAllQueued() {
+        return runAllQueued(null);
+    }
+
+    /** As {@link #runAllQueued()}, but only for these organizations (tests share one database). */
+    public int runAllQueued(@Nullable Collection<UUID> organizations) {
+        String workerId = workerId(Thread.currentThread().getName());
+        int ran = 0;
+        Optional<Job> job;
+        // Like the worker, never claims while stopping: a released job is runnable again at once.
+        while (!stopping.get() && (job = claim(workerId, organizations)).isPresent()) {
+            execute(job.get());
+            ran++;
+        }
+        return ran;
+    }
+
+    Optional<Job> claim(String workerId, @Nullable Collection<UUID> organizations) {
+        return store.claim(workerId, props.lease(), props.perOrgMaxRunning(), organizations);
+    }
+
+    /** Runs one claimed job to an outcome: DONE, re-queued with backoff, FAILED, released, or abandoned. */
+    void execute(Job job) {
+        if (TransactionSynchronizationManager.isActualTransactionActive()) {
+            throw new IllegalStateException("Jobs run outside any transaction; each chunk opens its own");
+        }
+        MDC.put("jobId", job.id().toString());
+        MDC.put("orgId", job.organizationId().toString());
+        try {
+            JobHandler handler = handlers.get(job.type());
+            if (handler == null) {
+                log.error("No handler for job type {}; failing job {}", job.type(), job.id());
+                store.markFailed(job.id(), job.workerId(), "no handler for type " + job.type());
+                return;
+            }
+            // Bound before any transaction starts, so every transaction the handler opens sets
+            // app.org_id for row-level security, exactly as a request would.
+            tenantScope.run(job.organizationId(), () -> runBound(job, handler));
+        } finally {
+            MDC.remove("jobId");
+            MDC.remove("orgId");
+        }
+    }
+
+    private void runBound(Job job, JobHandler handler) {
+        try {
+            handler.handle(job, new Context(job));
+            store.markDone(job.id(), job.workerId()); // no-op if the handler already completed it
+        } catch (LeaseLostException e) {
+            // Someone else owns the job now; whatever this worker had in flight was rolled back.
+            log.warn("Lease lost on job {}; another worker owns it now", job.id());
+        } catch (JobStoppedException e) {
+            store.release(job.id(), job.workerId());
+            log.info("Released job {} on shutdown", job.id());
+        } catch (RuntimeException e) {
+            if (isTransient(e)) {
+                if (job.attempts() >= job.maxAttempts()) {
+                    failPermanently(job, handler, "retries-exhausted", e);
+                } else {
+                    var delay = Backoff.delay(
+                            job.attempts(), props.baseBackoff(), props.maxBackoff(), ThreadLocalRandom.current());
+                    store.reschedule(job.id(), job.workerId(), delay, describe(e));
+                    log.warn(
+                            "Job {} failed transiently (attempt {}), retrying in {}",
+                            job.id(),
+                            job.attempts(),
+                            delay,
+                            e);
+                }
+            } else {
+                // Permanent, including bugs: retrying a deterministic failure five times only delays
+                // the report. After a fix, an operator retries explicitly.
+                String reason = e instanceof PermanentJobFailure ? e.getMessage() : INTERNAL_ERROR;
+                failPermanently(job, handler, reason, e);
+            }
+        }
+    }
+
+    /** The handler's clean-up and the job's FAILED status in one transaction, fenced. */
+    private void failPermanently(Job job, JobHandler handler, String reason, Exception cause) {
+        log.error("Job {} failed permanently: {}", job.id(), reason, cause);
+        try {
+            tx.executeWithoutResult(s -> {
+                handler.onPermanentFailure(job, reason);
+                if (!store.markFailed(job.id(), job.workerId(), describe(cause))) {
+                    throw new LeaseLostException(job.id(), job.workerId());
+                }
+            });
+        } catch (LeaseLostException e) {
+            log.warn("Lease lost on job {} while failing it; the new owner decides", job.id());
+        }
+    }
+
+    static boolean isTransient(Throwable e) {
+        return e instanceof TransientJobFailure
+                || e instanceof TransientDataAccessException
+                || e instanceof RecoverableDataAccessException
+                || e instanceof CannotCreateTransactionException;
+    }
+
+    /** Extends the lease of a job this worker is running (the heartbeat). */
+    boolean heartbeat(UUID jobId, String workerId) {
+        return store.extendLease(jobId, workerId, props.lease());
+    }
+
+    /**
+     * Recovers jobs whose worker died: expired leases with attempts left go back to the queue (the
+     * next worker resumes from the handler's checkpoint); those with none left are failed, with the
+     * handler told, one transaction each. Safe on several nodes at once: the requeue is one
+     * idempotent statement and each failure re-checks its job under {@code FOR UPDATE SKIP LOCKED}.
+     */
+    public int sweepExpiredLeases() {
+        List<UUID> requeued = store.requeueExpired();
+        if (!requeued.isEmpty()) {
+            log.warn("Re-queued {} job(s) whose lease expired: {}", requeued.size(), requeued);
+        }
+        int failed = 0;
+        for (Job job : store.expiredExhausted()) {
+            JobHandler handler = handlers.get(job.type());
+            Boolean done = tenantScope.call(
+                    job.organizationId(),
+                    () -> tx.execute(s -> {
+                        if (!store.lockExpiredExhausted(job.id())) {
+                            return false; // another sweeper has it, or it recovered
+                        }
+                        if (handler != null) {
+                            handler.onPermanentFailure(job, "retries-exhausted");
+                        }
+                        store.markFailedBySweeper(job.id(), "lease expired with no attempts left");
+                        return true;
+                    }));
+            if (Boolean.TRUE.equals(done)) {
+                failed++;
+            }
+        }
+        return requeued.size() + failed;
+    }
+
+    /** Graceful shutdown: running handlers see {@link JobContext#stopRequested()} at their next chunk. */
+    void requestStop() {
+        stopping.set(true);
+    }
+
+    void clearStop() {
+        stopping.set(false);
+    }
+
+    private static String describe(Throwable e) {
+        return e.getClass().getSimpleName() + ": " + e.getMessage();
+    }
+
+    private static String hostname() {
+        try {
+            return InetAddress.getLocalHost().getHostName();
+        } catch (UnknownHostException e) {
+            return "unknown-host";
+        }
+    }
+
+    private final class Context implements JobContext {
+
+        private final Job job;
+
+        Context(Job job) {
+            this.job = job;
+        }
+
+        @Override
+        public void fence() {
+            requireTransaction();
+            if (!store.extendLease(job.id(), job.workerId(), props.lease())) {
+                throw new LeaseLostException(job.id(), job.workerId());
+            }
+        }
+
+        @Override
+        public void complete() {
+            requireTransaction();
+            if (!store.markDone(job.id(), job.workerId())) {
+                throw new LeaseLostException(job.id(), job.workerId());
+            }
+        }
+
+        @Override
+        public boolean stopRequested() {
+            return stopping.get();
+        }
+
+        private static void requireTransaction() {
+            // A fence outside the chunk's transaction proves nothing: the data would commit alone.
+            if (!TransactionSynchronizationManager.isActualTransactionActive()) {
+                throw new IllegalStateException("fence() and complete() must run inside the work's transaction");
+            }
+        }
+    }
+}

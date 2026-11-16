@@ -17,6 +17,7 @@ import com.reconflow.paymentreconflow.shared.context.CurrentUser;
 import com.reconflow.paymentreconflow.shared.context.Permission;
 import com.reconflow.paymentreconflow.shared.context.TenantContext;
 import com.reconflow.paymentreconflow.shared.error.NotFoundException;
+import com.reconflow.paymentreconflow.shared.error.UniqueViolations;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.OptimisticLockException;
 import java.util.Objects;
@@ -49,6 +50,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  */
 @Service
 public class ExceptionCommands {
+
+    static final String ACTIVE_CASE_UK = "exception_case_active_uk";
 
     private final ExceptionCaseRepository cases;
     private final ExceptionStateMachine machine;
@@ -130,6 +133,46 @@ public class ExceptionCommands {
      */
     public void resolve(UUID id, long expectedVersion, @Nullable String code, @Nullable String note) {
         write(id, expectedVersion, c -> machine.apply(c, Transition.RESOLVE, TransitionInput.resolution(code, note)));
+    }
+
+    /**
+     * RESOLVED → OPEN, by an org admin, with a reason. The previous resolution is cleared from the
+     * case (V1's CHECK) and kept on the history row (M7.4); the assignee stays, as the natural owner.
+     *
+     * <p>The active-case collision (M7.3), in two layers, like the duplicate upload of M5:
+     * <ol>
+     *   <li>a friendly pre-check: another active case with the same key → 409 with its id;</li>
+     *   <li>the guarantee: if a run inserts one between the pre-check and our UPDATE, the partial
+     *       unique index {@code exception_case_active_uk} fails the flush. PostgreSQL has then
+     *       aborted the transaction, so the existing case is looked up in a <em>new</em> one.</li>
+     * </ol>
+     */
+    public void reopen(UUID id, long expectedVersion, @Nullable String reason) {
+        UUID org = tenant.organizationId();
+        try {
+            write(id, expectedVersion, c -> {
+                // Only a RESOLVED case can collide; anything else is the state machine's 409.
+                if (c.getStatus() == ExceptionStatus.RESOLVED) {
+                    cases.findActiveIdByOrganizationIdAndKey(org, c.getDiscrepancyKey())
+                            .ifPresent(active -> {
+                                throw new ActiveCaseExistsException(active);
+                            });
+                }
+                machine.apply(c, Transition.REOPEN, TransitionInput.reason(reason));
+            });
+        } catch (RuntimeException e) {
+            if (!UniqueViolations.isViolationOf(e, ACTIVE_CASE_UK)) {
+                throw e;
+            }
+            String key = tx.execute(s -> cases.findByIdAndOrganizationId(id, org)
+                    .map(ExceptionCase::getDiscrepancyKey)
+                    .orElse(null));
+            UUID active = key == null
+                    ? null
+                    : tx.execute(s ->
+                            cases.findActiveIdByOrganizationIdAndKey(org, key).orElse(null));
+            throw new ActiveCaseExistsException(active);
+        }
     }
 
     /** PATCH moves only between OPEN and IN_REVIEW; resolve and reopen have their own endpoints. */

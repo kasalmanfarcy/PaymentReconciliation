@@ -84,6 +84,14 @@ class ExceptionCrossTenantCases implements CrossTenantCases {
                 f -> Map.of("resolutionCode", "GATEWAY_FEE"),
                 NOT_FOUND,
                 IF_MATCH_0));
+        cases.add(new CrossTenantCase(
+                "reopen org B's resolved exception",
+                HttpMethod.POST,
+                "/api/v1/exceptions/{id}/reopen",
+                f -> Map.of("id", f.orgBResolvedCase()),
+                f -> Map.of("reason", "hijack"),
+                NOT_FOUND,
+                IF_MATCH_0));
         return cases;
     }
 }

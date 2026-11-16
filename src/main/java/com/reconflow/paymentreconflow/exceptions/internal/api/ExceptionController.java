@@ -149,6 +149,25 @@ class ExceptionController {
         return withETag(queries.detail(id));
     }
 
+    /** Reason required (≤ 1,000 characters); the state machine checks it, as for back-to-open. */
+    record ReopenRequest(@Nullable String reason) {}
+
+    /**
+     * RESOLVED → OPEN, org admins only ({@code EXCEPTION_REOPEN}): resolutions can be wrong, and
+     * reopening must be possible, rare, explained and attributable. 409 {@code active-case-exists}
+     * if a later run already opened a new case for the same discrepancy.
+     */
+    @PostMapping("/{id}/reopen")
+    @RequiresPermission(Permission.EXCEPTION_REOPEN)
+    ResponseEntity<ExceptionDetailView> reopen(
+            @PathVariable UUID id,
+            @RequestHeader(name = HttpHeaders.IF_MATCH, required = false) @Nullable String ifMatch,
+            @RequestBody ReopenRequest request) {
+        long expected = IfMatch.parseRequired(ifMatch);
+        commands.reopen(id, expected, request.reason());
+        return withETag(queries.detail(id));
+    }
+
     static ResponseEntity<ExceptionDetailView> withETag(ExceptionDetailView view) {
         return ResponseEntity.ok().eTag(Long.toString(view.version())).body(view);
     }

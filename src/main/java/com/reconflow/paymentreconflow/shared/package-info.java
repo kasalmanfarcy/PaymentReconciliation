@@ -7,4 +7,10 @@
  *
  * <p>Depends on no other module.
  */
+// OPEN: every sub-package (id, json, error, web, config, jobs) is usable by all modules, instead of
+// marking each one a @NamedInterface. Fine for a module of small building blocks. That it depends
+// on no other module is checked by ArchitectureRulesTest.
+@ApplicationModule(displayName = "Shared", type = ApplicationModule.Type.OPEN)
 package com.reconflow.paymentreconflow.shared;
+
+import org.springframework.modulith.ApplicationModule;

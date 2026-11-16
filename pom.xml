@@ -43,7 +43,20 @@
     <properties>
         <java.version>25</java.version>
         <uuid-creator.version>6.1.1</uuid-creator.version>
+        <!-- Spring Modulith 2.1.x is the line built for Spring Boot 4.1. Boot does not manage it. -->
+        <spring-modulith.version>2.1.2</spring-modulith.version>
     </properties>
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.springframework.modulith</groupId>
+                <artifactId>spring-modulith-bom</artifactId>
+                <version>${spring-modulith.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
     <dependencies>
         <dependency>
             <groupId>org.springframework.boot</groupId>
@@ -77,6 +90,11 @@
             <artifactId>flyway-database-postgresql</artifactId>
         </dependency>
 
+        <!-- Module annotations (@ApplicationModule, @NamedInterface) and the module model. -->
+        <dependency>
+            <groupId>org.springframework.modulith</groupId>
+            <artifactId>spring-modulith-starter-core</artifactId>
+        </dependency>
         <!-- UUIDv7 generator (ADR 0010): the JDK only generates v4 (random) UUIDs. -->
         <dependency>
             <groupId>com.github.f4b6a3</groupId>
@@ -98,6 +116,12 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-webmvc-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- ApplicationModules.verify() and Documenter for ModularityTest (M2.9). -->
+        <dependency>
+            <groupId>org.springframework.modulith</groupId>
+            <artifactId>spring-modulith-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
         <!-- Pulled forward from M2.3 so ./mvnw test passes on a fresh clone:

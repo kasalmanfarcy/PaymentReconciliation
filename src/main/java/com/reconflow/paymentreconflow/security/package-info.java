@@ -7,4 +7,9 @@
  * <p>Exposes almost nothing: other modules may only use the user directory (membership and
  * display-name lookups). Login, tokens and the filter are internal.
  */
+// Allowed dependencies: docs/architecture.md §4. A dependency not listed here fails ModularityTest,
+// even if it would not create a cycle.
+@ApplicationModule(displayName = "Security", allowedDependencies = {"organization", "audit", "shared"})
 package com.reconflow.paymentreconflow.security;
+
+import org.springframework.modulith.ApplicationModule;

@@ -26,6 +26,7 @@ public class ExactReferenceStrategy implements MatchingStrategy {
 
     private static final String CREATE_GROUP_TABLE = SqlScripts.load("create_group_table.sql");
     private static final String CLASSIFY_GROUPS = SqlScripts.load("classify_groups.sql");
+    private static final String INSERT_MATCHES = SqlScripts.load("insert_matches.sql");
     private static final String SELECT_EXCEPTION_GROUPS = SqlScripts.load("select_exception_groups.sql");
 
     private final JdbcClient jdbc;
@@ -55,6 +56,10 @@ public class ExactReferenceStrategy implements MatchingStrategy {
                 .param("rightSource", run.rightSource().name())
                 .param("currency", run.currency())
                 .update();
+        int matches = jdbc.sql(INSERT_MATCHES)
+                .param("org", run.organizationId())
+                .param("runId", run.runId())
+                .update();
         List<GroupRow> exceptionGroups =
                 jdbc.sql(SELECT_EXCEPTION_GROUPS).query(GroupRow::map).list();
 
@@ -63,7 +68,7 @@ public class ExactReferenceStrategy implements MatchingStrategy {
             discrepancies.add(toDiscrepancy(run, group));
         }
         discrepancies.sort(Comparator.comparing(Discrepancy::discrepancyKey));
-        return new DayResult(0, discrepancies);
+        return new DayResult(matches, discrepancies);
     }
 
     private static Discrepancy toDiscrepancy(RunContext run, GroupRow group) {

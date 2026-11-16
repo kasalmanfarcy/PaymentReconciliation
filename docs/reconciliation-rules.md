@@ -343,7 +343,24 @@ When a job ends `FAILED`, its handler moves the business entity (batch or run) t
 
 ## 8. Money handling
 
-_Added in M1.8._
+Binary floating point can't represent most decimal fractions exactly: in a `double`, `0.1 + 0.2` is `0.30000000000000004`. Money therefore never touches `float` or `double` anywhere in ReconFlow.
+
+| ID | Rule | Reason |
+|---|---|---|
+| MN1 | Java type `BigDecimal`; database type `NUMERIC(19,4)` | 15 integer digits covers any realistic single transaction; 4 decimal places covers every ISO-4217 currency (the most is 3 minor units, e.g. KWD, BHD) with headroom for computed differences. `NUMERIC` arithmetic in PostgreSQL is exact |
+| MN2 | Compare with `compareTo(...) == 0`, never `equals` | `BigDecimal.equals` compares the scale too: `new BigDecimal("1000.0").equals(new BigDecimal("1000.00"))` is `false`. Sample PAY-105 (`300.00` vs `300.0`) is the regression case, and an ArchUnit rule forbids `BigDecimal.equals` in production code (M6.22) |
+| MN3 | Parse from the **string** in the CSV with `new BigDecimal(text)`; never `Double.parseDouble` or `BigDecimal.valueOf(double)` | A `double` can't hold `0.1` exactly, so going through one corrupts the amount before it's even stored |
+| MN4 | Inputs with more than 4 decimal places are rejected (`AMOUNT_SCALE_EXCEEDED`). Valid amounts are stored with `setScale(4, RoundingMode.UNNECESSARY)` | `UNNECESSARY` throws instead of rounding. Silently changing a financial amount is worse than refusing it: a rejected row is visible and fixable, a rounded one isn't |
+| MN5 | Amounts aren't checked against the currency's minor units in v1 (`JPY 100.50` is accepted) | Some ledgers carry sub-unit precision (averaged costs, fractional fees). Flagged as a possible v2 rule |
+| MN6 | Sums are computed in SQL (`SUM(amount)` on `NUMERIC`); differences as `gateway − ledger` on two `NUMERIC` / `BigDecimal` values | Exact by construction, and no rows are loaded into Java just to add them up |
+| MN7 | JSON carries amounts as **strings** in plain notation with the stored scale (`"1000.0000"`), always next to a `currency` field; never as JSON numbers | JavaScript (and many JSON libraries) parse numbers into binary doubles, so a large or precise amount is silently changed on arrival. A string is lossless. Configured once in the Jackson setup (M2) |
+| MN8 | Format output with `toPlainString()`, never `toString()` | `toString()` can produce scientific notation, e.g. `new BigDecimal("1E+3").toString()` is `"1E+3"` |
+
+**No rounding anywhere in v1.** All inputs have at most 4 decimal places, and adding or subtracting values of scale 4 gives a value of scale 4, so no operation ever needs a rounding mode. If v2 adds FX conversion or fee percentages, that's when a rounding rule (and its `RoundingMode`) has to be chosen and written here.
+
+**Amounts are positive** (assumption A8). Direction comes from `transaction_type`, not from a sign, and `amount_difference` is the only value that can be negative.
+
+**How do you store and compare money, in one breath:** `BigDecimal` in Java and `NUMERIC(19,4)` in PostgreSQL, parsed from the original string, rejected rather than rounded if it has more than four decimals, compared with `compareTo` because `equals` treats `1000.0` and `1000.00` as different, summed in SQL, and sent over JSON as strings.
 
 ---
 

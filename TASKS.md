@@ -301,20 +301,20 @@ Built early so later milestones emit events as they go, instead of retrofitting 
 ## M11 — Deployment and portfolio
 
 ### Packaging and deployment
-- [ ] **M11.1** Multi-stage `Dockerfile` (or Buildpacks via `spring-boot:build-image`) running as a non-root user.
-- [ ] **M11.2** A `compose.yaml` profile that runs the full stack: app, PostgreSQL, and optionally Prometheus and Grafana.
-- [ ] **M11.3** A CI job that builds and pushes the image on merge to `main`.
-- [ ] **M11.4** Deploy to a host (Render, Fly.io, Railway or a small VM) with a managed PostgreSQL.
-- [ ] **M11.5** Run Flyway migrations as part of the deploy, with a rollback note for each migration.
+- [x] **M11.1** Multi-stage `Dockerfile` (or Buildpacks via `spring-boot:build-image`) running as a non-root user. *Done: `Dockerfile` (Temurin 25 JRE on Alpine, uid 10001, layered, pinned by digest), `.dockerignore` allow-list.*
+- [x] **M11.2** A `compose.yaml` profile that runs the full stack: app, PostgreSQL, and optionally Prometheus and Grafana. *Done: `--profile full` (migrate, api, worker) and `observability`; `demo` profile seeds under prod config.*
+- [x] **M11.3** A CI job that builds and pushes the image on merge to `main`. *Done: `image` job (build, uid check, Trivy) on every PR; `publish-image` pushes `sha-<commit>` and `main` from `main`. Runs once the repository is on GitHub.*
+- [ ] **M11.4** Deploy to a host (Render, Fly.io, Railway or a small VM) with a managed PostgreSQL. *Prepared; user step: everything is in `deploy/` and [docs/runbooks/deploy.md](docs/runbooks/deploy.md) (single VM + Compose + Traefik, managed PostgreSQL 16, S3), rehearsed end to end locally; the deploy itself and the public URL need the owner's accounts.*
+- [x] **M11.5** Run Flyway migrations as part of the deploy, with a rollback note for each migration. *Done: `migrate` role and `deploy.sh` stage; api/worker validate only, as the app role; rollback-note rule from V13 (CI).*
 
 ### Documentation and demo
-- [ ] **M11.6** Update the README: real setup steps, the current API surface, and roadmap statuses.
-- [ ] **M11.7** OpenAPI spec through springdoc, with Swagger UI enabled on non-prod profiles.
-- [ ] **M11.8** A Postman or Bruno collection that walks the demo: upload ledger → upload gateway file → run → list exceptions → resolve → report.
-- [ ] **M11.9** A reproducible demo dataset and a `scripts/demo.sh` that runs the walkthrough end to end.
-- [ ] **M11.10** Final `architecture.md` with diagrams that match the code as built.
-- [ ] **M11.11** A trade-offs write-up: what was deferred and why, what you would change at 100× scale, and lessons learned.
-- [ ] **M11.12** A short demo video or GIF in the README.
+- [x] **M11.6** Update the README: real setup steps, the current API surface, and roadmap statuses.
+- [x] **M11.7** OpenAPI spec through springdoc, with Swagger UI enabled on non-prod profiles. *Done: springdoc 3.2, `docs/openapi.json`, `OpenApiSpecIT` (drift, completeness, status codes vs api-design §8.1); off in prod.*
+- [x] **M11.8** A Postman or Bruno collection that walks the demo: upload ledger → upload gateway file → run → list exceptions → resolve → report. *Done: `bruno/`, 15 requests, passes headless against the full profile.*
+- [x] **M11.9** A reproducible demo dataset and a `scripts/demo.sh` that runs the walkthrough end to end. *Done: `docs/samples/demo`, `scripts/demo.sh`, `DemoDatasetIT`.*
+- [x] **M11.10** Final `architecture.md` with diagrams that match the code as built.
+- [x] **M11.11** A trade-offs write-up: what was deferred and why, what you would change at 100× scale, and lessons learned. *Done: `docs/trade-offs.md`.*
+- [ ] **M11.12** A short demo video or GIF in the README. *Prepared; user step: recording steps in [docs/media/README.md](docs/media/README.md); the README shows a text excerpt of a real run meanwhile.*
 
 **Exit criteria:** someone can clone the repo, run a single command, and watch the full workflow from upload to resolution.
 

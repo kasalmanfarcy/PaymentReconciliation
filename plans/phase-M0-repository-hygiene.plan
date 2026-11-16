@@ -1,6 +1,6 @@
 # Phase M0 — Repository hygiene
 
-**Status:** Not started · **Tasks:** TASKS.md M0.1–M0.6 · **Depends on:** nothing · **Date:** 2026-11-01
+**Status:** Done except M0.4 (create the GitHub repository, push and protect `main`: an owner step) · **Tasks:** TASKS.md M0.1–M0.6 · **Depends on:** nothing · **Date:** 2026-11-01
 
 This phase turns a folder of code on one laptop into a repository that someone else can clone, build, understand and contribute to under clear rules. None of it is glamorous, but every later phase relies on it. CI can't protect `main` until `main` lives on GitHub, commit messages can't reference task IDs until there's a convention, and a reviewer can't trust the build until `./mvnw test` passes on a machine that isn't yours.
 

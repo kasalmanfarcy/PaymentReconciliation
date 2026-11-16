@@ -17,22 +17,22 @@
 
 ## Phases, in build order
 
-| Phase | Plan | Builds | Depends on |
-|---|---|---|---|
-| M0 | [phase-M0-repository-hygiene.plan](phase-M0-repository-hygiene.plan) | Pushed repo, license, conventions, branch protection | — |
-| M1 | [phase-M1-requirements-and-design.plan](phase-M1-requirements-and-design.plan) | Requirements, rules, architecture, DB and API design docs, ADRs, sample CSVs | M0 |
-| M2 | [phase-M2-project-foundation.plan](phase-M2-project-foundation.plan) | Testcontainers, Compose, profiles, error model, logging, CI | M1 |
-| M3 | [phase-M3-organizations-users-tenancy.plan](phase-M3-organizations-users-tenancy.plan) | Entities, authentication, tenant context, RLS, permissions, cross-tenant tests | M2 |
-| M3.3 | [authentication.plan](authentication.plan) | Detailed authentication design that the M3 plan references | — |
-| M4 | [phase-M4-audit-foundation.plan](phase-M4-audit-foundation.plan) | Transactional, append-only audit | M3 |
-| M5 | [phase-M5-transaction-ingestion.plan](phase-M5-transaction-ingestion.plan) | Upload, job queue, streaming CSV pipeline, transactions API | M4 |
-| M6 | [phase-M6-reconciliation-engine.plan](phase-M6-reconciliation-engine.plan) | Set-based matching engine, idempotent runs | M5 |
-| M7 | [phase-M7-exception-management.plan](phase-M7-exception-management.plan) | Exception workflow, optimistic locking, history | M6 |
-| M8 | [phase-M8-reporting.plan](phase-M8-reporting.plan) | Aggregate reports, CSV export | M7 |
-| M9 | [phase-M9-reliability-and-performance.plan](phase-M9-reliability-and-performance.plan) | Recovery, failure injection, benchmarks, metrics, Kafka decision | M8 |
-| M10 | [phase-M10-security-hardening.plan](phase-M10-security-hardening.plan) | Keycloak migration, DB roles, scanning, rate limits | M9 |
-| M11 | [phase-M11-deployment-and-portfolio.plan](phase-M11-deployment-and-portfolio.plan) | Docker, deploy, OpenAPI, demo, write-ups | M10 |
-| v2 | [phase-v2-later-scope.plan](phase-v2-later-scope.plan) | Post-v1 features | M11 |
+| Phase | Plan | Builds | Depends on | Status |
+|---|---|---|---|---|
+| M0 | [phase-M0-repository-hygiene.plan](phase-M0-repository-hygiene.plan) | Pushed repo, license, conventions, branch protection | — | Done, except pushing and protecting the repository (owner) |
+| M1 | [phase-M1-requirements-and-design.plan](phase-M1-requirements-and-design.plan) | Requirements, rules, architecture, DB and API design docs, ADRs, sample CSVs | M0 | Done |
+| M2 | [phase-M2-project-foundation.plan](phase-M2-project-foundation.plan) | Testcontainers, Compose, profiles, error model, logging, CI | M1 | Done |
+| M3 | [phase-M3-organizations-users-tenancy.plan](phase-M3-organizations-users-tenancy.plan) | Entities, authentication, tenant context, RLS, permissions, cross-tenant tests | M2 | Done |
+| M3.3 | [authentication.plan](authentication.plan) | Detailed authentication design that the M3 plan references | — | Superseded by ADR 0015 (M10.1) |
+| M4 | [phase-M4-audit-foundation.plan](phase-M4-audit-foundation.plan) | Transactional, append-only audit | M3 | Done |
+| M5 | [phase-M5-transaction-ingestion.plan](phase-M5-transaction-ingestion.plan) | Upload, job queue, streaming CSV pipeline, transactions API | M4 | Done |
+| M6 | [phase-M6-reconciliation-engine.plan](phase-M6-reconciliation-engine.plan) | Set-based matching engine, idempotent runs | M5 | Done |
+| M7 | [phase-M7-exception-management.plan](phase-M7-exception-management.plan) | Exception workflow, optimistic locking, history | M6 | Done |
+| M8 | [phase-M8-reporting.plan](phase-M8-reporting.plan) | Aggregate reports, CSV export | M7 | Done |
+| M9 | [phase-M9-reliability-and-performance.plan](phase-M9-reliability-and-performance.plan) | Recovery, failure injection, benchmarks, metrics, Kafka decision | M8 | Done |
+| M10 | [phase-M10-security-hardening.plan](phase-M10-security-hardening.plan) | Keycloak migration, DB roles, scanning, rate limits | M9 | Done |
+| M11 | [phase-M11-deployment-and-portfolio.plan](phase-M11-deployment-and-portfolio.plan) | Docker, deploy, OpenAPI, demo, write-ups | M10 | Done (live deploy and demo GIF: owner) |
+| v2 | [phase-v2-later-scope.plan](phase-v2-later-scope.plan) | Post-v1 features | M11 | Not started |
 
 Supporting design: [docs/scalability.md](../docs/scalability.md), the capacity plan that several phases build on.
 

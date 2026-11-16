@@ -235,7 +235,7 @@ account: [docs/runbooks/deploy.md](docs/runbooks/deploy.md) §9.
 
 | Phase | Scope | Status |
 |---|---|---|
-| M0–M2 | Repository, requirements and design, project foundation | Done |
+| M0–M2 | Repository, requirements and design, project foundation | Done (protecting `main`: owner) |
 | M3–M4 | Organizations, users, tenant isolation; append-only audit | Done |
 | M5–M8 | Ingestion, reconciliation engine, exception workflow, reporting | Done |
 | M9 | Reliability and performance (recovery, benchmarks, metrics) | Done |
@@ -249,6 +249,8 @@ These need an account, a machine or a person, so they were prepared but not done
 
 - **Deploy** to a VM with a managed PostgreSQL and a bucket: [runbook](docs/runbooks/deploy.md) §2–§4,
   then switch on the [deploy workflow](.github/workflows/deploy.yml).
+- **Push the work and protect `main`** (TASKS.md M0.4, make the repository public if it isn't); CI
+  then runs `build` and `image` on every PR and `publish-image` on `main`.
 - **GitHub settings:** Dependabot, secret scanning and push protection, required checks
   (`build`, `image`, `dependency-review`, `gitleaks`), `NVD_API_KEY` ([security.md §3](docs/security.md#3-steps-that-live-outside-the-repository)),
   and making the GHCR package public after the first push.

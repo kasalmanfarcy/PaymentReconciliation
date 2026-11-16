@@ -1,6 +1,6 @@
 # Phase M11 — Deployment and portfolio
 
-**Status:** Not started · **Tasks:** TASKS.md M11.1–M11.12 · **Depends on:** M0–M10 (everything; M11 packages what exists) · **Date:** 2026-11-01
+**Status:** Done (2026-11-16; as built: §9; M11.4's live deploy and M11.12's recording are owner steps) · **Tasks:** TASKS.md M11.1–M11.12 · **Depends on:** M0–M10 (everything; M11 packages what exists) · **Date:** 2026-11-01
 
 M11 turns a working codebase into something a stranger can run, a host can deploy, and an interviewer can understand in five minutes. It has two halves: **packaging and deployment** (M11.1–M11.5), and **documentation and demo** (M11.6–M11.12). The second half is not decoration. For a portfolio project it's how most people will ever experience the work.
 
@@ -865,18 +865,18 @@ Keep it under ~5 MB, cut waiting time (speed up polling sections), and show the 
 
 ## 6. Exit criteria checklist
 
-- [ ] Multi-stage Dockerfile, non-root, layered, `.dockerignore` excludes `.env`
-- [ ] `docker compose --profile full up` runs api, worker, migrate, Postgres, MinIO, Keycloak; `observability` adds Prometheus and Grafana
-- [ ] Merges to `main` push `ghcr.io/kasalmanfarcy/reconflow:sha-<commit>` after tests pass; image scanned
-- [ ] Deployed on a public HTTPS URL with managed PostgreSQL 16 and S3-compatible storage
-- [ ] Migrations run as a separate step with the migrator role; the app only validates; every new migration has a `Rollback:` note
-- [ ] README rewritten; old open questions replaced by ADR links
-- [ ] OpenAPI spec committed and drift-checked; Swagger UI off in prod
-- [ ] Bruno collection walks the demo and passes
-- [ ] `./scripts/demo.sh` passes on a fresh clone, twice in a row, and against the deployment
-- [ ] `docs/architecture.md` matches the code
-- [ ] `docs/trade-offs.md` written, every claim linked
-- [ ] GIF or video in the README
+- [x] Multi-stage Dockerfile, non-root, layered, `.dockerignore` excludes `.env`
+- [x] `docker compose --profile full up` runs api, worker, migrate, Postgres, MinIO, Keycloak; `observability` adds Prometheus and Grafana
+- [x] Merges to `main` push `ghcr.io/kasalmanfarcy/reconflow:sha-<commit>` after tests pass; image scanned (the workflow; it first runs once the repository is on GitHub)
+- [ ] Deployed on a public HTTPS URL with managed PostgreSQL 16 and S3-compatible storage — **prepared and rehearsed locally; the deploy is an owner step** (docs/runbooks/deploy.md)
+- [x] Migrations run as a separate step with the migrator role; the app only validates; every new migration has a `Rollback:` note
+- [x] README rewritten; old open questions replaced by ADR links
+- [x] OpenAPI spec committed and drift-checked; Swagger UI off in prod
+- [x] Bruno collection walks the demo and passes
+- [x] `./scripts/demo.sh` passes on a fresh stack, twice in a row, and against the deployment rehearsal (against a real deployment: owner step)
+- [x] `docs/architecture.md` matches the code
+- [x] `docs/trade-offs.md` written, every claim linked
+- [ ] GIF or video in the README — **owner step** (docs/media/README.md); a text excerpt of a real run stands in
 
 TASKS.md's exit criterion — *someone can clone the repo, run a single command, and watch the full workflow from upload to resolution* — is the `./scripts/demo.sh` line. Test it on a machine that has never seen the project.
 
@@ -944,3 +944,31 @@ Each deliverable is the evidence behind a resume bullet (see the "after it's ful
 | In-house auth, then OIDC migration touching only the security package | The M10.1 ADR, linked from `docs/trade-offs.md` (M11.11) |
 | Postgres job queue with leases and failure-injection tests | `architecture.md` crash/re-claim sequence diagram (M11.10), trade-offs section on Kafka (M11.11) |
 | Shipped with partitioned schema, CI with Testcontainers, metrics, non-root Docker image | Dockerfile (M11.1), CI + GHCR job (M11.3), migrate step (M11.5), Grafana in Compose (M11.2) |
+
+---
+
+## 9. As built: where the code differs from this plan, and why
+
+docs/ win over this plan wherever they disagree. Built in the plan's order (M11.1, M11.2, M11.5, M11.3, M11.4, M11.7, M11.9, M11.8, M11.6, M11.10, M11.11, M11.12), one commit per task. Nothing left the machine: no deploy, no image push, no repository change on GitHub; images were built and scanned locally and every stack was started under its own compose project name and removed with `down -v`.
+
+| Plan said | Built | Why |
+|---|---|---|
+| **M11.1** `eclipse-temurin:25-jre` (Ubuntu) + `curl` for the health check; `-Djava.security.egd` | `25.0.5_8-jre-alpine`, both stages pinned by tag **and digest**; busybox `wget` for the health check (follows `MANAGEMENT_PORT`); no `egd` (obsolete since Java 9); `-Dmaven.test.skip` (tests compiled only in CI); `.dockerignore` an allow-list; OCI labels; Dependabot `docker` ecosystem | Smaller OS, fewer packages to patch, nothing installed. Measured: **149 MB compressed, 300 MB unpacked**, `id` = uid 10001; a rebuild after a source change reused the dependency layer. Trivy (0.76.2, local, 2026-11-16): **0 HIGH/CRITICAL, 1 MEDIUM** (zlib in the Alpine base, CVE-2026-4738, fixed in 1.4-r0: arrives with the next base digest). Building needs BuildKit (Buildx on Colima: README) |
+| **M11.2** `env_file: .env` for the app; `extra_hosts: localhost:host-gateway` | Each role gets an explicit environment (never the superuser's password; migrate the migrator's only); the issuer string stays `localhost:8180` while keys come from `keycloak:8180` over the compose network (`...JWT_JWKSETURI`); `mem_limit`s; the seeder's demo guard is a property (`reconflow.seed.only-into-demo-database`) | Least privilege per role; `localhost` mapped to the host gateway is unreliable (Docker already maps it to 127.0.0.1) |
+| **M11.5** `FlywayValidateOnlyConfig` with `@Profile("!migrate & !local & !test")` | `shared.db.FlywayStrategyConfig` switched by `reconflow.flyway.strategy` (`validate` in prod, `migrate` elsewhere); prod's Flyway connects **as the app role**, so `DB_MIGRATOR_*` left prod's required properties; `MigrateAndExit` exits explicitly; `FlywayValidateOnlyIT` on a separate database; `scripts/check_migration_notes.sh` in CI from V13 | Profile names live only in YAML (plans/README); validating needs only `SELECT` on the history, so the running app never sees the migrator password. Verified in compose: an api started before migrate exits 1 with Flyway's "not applied" message |
+| **M11.3** `aquasecurity/trivy-action`, push job only | An `image` job on every PR (build without push, uid check, Trivy from its pinned image, `--timeout 15m`) and `publish-image` on `main` after `build` and `image`, `provenance: mode=max`, SBOM | Same pattern as gitleaks (the CLI image, no third-party action); the first local scan needed more than Trivy's default 5 min to fetch its Java DB |
+| **M11.4** Render (PaaS), Keycloak as a Render service | **One VM with Docker Compose** (`deploy/compose.prod.yaml`): Traefik v3.5.6 (Let's Encrypt, HTTP→HTTPS, 51 MiB body cap, per-IP limits with a tighter one on Keycloak's token/login endpoints, `/admin` not routed), Keycloak `start` on its own database (`infra/db/bootstrap-keycloak.sql`), api/worker read-only with no capabilities, migrate as `deploy.sh`'s second stage; production realm without the password grant plus a `reconflow-cli` PKCE client (`scripts/lib/oidc.sh`); `server.forward-headers-strategy: native`; a gated `deploy.yml` workflow; `compose.local.yaml` rehearses it with PostgreSQL, MinIO and a throwaway CA | The exact files can be proven on a laptop with nothing leaving it, and the edge controls M10 left open need a proxy of our own. Rehearsed: all stages pass; HSTS present through the proxy, `/admin` 404, password grant `invalid_client`, PKCE login, `POST /members` through the internal Admin API (201), 54 MB upload 413 at Traefik, login burst 429, `demo.sh` twice. Not done (owner): the deploy itself, so no public URL and no measured deploy gap |
+| **M11.7** `@Operation` on the non-obvious cases | `@ApiResponses` on every endpoint (success + main errors from api-design §8.1), a customizer adding 401/403/429 and the ProblemDetail schema; its own filter chain with a CSP that lets Swagger UI load; `OpenApiSpecIT` also checks completeness against the handler mappings and status codes against api-design §8.1 | A spec that's only a drift check would still be free to say `200` for a `202` |
+| **M11.9** Dataset of ~20 rows, 12 matches; `--no-start` against a deployment | 19 ledger and 22 gateway rows (12 exact matches + 1 normalized), `expected.json` with imports, summary and open cases; login by PKCE; `DemoDatasetIT` checks the numbers and the second run on every build | The script has to work against a deployed realm; a demo whose numbers aren't in the build drifts |
+| **M11.8** Bruno, 10 requests | 15 (three role logins, a stale-ETag request), local realm only (password grant) | Bruno CLI 4.2.1 headless: 15/15 against the full profile |
+| **M11.12** GIF | Recording instructions; the README shows an excerpt of a real run | Recording needs a person at a terminal |
+| — | CONTRIBUTING: `perf` type; migration rules (expand/contract, locks, rollback note) | M9's commits used `perf`; M11.5's rules needed a home |
+
+Fixed along the way: `deploy.sh` reported success before Traefik's health check (every 5 s) had re-admitted the new api, so a smoke test right after it got `503`; it now waits until an anonymous call through the edge answers `401`. `.env.example` lacked `GRAFANA_ADMIN_PASSWORD`, which compose requires whichever profiles run, so a fresh clone couldn't `docker compose up` at all.
+
+**Final checks (2026-11-16):** `./mvnw clean verify` passed, 380 unit tests and 749 integration tests, 0 failures or skips. The rehearsal from an empty state: deploy stages all exit 0; readiness and liveness `UP`; through the edge `401` with HSTS, HTTP `301`, password grant `invalid_client`, `/admin` `404`, `/actuator/prometheus` `401`, `/v3/api-docs` and `/swagger-ui.html` `404` even authenticated, `POST /members` `201`, a 54 MB upload `413`; `demo.sh` twice, all checks passed, the second reusing both batches. Then `down -v`.
+
+Tests added: `FlywayValidateOnlyIT`, `ProductionRealmTest`, `OpenApiSpecIT`, `DemoDatasetIT`, a demo-guard case in `LocalSeederIT`; `CrossTenantCoverageIT` exempts the OpenAPI paths.
+
+Not done, needing the owner: the deployment and its public URL, the GitHub settings (required checks including `image`, secret scanning, Dependabot, `NVD_API_KEY`, GHCR visibility, the `production` environment and deploy secrets), the demo GIF. A zero-downtime api deploy would need a second api replica (runbook §6).
+

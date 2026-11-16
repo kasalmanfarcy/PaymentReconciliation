@@ -1,508 +1,260 @@
 # ReconFlow
 
-A payment reconciliation and exception resolution platform. ReconFlow compares a business's internal payment ledger against payment gateway settlements, surfaces the discrepancies, and tracks how each one was investigated and resolved.
+[![CI](https://github.com/kasalmanfarcy/PaymentReconciliation/actions/workflows/ci.yml/badge.svg)](https://github.com/kasalmanfarcy/PaymentReconciliation/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-> **Project status: security hardening done (M10).** Login is delegated to Keycloak over OIDC (ReconFlow only validates tokens and never sees a password), the application connects to PostgreSQL as a role that can't change the schema or rewrite the audit trail and to which row-level security finally applies, uploads are capped by the servlet container, uploads and runs are rate limited per user with an exact per-organization cap on queued jobs, logs are proven free of references, emails and raw rows by a canary test, and CI checks dependencies and secrets; every control is listed with its test in [docs/security.md](docs/security.md). Earlier: reliability and performance (M9). M9 proved the system survives what goes wrong and measured how fast it is: crash-at-any-point tests whose final state equals a clean run, in-process retries of transient database failures, a real `SIGKILL`/`SIGTERM` of the worker mid-import, separate liveness and readiness probes, Prometheus metrics on an internal port with a Grafana dashboard and alerts, archival of months older than 13, a timed restore drill, and benchmarks (50k × 50k reconciled in 6.5 s; read p95 21 ms under 100 users; a 500k import in 14 s under `-Xmx256m`) recorded in [docs/benchmarks.md](docs/benchmarks.md). Kafka was measured unnecessary ([ADR 0014](docs/adr/0014-no-kafka-in-v1.md)). Earlier: reporting (M8). On top of M2–M6 (profiles, error model, authentication (in-house JWT until M10.1), tenant resolution with PostgreSQL row-level security, a permission matrix, an append-only audit log, CSV ingestion through a PostgreSQL job queue, and a set-based matching engine that creates exception cases deduplicated by a deterministic discrepancy key): an exception workflow where investigators list, filter and open cases with both source records side by side, assign them, add append-only notes, and resolve them with a resolution code, and org admins reopen them with a reason. Every status change goes through one state machine that writes status history and an audit event in the same transaction; every update is guarded by optimistic locking (`ETag`/`If-Match`, `428` when missing, `409` when stale, proven by a two-writer race test); and admins can read any entity's audit timeline. Reporting (M8): one call answers "which match, which don't, why, who resolved them" for a run or a date range (overlapping runs never double count a day), plus import quality, exception ageing and a CSV export of a run's exceptions that streams small runs and hands large ones to a background job, escaped against spreadsheet formula injection; every report query's plan is checked at volume in the build. See [Roadmap](#roadmap).
+**A business's ledger says a payment arrived; the payment gateway's settlement file says something
+else.** ReconFlow imports both, matches them with deterministic rules, turns every disagreement into
+a case an investigator can work, and records who resolved what, and why, in an append-only audit
+trail. Multi-tenant, built as a Spring Boot modular monolith on PostgreSQL.
+
+> **Status: v1 complete (M0–M11).** Everything in [TASKS.md](TASKS.md) through M11 is built, tested
+> and documented, including a production deployment that has been rehearsed end to end on a laptop.
+> Not yet done, because each needs an account or a person: the live deployment, the GitHub
+> repository settings and a recorded demo GIF ([what's left](#whats-left-for-the-owner)).
+
+```text
+$ ./scripts/demo.sh
+▶ Uploading the gateway settlement file (22 rows, 2 of them malformed)
+  gateway: {"status":"COMPLETED_WITH_ERRORS","totalRows":22,"validRows":20,"errorRows":2}
+▶ Reconciling AED, 12-13 October 2026
+  matched: count 13, amount 13410.1400
+  amountMismatch: count 2, netDifference -500.0300
+  unmatchedLeft: count 2, amount 602.0000
+  ✓ summary identical to expected.json
+▶ Resolving DEMO-302 (ledger 2500.00, gateway 2000.00) as GATEWAY_FEE, with If-Match
+  ✓ resolved
+▶ The same resolve again with the old ETag: a concurrent edit must not win silently
+  HTTP 409 stale-version
+Demo complete: every number matched docs/samples/demo/expected.json.
+```
+<sub>An excerpt of a real run (trimmed). The full walkthrough also logs in three roles, lists the work queue, prints the report and the case's audit trail.</sub>
 
 ---
 
-## The problem
+## Quick start
 
-A single customer payment can appear in three systems that do not always agree:
+You need Docker (Docker Desktop, OrbStack or Colima), `curl`, `jq` and `openssl`. No Java, no Maven.
 
-- **Internal ledger** — the business records the order as paid.
-- **Payment gateway** — the provider records that it processed the payment.
-- **Bank / settlement account** — the money that actually arrived, possibly net of fees or on a later date.
+```bash
+git clone https://github.com/kasalmanfarcy/PaymentReconciliation.git && cd PaymentReconciliation
+./scripts/demo.sh
+```
 
-At scale, finance teams compare these sources in spreadsheets. ReconFlow replaces that with a deterministic, auditable matching process.
+The first run builds the image (a few minutes), starts PostgreSQL, MinIO, Keycloak and the app
+(`docker compose --profile full`), then walks the demo and checks every number. Run it again: the
+uploads are recognised as duplicates and the second run gives the same summary.
+`docker compose --profile full down -v` removes everything.
 
-### Worked example
+> **Colima:** export `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock` first, and install the
+> Buildx plugin the image build needs (`brew install docker-buildx`, then link it into
+> `~/.docker/cli-plugins`, as [Development](#development) shows).
 
-| Transaction | Internal ledger | Gateway file   | Result    |
-| ----------- | --------------- | -------------- | --------- |
-| TXN-101     | 1,000.00        | 1,000.00       | Matched   |
-| TXN-102     | 500.00          | Missing        | Unmatched |
-| TXN-103     | 750.00          | 700.00         | Mismatch  |
-| TXN-104     | 250.00          | 250.00 ×2      | Duplicate |
-| TXN-105     | 300.00          | 300.00         | Matched   |
+---
 
-*Illustrative data. Real matching also considers transaction type, currency, settlement date, fees, and provider file formats.*
+## What it does
 
 ReconFlow answers four questions:
 
-1. Which transactions match?
-2. Which are missing, duplicated, or inconsistent?
-3. Why did each discrepancy occur?
-4. Who investigated it, and how was it resolved?
+1. **Which transactions match?** Same normalized reference, transaction type, currency and amount.
+2. **Which don't?** Missing on either side, amount mismatches, duplicates, currency mismatches; never
+   a silent best guess.
+3. **Why?** Each discrepancy is a case with a type, a reason and both sides' records, raw and
+   normalized.
+4. **Who resolved it, and how?** Assignment, notes, resolution codes and reopening, all audited.
 
----
-
-## Architecture
-
-A **modular monolith**: one Spring Boot application with strictly separated modules, backed by PostgreSQL. This keeps transaction boundaries and business rules coherent while avoiding distributed-systems overhead before the domain logic is proven.
-
-```
-Browser / API client
-        │
-        ▼
-┌─────────────────────────────────────────────┐
-│ Spring Boot REST API                        │
-│ auth · authorization · request validation   │
-├─────────────────────────────────────────────┤
-│ Ingestion    │ Ledger     │ Reconciliation   │
-│ files/imports│ normalized │ matching engine  │
-│              │ records    │                  │
-├─────────────────────────────────────────────┤
-│ Exceptions   │ Reporting & audit            │
-│ workflow     │ history · accountability     │
-└─────────────────────────────────────────────┘
-        │
-        ▼
-   PostgreSQL
-   durable records · constraints · transactional consistency
-
-  Background jobs: PostgreSQL job table + worker processes (ADR 0004)
-  Later, only if measured: Kafka
-```
-
-### Processing pipeline
-
-| Stage | Responsibility |
-| ----- | -------------- |
-| 01 Ingestion | Import internal transactions and gateway/bank settlement files |
-| 02 Validation & normalization | Validate the file, standardize fields, detect duplicate imports |
-| 03 Reconciliation | Compare records using deterministic matching rules |
-| 04 Exception management | Create cases for missing, duplicated, and mismatched records |
-| 05 Investigation & resolution | Assign, investigate, resolve with reason and audit trail |
-| 06 Reporting & audit | Reconciliation results, financial totals, action history |
-
-v1 accepts **manual CSV uploads**. Scheduled imports, provider APIs, and event-driven processing come later.
-
----
-
-## Domain model
-
-| Entity | Purpose |
-| ------ | ------- |
-| `Organization` | Tenant boundary. Every business-owned row carries `organizationId`. |
-| `ImportBatch` | An uploaded CSV: source type, processing status, row counts, stored file reference. |
-| `TransactionRecord` | A normalized transaction from either source, preserving original values. |
-| `ReconciliationRun` | One matching execution over a defined period and source pair, with summary counts. |
-| `ReconciliationMatch` | Persistent link between a matched internal and gateway record. |
-| `ExceptionCase` | A discrepancy requiring review: type, status, assignee, resolution. |
-| `AuditEvent` | Append-only record of important actions and state changes. |
-
-Monetary values are `BigDecimal` in Java and `NUMERIC` in PostgreSQL — never `double` or `float`. Decimal precision, rounding, and scale are treated as part of the schema contract.
-
-### State machines
-
-| Entity | States |
-| ------ | ------ |
-| Import batch | `RECEIVED → PROCESSING → COMPLETED` (or `COMPLETED_WITH_ERRORS`, `FAILED`) |
-| Reconciliation run | `PENDING → RUNNING → COMPLETED` (or `FAILED`) |
-| Exception case | `OPEN → IN_REVIEW → RESOLVED` (reopen retains prior resolution history) |
-
-Valid transitions, required reasons, and authorization rules are defined in [reconciliation-rules.md §7](docs/reconciliation-rules.md#7-state-machines).
-
----
-
-## Reconciliation rules (v1 scope)
-
-Deterministic one-to-one matching on payment transactions:
-
-1. **Normalize** — standardize references, currency codes, timestamps, and statuses while retaining the raw imported values.
-2. **Exact reference match** — same normalized reference, compatible currency, matching transaction type.
-3. **Amount comparison** — matching references with differing amounts produce an `AMOUNT_MISMATCH`, never a silent match.
-4. **Unmatched detection** — a record present in only one source becomes an unmatched exception.
-5. **Duplicate detection** — repeated records within a file and repeated imports are flagged, not silently deduplicated.
-6. **Persist results** — matches, exceptions, and run summaries are written atomically.
-
-Explicitly **out of scope for v1**: one-to-many matching for aggregated settlements, refunds/chargebacks/fees as distinct flows, cross-currency matching, configurable settlement windows, fuzzy or probabilistic matching. The model leaves room for these; the engine does not attempt them yet.
-
----
-
-## Tech stack
-
-| Concern | Choice | Notes |
-| ------- | ------ | ----- |
-| Language | Java 25 | LTS |
-| Framework | Spring Boot 4.1.2 | Web MVC, validation, data JPA, security (OAuth2 resource server, Nimbus JWT), actuator; Spring Modulith 2.1 for module boundaries |
-| Database | PostgreSQL | `NUMERIC` for money, FK + unique constraints, transactional writes |
-| Migrations | Flyway | V1–V4 applied on startup (V4: row-level security); applied migrations are never edited |
-| Build | Maven (wrapper) | `./mvnw`, no system Maven required |
-| Testing | JUnit + Testcontainers | Unit tests (`*Test`) need no Docker; integration tests (`*IT`) start their own PostgreSQL 16 |
-| Quality gates | Spotless, JaCoCo, GitHub Actions | Palantir Java Format check, coverage reports (no threshold yet), `./mvnw verify` on every PR |
-| Async | PostgreSQL job table | Worker processes claim jobs with `SKIP LOCKED` ([ADR 0004](docs/adr/0004-postgresql-job-queue.md)); Kafka deliberately deferred |
-| Cache | Redis | Deliberately deferred; only if a concrete need appears |
-| Local infra | Docker Compose | PostgreSQL 16 and MinIO (S3-compatible), see `compose.yaml` |
-
----
-
-## Getting started
-
-### Prerequisites
-
-- **Java 25**: verify with `java -version`
-- No system Maven needed; use the bundled wrapper (`./mvnw`, executable)
-- **Docker** with Compose (Docker Desktop, OrbStack or Colima). It runs PostgreSQL 16 and MinIO
-  for local development and the Testcontainers database for integration tests. No locally
-  installed PostgreSQL is needed.
-
-> **Colima.** Docker and Testcontainers look for `/var/run/docker.sock`, which Colima doesn't
-> create. Export these (e.g. in your shell profile) before `docker compose` or `./mvnw verify`:
->
-> ```bash
-> export DOCKER_HOST=unix://$HOME/.colima/default/docker.sock
-> export TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock   # the path inside the Colima VM
-> ```
->
-> With Homebrew's standalone `docker-compose`, either run `docker-compose ...` or link it as a
-> CLI plugin so `docker compose` works:
-> `mkdir -p ~/.docker/cli-plugins && ln -sfn "$(brew --prefix)/opt/docker-compose/bin/docker-compose" ~/.docker/cli-plugins/docker-compose`.
-
-### Configure
-
-Credentials live in a gitignored `.env` in the project root, read by both Docker Compose and the
-`local` profile:
-
-```bash
-cp .env.example .env
-# optionally change the passwords (DB_*, S3_SECRET_KEY, KEYCLOAK_*)
-```
-
-The `local` profile imports it with `spring.config.import: optional:file:.env[.properties]`. Real
-environment variables take precedence over the file. No other profile reads `.env`: tests get
-their database from Testcontainers, and `prod` takes its database settings from the environment
-only and refuses to start, naming the variable, if one is missing.
-
-#### Database roles (M10.7)
-
-Three PostgreSQL roles, so row-level security and the append-only audit trail actually hold:
-
-| Role | Env vars | Used by | Can |
+| Reference | Internal ledger | Gateway file | Result |
 |---|---|---|---|
-| superuser | `DB_USER`, `DB_PASSWORD` | humans, emergencies, `scripts/*.sh` | everything |
-| `reconflow_migrator` | `DB_MIGRATOR_USER`, `DB_MIGRATOR_PASSWORD` | Flyway | owns the schema (DDL) |
-| `reconflow_app` | `DB_APP_USER`, `DB_APP_PASSWORD` | the application | read and write data, nothing else; RLS applies |
+| DEMO-001 | 1,250.00 AED | 1,250.00 AED | Matched |
+| ` demo-013 ` | 180.5 aed | DEMO-013, 180.50 AED | Matched (normalized) |
+| DEMO-101 | 560.00 | — | `MISSING_IN_GATEWAY` |
+| DEMO-302 | 2,500.00 | 2,000.00 | `AMOUNT_MISMATCH`, −500.00 |
+| DEMO-401 | 450.00 | 450.00 ×2 | `DUPLICATE_IN_SOURCE` |
+| DEMO-501 | 400.00 AED | 108.92 USD | `CURRENCY_MISMATCH` |
 
-`compose.yaml` creates the two roles when the PostgreSQL volume is first initialised
-(`infra/db/initdb/10-reconflow-roles.sh` runs `infra/db/bootstrap-roles.sql`). A volume created
-before M10.7 is never re-initialised; either recreate it (`docker compose down -v`, local data only)
-or run the script once by hand:
+From the [demo dataset](docs/samples/demo/README.md). The rules (normalization N1–N11, participation,
+ordered outcomes, discrepancy keys) are in [reconciliation-rules.md](docs/reconciliation-rules.md).
 
-```bash
-docker compose exec -T postgres psql -U "$DB_USER" -d paymentreconflow \
-  -v migrator_pw="$DB_MIGRATOR_PASSWORD" -v app_pw="$DB_APP_PASSWORD" -f - < infra/db/bootstrap-roles.sql
+---
+
+## Architecture at a glance
+
+```mermaid
+flowchart LR
+  user([Finance users]) -->|HTTPS, OIDC token| edge[Traefik<br/>TLS, body cap, per-IP limits]
+  edge --> api[ReconFlow api<br/>prod,api]
+  edge -->|login, tokens| kc[Keycloak]
+  api -->|JWKS, Admin API| kc
+  api --> pg[(PostgreSQL 16<br/>data, job queue, audit)]
+  worker[ReconFlow worker<br/>prod,worker] --> pg
+  api --> s3[(S3 bucket<br/>original CSVs)]
+  worker --> s3
+  migrate[migrate<br/>once per deploy] -->|DDL as reconflow_migrator| pg
 ```
 
-It also hands every existing object to `reconflow_migrator`. Any other environment runs the same
-script once, as a superuser, before the first deploy.
+One jar, three roles chosen by profile. The api accepts uploads and run requests with `202 Accepted`
+and writes jobs to a PostgreSQL table; workers claim them with `FOR UPDATE SKIP LOCKED`, leases and
+heartbeats. Inside, nine modules (`ingestion`, `ledger`, `reconciliation`, `exceptions`, `reporting`,
+`audit`, `organization`, `security`, `shared`) with boundaries enforced by Spring Modulith.
+Details: [docs/architecture.md](docs/architecture.md).
 
-### Start the dependencies
+---
+
+## Engineering highlights
+
+Each claim links to the code or test that proves it.
+
+- **Idempotent everywhere.** A re-uploaded file is `409` by a SHA-256 unique constraint
+  ([ADR 0005](docs/adr/0005-duplicate-import-policy.md), [DuplicateImportIT](src/test/java/com/reconflow/paymentreconflow/ingestion/DuplicateImportIT.java));
+  a repeated run request returns the same run ([ADR 0006](docs/adr/0006-reconciliation-run-idempotency.md));
+  a re-run never duplicates an active case ([RerunIT](src/test/java/com/reconflow/paymentreconflow/reconciliation/RerunIT.java)).
+  A property test checks every record ends up in exactly one place
+  ([EveryRecordInExactlyOnePlaceIT](src/test/java/com/reconflow/paymentreconflow/reconciliation/EveryRecordInExactlyOnePlaceIT.java)).
+- **Set-based matching in SQL**, orchestrated from Java a day at a time with a checkpoint
+  ([ADR 0012](docs/adr/0012-set-based-matching-in-sql.md), [classify_groups.sql](src/main/resources/sql/reconciliation/classify_groups.sql)):
+  50,000 × 50,000 records reconciled in **6.5 s** (median of 3, [benchmarks §2.3](docs/benchmarks.md)).
+- **Streaming imports** in 5,000-row transactions with a resume checkpoint: 500,000 rows in **14 s**
+  under a 256 MB heap ([benchmarks §2.5](docs/benchmarks.md)).
+- **Optimistic locking** on cases with `ETag`/`If-Match` (`428` when missing, `409` when stale): 50
+  users resolving the same 10 cases got exactly 10 × `200` and 40 × `409`
+  ([benchmarks §3, S6](docs/benchmarks.md), [ExceptionConcurrencyIT](src/test/java/com/reconflow/paymentreconflow/exceptions/ExceptionConcurrencyIT.java)).
+- **Tenant isolation in three layers:** membership check per request, `organization_id` in every
+  query, PostgreSQL row-level security for an application role that can't bypass it
+  ([ADR 0008](docs/adr/0008-tenant-isolation.md), [CrossTenantIT](src/test/java/com/reconflow/paymentreconflow/tenancy/CrossTenantIT.java),
+  [AppRolePrivilegesIT](src/test/java/com/reconflow/paymentreconflow/tenancy/AppRolePrivilegesIT.java)).
+- **Transactional, append-only audit:** written in the caller's transaction, protected by triggers
+  and revoked privileges ([AuditAppendOnlyIT](src/test/java/com/reconflow/paymentreconflow/audit/AuditAppendOnlyIT.java)).
+- **A PostgreSQL job queue that survives crashes:** leases, heartbeats, a sweeper, backoff; a real
+  `SIGKILL` mid-import resumes from its checkpoint with no row twice
+  ([ADR 0004](docs/adr/0004-postgresql-job-queue.md), [FailureInjectionIT](src/test/java/com/reconflow/paymentreconflow/reliability/FailureInjectionIT.java),
+  [benchmarks §4](docs/benchmarks.md)). Kafka was measured unnecessary ([ADR 0014](docs/adr/0014-no-kafka-in-v1.md)).
+- **Delegated authentication:** built in-house first to learn it, then moved to Keycloak over OIDC
+  with changes confined to the security package ([ADR 0015](docs/adr/0015-delegate-authentication-to-keycloak.md)).
+- **Shipped like production:** non-root layered image, migrations as their own deploy step with their
+  own credentials, a TLS edge with body caps and per-IP limits ([runbook](docs/runbooks/deploy.md));
+  every control and its test in [docs/security.md](docs/security.md).
+
+---
+
+## API
+
+- **Contract:** [docs/openapi.json](docs/openapi.json), generated from the controllers and checked
+  in CI against the code and [api-design.md](docs/api-design.md) (`OpenApiSpecIT`).
+- **Swagger UI:** `http://localhost:8080/swagger-ui.html` when the app runs with the `local` profile
+  ([Development](#development)); off in `prod`.
+- **Walkthrough as requests:** the [Bruno collection](bruno/) (`npx @usebruno/cli@4.2.1 run --env local
+  --env-var demoPassword=reconflow-local-demo` from `bruno/`).
+
+Uploads and runs are asynchronous (`202` and a `Location` to poll); errors are RFC 9457 problem
+details with a stable `code` and the `requestId`; lists paginate (`page`, `size` ≤ 200). The endpoint
+index with permissions is [api-design.md §8.1](docs/api-design.md#81-index).
+
+---
+
+## Development
+
+**Prerequisites:** Java 25, Docker with Compose and Buildx. No Maven (`./mvnw`).
 
 ```bash
-docker compose up -d
-docker compose ps        # postgres, minio and keycloak "healthy"; minio-init exited (0)
-```
-
-PostgreSQL listens on `localhost:5432` (change `DB_PORT` and `DB_URL` if that's taken), the MinIO
-S3 API on `localhost:9000` and its console on `http://localhost:9001` (log in with `S3_ACCESS_KEY` /
-`S3_SECRET_KEY`; bucket `reconflow-imports`). Data persists in named volumes;
-`docker compose down -v` wipes it. Keycloak (M10.1) listens on `http://localhost:8180`; its admin
-console logs in as `admin` / `KEYCLOAK_ADMIN_PASSWORD`, and the `reconflow` realm is imported from
-`infra/keycloak/realm-reconflow.json` on first start.
-
-### Run
-
-```bash
+cp .env.example .env                 # local, clearly fake credentials
+docker compose up -d                 # PostgreSQL 16, MinIO, Keycloak (realm imported from git)
 SPRING_PROFILES_ACTIVE=local,api,worker ./mvnw spring-boot:run
 ```
 
-Flyway applies `V1`–`V12` on first startup (`V7`/`V8` are M8's report support, `V9` M9.16's archive manifest, `V10` the application role's grants, `V11` the pending-job index, `V12` the Keycloak link column) (`V5` is M6's engine support: summary columns, `exception_case_run`, `uuid_generate_v7()`, the reference index and the one-active-run-per-scope index; `V6` makes exception notes and status history append-only with triggers). Hibernate runs in `validate` mode, so a mismatch between
-the entities and the schema fails the boot rather than silently altering it.
-
-| Profile | Kind | Effect |
-|---|---|---|
-| `local` | Environment | Reads `.env`, readable logs with the request ID, DEBUG SQL, full health details |
-| `prod` | Environment | Secrets from environment variables only, JSON (ECS) logs |
-| `test` | Environment | Used by the tests (Testcontainers); lives in `src/test/resources` |
-| `api` | Role | Serves HTTP traffic |
-| `worker` | Role | Turns on the job worker (`reconflow.jobs.worker.enabled`) and scheduled jobs (lease sweeper with a startup sweep, orphaned-work check, job retention, metric gauges, partition maintenance at startup and 02:15 UTC, monthly archival, orphan-file sweeper) |
-
-There is deliberately no default profile. Locally one process runs both roles.
-
-Actuator lives on the management port 8081 in `local` and `prod` (M9.10): probes at
-`/actuator/health/liveness` and `/readiness`, metrics at `/actuator/prometheus`, which the public
-port refuses.
+On **Colima**, Docker and Testcontainers need to be told where the socket is, and the image build
+needs the Buildx plugin:
 
 ```bash
-curl -s localhost:8081/actuator/health        # {"status":"UP",...}
-curl -si localhost:8080/api/v1/members        # 401, application/problem+json, X-Request-Id
+export DOCKER_HOST=unix://$HOME/.colima/default/docker.sock
+export TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock
+brew install docker-buildx docker-compose
+mkdir -p ~/.docker/cli-plugins
+ln -sfn "$(brew --prefix)/opt/docker-buildx/bin/docker-buildx" ~/.docker/cli-plugins/docker-buildx
+ln -sfn "$(brew --prefix)/opt/docker-compose/bin/docker-compose" ~/.docker/cli-plugins/docker-compose
 ```
 
-Errors are RFC 9457 Problem Details with `code` and `requestId`
-([api-design.md §3](docs/api-design.md#3-error-model)).
-
-### Log in (local)
-
-Login is Keycloak's (M10.1): ReconFlow validates its tokens and never sees a password. The local
-realm holds the demo accounts below, all with the documented demo password `reconflow-local-demo`
-(local realm only, never a deployed one), and the `local` profile seeds the matching ReconFlow side
-(organizations, memberships, users linked by Keycloak id) on first start. The `reconflow-demo` client
-allows the password grant so curl and the scripts can get a token; a browser UI would use
-`reconflow-web` (authorization code with PKCE). Tokens last 15 minutes.
-
-| Account | Organization(s) and role |
-|---|---|
-| `admin@acme.test`, `investigator@acme.test`, `uploader@acme.test`, `viewer@acme.test` | Acme Payments (`0193b9e2-7c41-7a10-8d2e-5f6a7b8c9d0e`), one role each |
-| `admin@globex.test`, `investigator@globex.test`, `uploader@globex.test`, `viewer@globex.test` | Globex Retail (`0193b9e2-7c41-7a10-8d2e-5f6a7b8c9d0f`), one role each |
-| `consultant@both.test` | Investigator at Acme, viewer at Globex: must send `X-Organization-Id` |
-| `platform@reconflow.test` | Platform admin: manages organizations, sees no tenant data |
+**Log in (local).** Keycloak issues every token; ReconFlow only validates them. The local realm has
+demo accounts with the documented password `reconflow-local-demo` (local only):
+`admin|investigator|uploader|viewer@acme.test` (Acme Payments) and `@globex.test` (Globex Retail),
+`consultant@both.test` (in both: send `X-Organization-Id`) and `platform@reconflow.test`.
 
 ```bash
-TOKEN=$(curl -s localhost:8180/realms/reconflow/protocol/openid-connect/token \
-  -d grant_type=password -d client_id=reconflow-demo -d username=admin@acme.test -d password=reconflow-local-demo | jq -r .access_token)
+TOKEN=$(curl -s localhost:8180/realms/reconflow/protocol/openid-connect/token -d grant_type=password \
+  -d client_id=reconflow-demo -d username=admin@acme.test -d password=reconflow-local-demo | jq -r .access_token)
 curl -s localhost:8080/api/v1/members -H "Authorization: Bearer $TOKEN" | jq
 ```
 
-### Import a file (local)
-
-Uploads are asynchronous: `202 Accepted` with the batch and a `Location` to poll; the worker (the
-`worker` role, on in this local setup) processes the file in the background.
+**Test.**
 
 ```bash
-TOKEN=$(curl -s localhost:8180/realms/reconflow/protocol/openid-connect/token \
-  -d grant_type=password -d client_id=reconflow-demo -d username=uploader@acme.test -d password=reconflow-local-demo | jq -r .access_token)
-curl -s localhost:8080/api/v1/imports -H "Authorization: Bearer $TOKEN" \
-  -F file=@docs/samples/ledger-basic.csv --form-string sourceType=INTERNAL_LEDGER | jq
-curl -s localhost:8080/api/v1/imports -H "Authorization: Bearer $TOKEN" \
-  -F file=@docs/samples/gateway-basic.csv --form-string sourceType=GATEWAY | jq
-curl -s localhost:8080/api/v1/imports -H "Authorization: Bearer $TOKEN" | jq '.content[] | {fileName, status, totalRows, validRows, errorRows}'
-curl -s "localhost:8080/api/v1/transactions?transactionDateFrom=2026-10-01&transactionDateTo=2026-10-31&reference=pay-104" \
-  -H "Authorization: Bearer $TOKEN" | jq
+./mvnw test           # unit tests (*Test), no Docker
+./mvnw verify         # + integration tests (*IT, Testcontainers PostgreSQL, MinIO, Keycloak), Spotless, JaCoCo
+./mvnw spotless:apply # format before committing
 ```
 
-Uploading the same file again is `409 duplicate-file` with `existingBatchId`; `ledger-malformed.csv`
-shows row errors at `GET /api/v1/imports/{id}/errors`. [docs/samples/README.md](docs/samples/README.md)
-says what every sample produces.
+**Profiles.** Environment: `local` (reads `.env`, readable logs, migrates on startup), `prod`
+(environment variables only, JSON logs, validates the schema instead of migrating), `test`. Role:
+`api`, `worker`, `migrate` (applies migrations and exits). `demo` seeds the demo organizations under
+`prod` config. There is deliberately no default profile.
 
-### Reconcile (local)
+**Database roles.** The app connects as `reconflow_app` (data only; row-level security applies),
+Flyway as `reconflow_migrator` (owns the schema); the superuser is for humans
+([bootstrap-roles.sql](infra/db/bootstrap-roles.sql)). Compose creates both on first start; an older
+volume needs `docker compose down -v` or the script run once by hand.
 
-With both basic files imported, start a run as a user with `RUN_CREATE` (an investigator, uploader
-or org admin). It is asynchronous too: `202 Accepted`, then poll until `COMPLETED`.
+**Observe and measure.** `docker compose --profile observability up -d` adds Prometheus (`:9090`) and
+Grafana (`:3000`, provisioned dashboard and alerts); the app's metrics are on the management port
+8081, never the public one. Benchmarks, load scenarios and chaos scripts: [docs/benchmarks.md](docs/benchmarks.md).
 
-```bash
-TOKEN=$(curl -s localhost:8180/realms/reconflow/protocol/openid-connect/token \
-  -d grant_type=password -d client_id=reconflow-demo -d username=investigator@acme.test -d password=reconflow-local-demo | jq -r .access_token)
-RUN=$(curl -s localhost:8080/api/v1/reconciliation-runs -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' -H 'Idempotency-Key: demo-oct-1' \
-  -d '{"periodStart":"2026-10-01","periodEnd":"2026-10-02","currency":"AED"}' | jq -r .id)
-curl -s localhost:8080/api/v1/reconciliation-runs/$RUN -H "Authorization: Bearer $TOKEN" | jq '{status, summary}'
-curl -s localhost:8080/api/v1/reconciliation-runs/$RUN/matches -H "Authorization: Bearer $TOKEN" | jq '.content[] | {ledger: .ledger.reference, gateway: .gateway.reference}'
-```
+**Deploy.** One VM with Docker Compose behind Traefik, a managed PostgreSQL 16 and an S3 bucket; CI
+pushes `ghcr.io/kasalmanfarcy/reconflow:sha-<commit>` from `main`. Rehearse it locally with no
+account: [docs/runbooks/deploy.md](docs/runbooks/deploy.md) §9.
 
-Repeating the same request returns the same run (`200`); a fresh `Idempotency-Key` re-runs the period
-without duplicating active exception cases. The expected summary is in
-[docs/samples/README.md §1](docs/samples/README.md#1-ledger-basiccsv--gateway-basiccsv).
+---
 
-Then work the PAY-103 case (ledger 750.00, gateway 700.00). Every update sends the `ETag` it last
-saw as `If-Match`; a stale one gets `409 stale-version`, a missing one `428`.
+## Project docs
 
-```bash
-CASE=$(curl -s "localhost:8080/api/v1/exceptions?type=AMOUNT_MISMATCH" -H "Authorization: Bearer $TOKEN" \
-  | jq -r '.content[] | select(.reference=="PAY-103") | .id')
-curl -s -X PATCH localhost:8080/api/v1/exceptions/$CASE -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/merge-patch+json' -H 'If-Match: "0"' \
-  -d '{"status":"IN_REVIEW"}' | jq '{status, version}'
-curl -s localhost:8080/api/v1/exceptions/$CASE/notes -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' -d '{"body":"Gateway confirms a 50 AED fee, ticket GW-8812"}'
-curl -s localhost:8080/api/v1/exceptions/$CASE/resolve -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' -H 'If-Match: "1"' -d '{"resolutionCode":"GATEWAY_FEE"}' \
-  | jq '{status, resolution, history}'
-```
-
-`{"assignedTo": "<user id>"}` (or `null`) in the same PATCH assigns the case. An org admin can then reopen it (`POST .../reopen` with `If-Match: "2"` and a `reason`) and read
-the whole trail with `GET /api/v1/audit-events?entityType=EXCEPTION_CASE&entityId=$CASE`.
-
-Access tokens last 15 minutes; Keycloak rotates refresh tokens and locks an account for 15 minutes
-after 5 failed passwords. Users never sign up: an org admin creates them (`POST /api/v1/members`),
-which creates the Keycloak account with a temporary password that must be changed at first login.
-Design: [ADR 0015](docs/adr/0015-delegate-authentication-to-keycloak.md) (which supersedes the
-in-house design of [ADR 0013](docs/adr/0013-build-authentication-in-house.md)).
-
-### Configure a non-local environment
-
-| Variable | Purpose |
+| Document | Contents |
 |---|---|
-| `DB_URL`, `DB_APP_USER`, `DB_APP_PASSWORD` | The application's database role (`reconflow_app`, M10.7) |
-| `DB_MIGRATOR_USER`, `DB_MIGRATOR_PASSWORD` | Flyway's role (`reconflow_migrator`); moves to a separate migrate step in M11.5 |
-| `OIDC_ISSUER_URI` | Keycloak realm URL, exactly as it appears in the tokens' `iss`, e.g. `https://id.example.com/realms/reconflow` |
-| `KEYCLOAK_BASE_URL`, `KEYCLOAK_ADMIN_CLIENT_SECRET` | Keycloak's Admin API (user management), as the `reconflow-admin` service account |
-| `RECONFLOW_BOOTSTRAP_ADMIN_EMAIL` | One-time: if set and no platform admin exists, makes that email the platform admin. Create the account in Keycloak with the email marked verified; its first login links it. No password is generated or logged |
-
-`prod` refuses to start, naming the variable, if any of these is missing. A deployed realm must not
-enable the password grant (`reconflow-demo` is local only) and runs Keycloak with `start`, its own
-database and TLS (M11).
-
-Every security control, the threat it addresses and the test that proves it:
-[docs/security.md](docs/security.md).
-
-`./mvnw spring-boot:test-run` runs the application against a Testcontainers PostgreSQL instead of
-Compose.
-
-### Observe and benchmark (local)
-
-```bash
-docker compose --profile observability up -d    # Prometheus :9090, Grafana :3000 (GRAFANA_ADMIN_PASSWORD; on Colima HOST_GATEWAY=192.168.5.2)
-python3 scripts/generate_dataset.py --preset 50k --out target/datasets/50k
-scripts/bench_import.sh target/datasets/50k 3   # import + reconcile, checked against expected.json
-k6 run -e ORG=<org> -e RUN=<run> perf/k6/s1-steady-browsing.js
-```
-
-Load scenarios, chaos (`scripts/chaos_kill.sh`), background data (`scripts/preload.sh`) and the
-restore drill (`scripts/restore_drill.sh`) are described in [docs/benchmarks.md](docs/benchmarks.md)
-and [docs/runbooks](docs/runbooks). All of them talk only to local containers.
-
-### Test
-
-```bash
-./mvnw test       # unit tests only (*Test): fast, no Docker
-./mvnw verify     # everything: unit + integration tests (*IT, Testcontainers), Spotless check, JaCoCo
-./mvnw spotless:apply   # format the code before committing
-```
-
-Integration tests need Docker but no local database and no `.env`: they start
-`postgres:16.4-alpine` and MinIO (`pgsty/minio`, the compose image), share one set of containers
-per run, and Flyway applies the migrations. The job queue runs synchronously in tests
-(`JobRunner.runAllQueued`), with 100-row chunks so small files span several commits.
-`UploadSizeLimitIT` is the one IT that starts its own context (a real Tomcat port).
-Coverage reports land in `target/site/jacoco/` (unit) and `target/site/jacoco-it/` (integration).
-CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `./mvnw verify` on every pull
-request.
+| [requirements.md](docs/requirements.md) | Problem, personas, functional and non-functional requirements, CSV contracts |
+| [reconciliation-rules.md](docs/reconciliation-rules.md) | Normalization, matching, outcomes, discrepancy keys, state machines |
+| [architecture.md](docs/architecture.md) | Context, containers, modules, flows, data model, deployment |
+| [database-design.md](docs/database-design.md) | Tables, constraints, partitioning, tenancy, migrations |
+| [api-design.md](docs/api-design.md) | Conventions, error catalogue, idempotency, concurrency, endpoints |
+| [security.md](docs/security.md) | Every security control, its threat, enforcement and proof |
+| [scalability.md](docs/scalability.md) | Capacity plan and SLOs |
+| [benchmarks.md](docs/benchmarks.md) | Measured numbers only |
+| [adr/](docs/adr/) | 15 Architecture Decision Records |
+| [runbooks/](docs/runbooks/) | Deploy, restore drill, archival, default partition |
+| [plans/](plans/README.md) | How each phase was built, and where the code differs from the plan |
 
 ---
 
 ## Roadmap
 
-| # | Milestone | Status |
-| - | --------- | ------ |
-| M0 | Repository hygiene: license, conventions, protected `main` | In progress |
-| M1 | Requirements and system design: docs, ADRs, sample data | Done |
-| M2 | Project foundation: profiles, error model, logging, CI | Done |
-| M3 | Organizations, users, authentication, tenant isolation | Done |
-| M4 | Append-only audit | Done |
-| M5 | Transaction ingestion: CSV upload, job queue, validation | Done |
-| M6 | Reconciliation engine: matching, idempotent runs | Done |
-| M7 | Exception management: workflow, optimistic locking | Done |
-| M8 | Reporting and export | Done |
-| M9 | Reliability and performance | Done |
-| M10 | Security hardening | Done |
-| M11 | Deployment and portfolio | Not started |
+| Phase | Scope | Status |
+|---|---|---|
+| M0–M2 | Repository, requirements and design, project foundation | Done |
+| M3–M4 | Organizations, users, tenant isolation; append-only audit | Done |
+| M5–M8 | Ingestion, reconciliation engine, exception workflow, reporting | Done |
+| M9 | Reliability and performance (recovery, benchmarks, metrics) | Done |
+| M10 | Security hardening (Keycloak, DB roles, scanning, rate limits) | Done |
+| M11 | Deployment and portfolio | Done (live deployment: owner step) |
+| v2 | Many-to-one matching, fees, bank statements, a web UI, … | [Planned](plans/phase-v2-later-scope.plan) |
 
-[TASKS.md](TASKS.md) lists every task; [plans/](plans/README.md) explains how each phase is built.
+### What's left for the owner
 
-### API so far
+These need an account, a machine or a person, so they were prepared but not done:
 
-| Endpoint | Purpose |
-| -------- | ------- |
-| (Keycloak) `POST /realms/reconflow/protocol/openid-connect/token` | Tokens; login, refresh, logout and password changes are Keycloak's since M10.1 |
-| `GET/POST /api/v1/members`, `PATCH /api/v1/members/{userId}`, `POST …/reset-password`, `POST …/disable` | Member management (`MEMBER_MANAGE`) |
-| `GET/POST /api/v1/platform/organizations` | Organizations (platform admins only) |
-| `POST /api/v1/imports` | Upload a ledger or gateway CSV (multipart); `202` with the batch (`IMPORT_CREATE`) |
-| `GET /api/v1/imports`, `GET /api/v1/imports/{id}` | List imports; one import's status and counts, `Retry-After` while running (`IMPORT_READ`) |
-| `GET /api/v1/imports/{id}/errors` | Row errors with row, column, code and raw row, paginated (`IMPORT_READ`) |
-| `POST /api/v1/imports/{id}/retry` | Reprocess a `FAILED` import from scratch, with a reason (`IMPORT_CREATE`) |
-| `GET /api/v1/transactions` | Search normalized records by date range, source, reference, currency, batch; a slice (`TRANSACTION_READ`) |
-| `POST /api/v1/reconciliation-runs` | Request a run for a period, currency and sources; `202` new, `200` repeat, `Idempotency-Key` optional (`RUN_CREATE`) |
-| `GET /api/v1/reconciliation-runs`, `GET /api/v1/reconciliation-runs/{id}` | List runs; one run's status, progress and summary (`RUN_READ`) |
-| `GET /api/v1/reconciliation-runs/{id}/matches` | A run's matches, both records side by side, paginated (`RUN_READ`) |
-| `POST /api/v1/reconciliation-runs/{id}/retry` | Resume a `FAILED` run from its checkpoint, with a reason (`RUN_CREATE`) |
-
-| `GET /api/v1/exceptions` | The work queue: filter by `type`, `status` (default `OPEN`, `IN_REVIEW`), `assignedTo` (`me`, `unassigned` or a user id), `runId`, `createdFrom`/`createdTo`, `amountMin`/`amountMax`; paginated (`EXCEPTION_READ`) |
-| `GET /api/v1/exceptions/{id}` | One case: both sides' records (raw and normalized), runs, notes, status history, `ETag` (`EXCEPTION_READ`) |
-| `PATCH /api/v1/exceptions/{id}` | Assign/unassign and move between `OPEN` and `IN_REVIEW`; `application/merge-patch+json`, `If-Match` required (`EXCEPTION_UPDATE`) |
-| `POST /api/v1/exceptions/{id}/notes` | Add an append-only investigation note (`EXCEPTION_UPDATE`) |
-| `POST /api/v1/exceptions/{id}/resolve` | Resolve with a resolution code (and a note where required), `If-Match` (`EXCEPTION_RESOLVE`) |
-| `POST /api/v1/exceptions/{id}/reopen` | Reopen a resolved case with a reason, `If-Match`, org admins only (`EXCEPTION_REOPEN`) |
-| `GET /api/v1/audit-events?entityType=&entityId=` | One entity's audit timeline (`AUDIT_READ`) |
-
-Permissions per endpoint: [api-design.md §8.1](docs/api-design.md#81-index) and §9.
-
-### Planned API surface
-
-| Endpoint | Purpose |
-| -------- | ------- |
-| `GET /api/v1/reports/reconciliation` | Summary metrics by run or date range |
-| `GET /api/v1/reports/import-quality`, `/exception-ageing` | File quality, case ageing |
-| `GET /api/v1/reports/exceptions/export` | A run's exceptions as CSV |
-
-Build order is ingestion → reconciliation → exceptions. Not every endpoint is required for the first working version.
+- **Deploy** to a VM with a managed PostgreSQL and a bucket: [runbook](docs/runbooks/deploy.md) §2–§4,
+  then switch on the [deploy workflow](.github/workflows/deploy.yml).
+- **GitHub settings:** Dependabot, secret scanning and push protection, required checks
+  (`build`, `image`, `dependency-review`, `gitleaks`), `NVD_API_KEY` ([security.md §3](docs/security.md#3-steps-that-live-outside-the-repository)),
+  and making the GHCR package public after the first push.
+- **A demo GIF** for this page: `asciinema rec` of `./scripts/demo.sh`, converted with `agg`
+  (TASKS.md M11.12).
 
 ---
 
-## Design principles
-
-- **Correctness over coverage.** Deterministic rules and explicit mismatch outcomes beat clever heuristics that silently mis-match.
-- **Idempotency everywhere.** Re-uploading a file or re-running reconciliation must not create duplicate financial records, matches, or active exceptions.
-- **Tenant isolation is enforced server-side.** A user from one organization must never read another's records by guessing an ID; hiding rows in a UI is not access control.
-- **Audit is append-only.** Important state changes produce immutable events — who acted, on what, when, and why.
-- **No speculative infrastructure.** Kafka, Redis, and microservices are added only when a measured need justifies them.
-- **Failures are first-class.** Partial imports expose per-row errors; crashed jobs resume or reprocess safely; concurrent edits return a conflict rather than silently overwriting.
-
-## Design decisions
-
-| Question | Decision |
-|---|---|
-| Duplicate imports | [ADR 0005](docs/adr/0005-duplicate-import-policy.md) |
-| Reconciliation-run idempotency | [ADR 0006](docs/adr/0006-reconciliation-run-idempotency.md) |
-| Sync vs async processing | [ADR 0003](docs/adr/0003-asynchronous-imports-and-runs.md) |
-| Concurrency on exceptions | [ADR 0007](docs/adr/0007-optimistic-locking-on-exceptions.md) |
-| Tenant enforcement | [ADR 0008](docs/adr/0008-tenant-isolation.md) |
-| Building authentication in-house | [ADR 0013](docs/adr/0013-build-authentication-in-house.md) |
-| Currencies per run | [ADR 0009](docs/adr/0009-run-pinned-to-one-currency.md) |
-
-All decisions: [docs/adr/](docs/adr/).
-
----
-
-## Repository layout
-
-```
-paymentreconflow/
-├── docs/                 # scalability plan; requirements, architecture, API, rules (M1)
-├── plans/                # how each phase is built, and why
-├── src/main/java/com/reconflow/paymentreconflow/
-│   ├── PaymentreconflowApplication.java
-│   ├── organization/ security/ ingestion/ ledger/        # one package per module,
-│   ├── reconciliation/ exceptions/ reporting/ audit/     # boundaries checked by ModularityTest
-│   └── shared/           # ids, json, error, web, config, jobs
-├── src/main/resources/
-│   ├── application.yml   # shared defaults; application-<profile>.yml overlays
-│   └── db/migration/     # Flyway V1–V4
-├── src/test/java/...     # *Test unit tests, *IT Testcontainers integration tests
-├── compose.yaml          # local PostgreSQL 16 and MinIO
-├── .github/workflows/    # CI
-├── projectoverview.md    # full system design brief
-├── TASKS.md              # every task, M0–M11
-├── CONTRIBUTING.md       # branch, commit and PR conventions
-├── LICENSE               # Apache-2.0
-├── pom.xml
-└── README.md
-```
-
----
-
-## Documentation
-
-| Document | Contents |
-| -------- | -------- |
-| [requirements.md](docs/requirements.md) | Problem statement, personas, functional and non-functional requirements, scope, assumptions, CSV contracts |
-| [reconciliation-rules.md](docs/reconciliation-rules.md) | Normalization, participation, match key, ordered outcomes, exception types and codes, discrepancy keys, state machines, money handling |
-| [architecture.md](docs/architecture.md) | Context and containers, modules and table ownership, allowed dependencies, request flows, background processing |
-| [database-design.md](docs/database-design.md) | Conventions, ERD, tables, the constraints that enforce correctness, partitioning, tenancy, migration policy |
-| [api-design.md](docs/api-design.md) | Conventions, error model and catalogue, pagination, idempotency, concurrency, status codes, endpoint reference |
-| [scalability.md](docs/scalability.md) | Capacity plan for 1,000 users, SLOs, load-test scenarios |
-| [samples/](docs/samples/README.md) | Sample CSVs and the expected outcome of every row |
-| [adr/](docs/adr/) | Architecture Decision Records |
-
-`projectoverview.md` holds the original design brief and remains the source of intent.
+[TASKS.md](TASKS.md) lists every task · [CONTRIBUTING.md](CONTRIBUTING.md) the conventions ·
+Apache-2.0 [LICENSE](LICENSE)

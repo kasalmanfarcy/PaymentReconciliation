@@ -61,3 +61,89 @@ jobs:
             target/site/jacoco/
             target/site/jacoco-it/
           retention-days: 7
+
+  # M11.1/M11.3: on every PR and push, after the tests pass: build the production image, check it
+  # runs as the non-root uid, and scan it. Nothing is pushed here, so it needs no write permission
+  # (a PR from a fork can run it safely).
+  image:
+    name: image
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@v5
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build the image (not pushed)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: reconflow:ci
+          # Shared with publish-image below, so the push rebuilds nothing.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Runs as uid 10001, not root
+        run: test "$(docker run --rm --entrypoint id reconflow:ci -u)" = "10001"
+
+      - name: Scan the image (Trivy)
+        # The CLI from its pinned image, as secret-scan.yml runs gitleaks: only the vulnerability
+        # database is downloaded. Fails on a HIGH or CRITICAL finding that has a fix available.
+        run: |
+          docker save reconflow:ci -o "$RUNNER_TEMP/image.tar"
+          docker run --rm -v "$RUNNER_TEMP:/work" aquasec/trivy:0.76.2 image \
+            --input /work/image.tar --scanners vuln \
+            --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1
+
+  # M11.3: every merge to main ships exactly what CI tested, identified by an immutable tag:
+  # ghcr.io/kasalmanfarcy/reconflow:sha-<40 hex>, plus a moving `main`. A red build or a failed image
+  # check publishes nothing (needs). Deploys use the SHA tag (docs/runbooks/deploy.md).
+  publish-image:
+    name: publish-image
+    needs: [build, image]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write   # GITHUB_TOKEN can push to this repository's GHCR packages; no personal token
+    steps:
+      - name: Check out
+        uses: actions/checkout@v5
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # Written out in lowercase: the repository name has capitals and GHCR refuses them.
+          images: ghcr.io/kasalmanfarcy/reconflow
+          tags: |
+            type=sha,format=long
+            type=raw,value=main
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          # BuildKit attaches build provenance and an SBOM to the pushed image as attestations.
+          provenance: mode=max
+          sbom: true

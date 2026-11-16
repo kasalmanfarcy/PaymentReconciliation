@@ -1,8 +1,13 @@
 package com.reconflow.paymentreconflow;
 
+import static com.tngtech.archunit.core.domain.JavaCall.Predicates.target;
+import static com.tngtech.archunit.core.domain.JavaClass.Predicates.type;
+import static com.tngtech.archunit.core.domain.properties.HasName.Predicates.name;
+import static com.tngtech.archunit.core.domain.properties.HasOwner.Predicates.With.owner;
 import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.methods;
 import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noClasses;
 
+import com.reconflow.paymentreconflow.reconciliation.domain.ReconciliationRun;
 import com.reconflow.paymentreconflow.shared.context.RequiresPermission;
 import com.tngtech.archunit.core.domain.JavaClasses;
 import com.tngtech.archunit.core.importer.ClassFileImporter;
@@ -107,6 +112,23 @@ class ArchitectureRulesTest {
                 .beAnnotatedWith(RequiresPermission.class)
                 .orShould()
                 .beAnnotatedWith(PreAuthorize.class)
+                .check(classes);
+    }
+
+    @Test
+    void onlyRunLifecycleChangesARunsStatus() {
+        // M6.10: one class, one table of allowed transitions, one place that audits. Scattered
+        // status changes are how a run ends up COMPLETED with a failure reason.
+        noClasses()
+                .that()
+                .doNotHaveFullyQualifiedName(ROOT + ".reconciliation.application.RunLifecycle")
+                .and()
+                .doNotHaveFullyQualifiedName(ROOT + ".reconciliation.domain.ReconciliationRun")
+                .should()
+                .callMethodWhere(target(name("transitionTo"))
+                        .or(target(name("complete")))
+                        .or(target(name("fail")))
+                        .and(target(owner(type(ReconciliationRun.class)))))
                 .check(classes);
     }
 }

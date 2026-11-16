@@ -8,33 +8,37 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
+import org.springframework.security.config.Customizer;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
 import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.core.userdetails.UserDetailsService;
 import org.springframework.security.core.userdetails.UsernameNotFoundException;
+import org.springframework.security.web.AuthenticationEntryPoint;
 import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.access.AccessDeniedHandler;
 
 /**
- * TEMPORARY (M2.2): deny-by-default until M3.3 replaces this chain with JWT authentication
- * (plans/authentication.plan §6).
+ * The security filter chain (authentication.plan §6): a stateless OAuth2 resource server that
+ * validates the app's own RS256 JWTs. M10.1 changes only the JwtDecoder (to Keycloak's
+ * issuer-uri); nothing else here knows where tokens come from.
  *
- * <p>Adding Spring Security without this would lock everything, including
- * {@code /actuator/health}, behind HTTP Basic with a generated password, so Docker, load
- * balancer and CI health checks would get 401. Here health and info are public and every
- * other path is 401: with no login mechanism yet, nothing else can be authenticated. That is
- * the safe default; paths are opened one at a time, never {@code permitAll()} "for now".
+ * <p>Public: login, refresh and logout (the last two are authenticated by the refresh cookie, not
+ * a bearer token) and health. Everything else needs a valid bearer token; paths are opened one at
+ * a time, never {@code permitAll()} "for now".
  */
 @Configuration(proxyBeanMethods = false)
 @EnableWebSecurity
 class SecurityConfig {
 
     @Bean
-    SecurityFilterChain securityFilterChain(HttpSecurity http, ProblemDetailWriter problemWriter) {
+    SecurityFilterChain securityFilterChain(
+            HttpSecurity http, AuthenticationEntryPoint problemEntryPoint, AccessDeniedHandler problemDeniedHandler) {
         http.sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
-                // A stateless bearer-token API with no cookies yet; M3.3 revisits CSRF for the
-                // refresh-token cookie (SameSite + Path).
+                // Bearer tokens aren't sent automatically by browsers, so CSRF can't use them. The
+                // refresh cookie is: SameSite=Strict plus Path=/api/v1/auth confine it to
+                // same-site requests to the auth endpoints (authentication.plan §3).
                 .csrf(AbstractHttpConfigurer::disable)
                 .httpBasic(AbstractHttpConfigurer::disable)
                 .formLogin(AbstractHttpConfigurer::disable)
@@ -46,35 +50,49 @@ class SecurityConfig {
                         .permitAll()
                         .requestMatchers("/actuator/health", "/actuator/health/**", "/actuator/info")
                         .permitAll()
-                        .requestMatchers(HttpMethod.POST, "/api/v1/auth/login")
+                        .requestMatchers(
+                                HttpMethod.POST, "/api/v1/auth/login", "/api/v1/auth/refresh", "/api/v1/auth/logout")
                         .permitAll()
                         .anyRequest()
                         .authenticated())
+                // Invalid tokens fail inside BearerTokenAuthenticationFilter, which uses this
+                // entry point rather than the one under exceptionHandling; both must be ours.
+                .oauth2ResourceServer(
+                        oauth2 -> oauth2.jwt(Customizer.withDefaults()).authenticationEntryPoint(problemEntryPoint))
                 // 401 and 403 happen in filters, before GlobalExceptionHandler can see them, so
                 // they are written here in the same ProblemDetail shape.
-                .exceptionHandling(errors -> errors.authenticationEntryPoint(
-                                (request, response, ex) -> problemWriter.write(
-                                        request,
-                                        response,
-                                        ProblemDetails.of(
-                                                HttpStatus.UNAUTHORIZED,
-                                                ProblemCodes.UNAUTHENTICATED,
-                                                "Authentication is required.")))
-                        .accessDeniedHandler((request, response, ex) -> problemWriter.write(
-                                request,
-                                response,
-                                ProblemDetails.of(
-                                        HttpStatus.FORBIDDEN,
-                                        ProblemCodes.FORBIDDEN,
-                                        "You do not have permission to do this."))));
+                .exceptionHandling(errors ->
+                        errors.authenticationEntryPoint(problemEntryPoint).accessDeniedHandler(problemDeniedHandler));
         return http.build();
     }
 
-    /** No users until M3.3. Declaring this stops Boot generating (and logging) a default password. */
+    /** 401 {@code unauthenticated}; deliberately the same body for a missing, expired or forged token. */
+    @Bean
+    AuthenticationEntryPoint problemEntryPoint(ProblemDetailWriter problemWriter) {
+        return (request, response, ex) -> problemWriter.write(
+                request,
+                response,
+                ProblemDetails.of(
+                        HttpStatus.UNAUTHORIZED, ProblemCodes.UNAUTHENTICATED, "Authentication is required."));
+    }
+
+    @Bean
+    AccessDeniedHandler problemDeniedHandler(ProblemDetailWriter problemWriter) {
+        return (request, response, ex) -> problemWriter.write(
+                request,
+                response,
+                ProblemDetails.of(
+                        HttpStatus.FORBIDDEN, ProblemCodes.FORBIDDEN, "You do not have permission to do this."));
+    }
+
+    /**
+     * No username/password authentication through Spring Security: login is our own endpoint.
+     * Declaring this stops Boot generating (and logging) a default user and password.
+     */
     @Bean
     UserDetailsService noUsers() {
         return username -> {
-            throw new UsernameNotFoundException("No users are configured yet");
+            throw new UsernameNotFoundException("Spring Security user lookups are not used");
         };
     }
 }

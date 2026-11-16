@@ -1,7 +1,9 @@
 package com.reconflow.paymentreconflow.security.auth;
 
 import com.reconflow.paymentreconflow.security.token.AccessTokenService;
+import com.reconflow.paymentreconflow.security.token.AccessTokenService.AccessToken;
 import com.reconflow.paymentreconflow.security.token.RefreshTokenService;
+import com.reconflow.paymentreconflow.security.token.RevocationReason;
 import com.reconflow.paymentreconflow.security.user.AppUser;
 import com.reconflow.paymentreconflow.security.user.AppUserRepository;
 import com.reconflow.paymentreconflow.security.user.MembershipQueries;
@@ -9,6 +11,7 @@ import java.security.SecureRandom;
 import java.time.Clock;
 import java.util.HexFormat;
 import java.util.Optional;
+import java.util.UUID;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -38,6 +41,7 @@ public class AuthService {
     private final AccessTokenService accessTokens;
     private final RefreshTokenService refreshTokens;
     private final TransactionTemplate tx;
+    private final PasswordPolicy policy;
     private final Clock clock;
 
     /**
@@ -54,6 +58,7 @@ public class AuthService {
             AccessTokenService accessTokens,
             RefreshTokenService refreshTokens,
             TransactionTemplate tx,
+            PasswordPolicy policy,
             Clock clock) {
         this.users = users;
         this.memberships = memberships;
@@ -62,6 +67,7 @@ public class AuthService {
         this.accessTokens = accessTokens;
         this.refreshTokens = refreshTokens;
         this.tx = tx;
+        this.policy = policy;
         this.clock = clock;
         byte[] random = new byte[16];
         new SecureRandom().nextBytes(random);
@@ -109,6 +115,40 @@ public class AuthService {
                     accessTokens.issue(user),
                     refreshToken,
                     memberships.activeMembershipsOf(user.getId()));
+        });
+    }
+
+    /** The outcome of a password change; a wrong current password is returned, not thrown. */
+    public sealed interface ChangeResult {
+        record Changed(AccessToken accessToken, String refreshToken) implements ChangeResult {}
+
+        record WrongPassword() implements ChangeResult {}
+    }
+
+    /**
+     * Change-password (authentication.plan §4.5): verify the current password, apply the policy,
+     * rehash, clear {@code must_change_password}, revoke every refresh token of the user (logging
+     * out all other devices), and start a new family for this device.
+     *
+     * <p>The new pair is what avoids the first-login dead end: this device's refresh token was
+     * just revoked and its access token still says {@code pwd_change}, so without a fresh pair the
+     * user would change their password and immediately be locked out of everything.
+     */
+    public ChangeResult changePassword(UUID userId, String currentPassword, String newPassword) {
+        policy.validate(newPassword);
+        AppUser candidate = users.findById(userId).orElseThrow();
+        if (!matches(currentPassword, candidate.getPasswordHash())) {
+            // A stolen access token must not become an unlimited password oracle: count it.
+            tx.executeWithoutResult(status -> attempts.recordFailure(userId));
+            return new ChangeResult.WrongPassword();
+        }
+        String newHash = encoder.encode(newPassword); // bcrypt outside the transaction, as in login
+        return tx.execute(status -> {
+            AppUser user = users.findById(userId).orElseThrow();
+            user.changePassword(newHash);
+            refreshTokens.revokeAllForUser(userId, RevocationReason.PASSWORD_CHANGED);
+            String refreshToken = refreshTokens.issue(userId);
+            return new ChangeResult.Changed(accessTokens.issue(user), refreshToken);
         });
     }
 

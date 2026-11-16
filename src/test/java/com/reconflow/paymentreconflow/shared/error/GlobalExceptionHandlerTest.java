@@ -4,6 +4,7 @@ import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.matchesPattern;
 import static org.hamcrest.Matchers.not;
+import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.csrf;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
@@ -23,6 +24,8 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.security.test.context.support.WithMockUser;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -34,9 +37,14 @@ import org.springframework.web.bind.annotation.RestController;
 /**
  * Every error path renders the api-design.md §3 shape. A web slice: MockMvc, the advice and the
  * RequestIdFilter, with a test-only controller that throws on demand. No database.
+ *
+ * <p>The slice doesn't load the app's SecurityConfig, so Boot's default security applies:
+ * {@link WithMockUser} gets past authentication and {@code csrf()} past its CSRF check. The real
+ * security chain is tested in SecurityConfigIT.
  */
 @WebMvcTest(GlobalExceptionHandlerTest.ThrowingController.class)
 @Import(GlobalExceptionHandlerTest.ThrowingController.class)
+@WithMockUser
 class GlobalExceptionHandlerTest {
 
     static final UUID ID = UUID.fromString("01928c7e-5b1a-7c3e-9f00-2a4b6c8d0e1f");
@@ -64,6 +72,11 @@ class GlobalExceptionHandlerTest {
 
         @GetMapping("/test/param")
         void param(@RequestParam int page) {}
+
+        @GetMapping("/test/denied")
+        void denied() {
+            throw new AccessDeniedException("no permission");
+        }
 
         @GetMapping("/test/boom")
         void boom() {
@@ -108,7 +121,7 @@ class GlobalExceptionHandlerTest {
     @Test
     void beanValidationListsEachField() throws Exception {
         assertProblem(
-                        mockMvc.perform(post("/test/body")
+                        mockMvc.perform(post("/test/body").with(csrf())
                                 .contentType(MediaType.APPLICATION_JSON)
                                 .content("{\"reference\": \" \", \"count\": 0}")),
                         400,
@@ -122,7 +135,7 @@ class GlobalExceptionHandlerTest {
     @Test
     void malformedJsonIsAValidationFailure() throws Exception {
         assertProblem(
-                        mockMvc.perform(post("/test/body")
+                        mockMvc.perform(post("/test/body").with(csrf())
                                 .contentType(MediaType.APPLICATION_JSON)
                                 .content("{\"reference\": ")),
                         400,
@@ -133,7 +146,7 @@ class GlobalExceptionHandlerTest {
     @Test
     void wrongValueTypeNamesTheField() throws Exception {
         assertProblem(
-                        mockMvc.perform(post("/test/body")
+                        mockMvc.perform(post("/test/body").with(csrf())
                                 .contentType(MediaType.APPLICATION_JSON)
                                 .content("{\"reference\": \"x\", \"count\": \"many\"}")),
                         400,
@@ -158,11 +171,16 @@ class GlobalExceptionHandlerTest {
 
     @Test
     void wrongMethodAndMediaTypeGetCatalogueCodes() throws Exception {
-        assertProblem(mockMvc.perform(post("/test/not-found")), 405, "method-not-allowed");
+        assertProblem(mockMvc.perform(post("/test/not-found").with(csrf())), 405, "method-not-allowed");
         assertProblem(
-                mockMvc.perform(post("/test/body").contentType(MediaType.TEXT_PLAIN).content("x")),
+                mockMvc.perform(post("/test/body").with(csrf()).contentType(MediaType.TEXT_PLAIN).content("x")),
                 415,
                 "unsupported-media-type");
+    }
+
+    @Test
+    void securityExceptionsAreLeftToSpringSecurityNotTurnedInto500() throws Exception {
+        mockMvc.perform(get("/test/denied")).andExpect(status().isForbidden());
     }
 
     @Test

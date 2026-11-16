@@ -16,6 +16,8 @@ import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.orm.ObjectOptimisticLockingFailureException;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.security.core.AuthenticationException;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.MissingServletRequestParameterException;
@@ -56,6 +58,16 @@ class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
                 HttpStatus.CONFLICT,
                 ProblemCodes.STALE_VERSION,
                 "The resource was changed by someone else. Reload it and retry.");
+    }
+
+    /**
+     * Security exceptions thrown inside a controller (e.g. by {@code @PreAuthorize}) must reach
+     * Spring Security's ExceptionTranslationFilter, which decides between 401 and 403 and writes
+     * the response. Without this, the catch-all below would turn them into 500s.
+     */
+    @ExceptionHandler({AccessDeniedException.class, AuthenticationException.class})
+    void rethrowSecurityExceptions(RuntimeException ex) {
+        throw ex;
     }
 
     /**

@@ -35,7 +35,8 @@ class TenantContextFilterTest {
     private final UUID org = UUID.randomUUID();
     private final TenantLookup lookup = mock(TenantLookup.class);
     private final ScopedTenantHolder holder = new ScopedTenantHolder();
-    private final TenantContextFilter filter = new TenantContextFilter(lookup, newWriter());
+    private final TenantContextFilter filter = new TenantContextFilter(
+            jwt -> java.util.Optional.of(UUID.fromString(jwt.getSubject())), lookup, newWriter());
 
     private static ProblemDetailWriter newWriter() {
         try {

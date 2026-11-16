@@ -4,7 +4,6 @@ import com.reconflow.paymentreconflow.shared.context.Role;
 import com.reconflow.paymentreconflow.shared.id.Ids;
 import java.util.UUID;
 import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 
 /**
  * Fixtures written with plain SQL, so tests don't depend on the services under test to set up
@@ -12,12 +11,6 @@ import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
  * never assume a table is empty.
  */
 public final class TestData {
-
-    /** The password of every fixture user. */
-    public static final String PASSWORD = "correct-horse-battery-staple";
-
-    // Hashed once per JVM: bcrypt at cost 12 takes ~200 ms, and fixtures create many users.
-    private static final String PASSWORD_HASH = "{bcrypt}" + new BCryptPasswordEncoder(12).encode(PASSWORD);
 
     public record TestUser(UUID id, String email) {}
 
@@ -37,17 +30,31 @@ public final class TestData {
         return id;
     }
 
-    /** An active user with {@link #PASSWORD} and no pending password change. */
+    /**
+     * An active user, linked to the identity provider with {@code external_subject = id} (M10.1), so
+     * a token whose {@code sub} is the user's id authenticates as them.
+     */
     public TestUser newUser() {
         UUID id = Ids.newId();
         String email = "user-" + id + "@example.test";
         jdbc.update(
-                "insert into app_user (id, email, display_name, password_hash, must_change_password)"
+                "insert into app_user (id, email, display_name, external_subject, must_change_password)"
                         + " values (?, ?, ?, ?, false)",
                 id,
                 email,
                 "User " + id.toString().substring(0, 8),
-                PASSWORD_HASH);
+                id.toString());
+        return new TestUser(id, email);
+    }
+
+    /** A user that exists in ReconFlow but has never logged in through the IdP (no subject yet). */
+    public TestUser newUnlinkedUser(String email) {
+        UUID id = Ids.newId();
+        jdbc.update(
+                "insert into app_user (id, email, display_name, must_change_password) values (?, ?, ?, false)",
+                id,
+                email,
+                "Unlinked " + id.toString().substring(0, 8));
         return new TestUser(id, email);
     }
 
@@ -69,10 +76,6 @@ public final class TestData {
         TestUser user = newUser();
         jdbc.update("update app_user set is_platform_admin = true where id = ?", user.id());
         return user;
-    }
-
-    public void requirePasswordChange(UUID userId) {
-        jdbc.update("update app_user set must_change_password = true where id = ?", userId);
     }
 
     public void setStatus(UUID userId, String status) {

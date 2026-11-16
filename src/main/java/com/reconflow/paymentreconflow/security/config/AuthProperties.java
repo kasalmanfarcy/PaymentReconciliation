@@ -1,6 +1,5 @@
 package com.reconflow.paymentreconflow.security.config;
 
-import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
 import java.time.Duration;
 import org.jspecify.annotations.Nullable;
@@ -9,47 +8,30 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
 import org.springframework.validation.annotation.Validated;
 
 /**
- * {@code reconflow.auth.*}: everything about tokens that must not be a string literal in code
- * (authentication.plan §3, §7). {@code iss}/{@code aud} are configuration because M10.1 changes
- * them to Keycloak's.
+ * {@code reconflow.auth.*} (M10.1). Token validation is Spring's resource server, configured under
+ * {@code spring.security.oauth2.resourceserver.jwt} (issuer and audience); what remains here is how
+ * ReconFlow talks to Keycloak's Admin REST API to create and manage users.
+ *
+ * @param keycloak the Admin REST API, through a confidential service-account client that has only
+ *     the {@code manage-users} role
  */
 @Validated
 @ConfigurationProperties("reconflow.auth")
-public record AuthProperties(
-        @DefaultValue Jwt jwt,
-        @DefaultValue Refresh refresh,
-        @DefaultValue Cookie cookie,
-        @DefaultValue RateLimit rateLimit) {
+public record AuthProperties(@DefaultValue Keycloak keycloak) {
 
     /**
-     * @param privateKey PKCS#8 PEM of the RS256 signing key (env {@code JWT_PRIVATE_KEY}); never
-     *     committed
-     * @param publicKey X.509 PEM of the matching public key (env {@code JWT_PUBLIC_KEY})
-     * @param generateEphemeralKey local and test only: generate a key pair at startup instead.
-     *     Tokens then die on restart. Any other profile fails startup without a configured key.
+     * @param baseUrl Keycloak's base URL as the application reaches it, e.g. {@code http://keycloak:8180}
+     * @param realm the realm whose users ReconFlow manages
+     * @param adminClientId the service-account client
+     * @param adminClientSecret from the environment only ({@code KEYCLOAK_ADMIN_CLIENT_SECRET}); never
+     *     committed. Without it, user management fails (and {@code prod} refuses to start).
+     * @param timeout connect and read timeout for every Admin API call: a slow IdP must not hold a
+     *     request thread (and its database transaction) for long
      */
-    public record Jwt(
-            @DefaultValue("reconflow") @NotBlank String issuer,
-            @DefaultValue("reconflow-api") @NotBlank String audience,
-            @DefaultValue("15m") Duration accessTokenTtl,
-            @DefaultValue("60s") Duration clockSkew,
-            @Nullable String privateKey,
-            @Nullable String publicKey,
-            @DefaultValue("false") boolean generateEphemeralKey) {}
-
-    /** Each refresh token lives 7 days; its family (one login's chain) is capped at 30. */
-    public record Refresh(
-            @DefaultValue("7d") Duration tokenTtl,
-            @DefaultValue("30d") Duration familyTtl) {}
-
-    /**
-     * {@code secure} defaults to true and only the local profile turns it off (for Safari on
-     * http://localhost), so a forgotten setting in production fails safe.
-     */
-    public record Cookie(@DefaultValue("true") boolean secure) {}
-
-    /** Login attempts per client IP: a token bucket of {@code capacity}, refilled per minute. */
-    public record RateLimit(
-            @DefaultValue("10") @Min(1) int capacity,
-            @DefaultValue("10") @Min(1) int refillPerMinute) {}
+    public record Keycloak(
+            @DefaultValue("http://localhost:8180") @NotBlank String baseUrl,
+            @DefaultValue("reconflow") @NotBlank String realm,
+            @DefaultValue("reconflow-admin") @NotBlank String adminClientId,
+            @Nullable String adminClientSecret,
+            @DefaultValue("5s") Duration timeout) {}
 }

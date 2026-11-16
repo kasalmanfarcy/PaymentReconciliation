@@ -52,5 +52,10 @@ public enum AuditAction {
     EXCEPTIONS_EXPORTED,
     // M9: data lifecycle
     /** An old month of the organization's records left PostgreSQL for verified files in object storage. */
-    PARTITION_ARCHIVED
+    PARTITION_ARCHIVED,
+    // M10.1: identity provider. LOGIN_*, ACCOUNT_LOCKED, LOGOUT, PASSWORD_CHANGED and
+    // REFRESH_TOKEN_REUSE are no longer written (Keycloak's login and admin events record them) but
+    // stay, because stored rows hold their names.
+    /** A Keycloak account was linked to an existing user by verified email, on its first request. */
+    USER_LINKED
 }

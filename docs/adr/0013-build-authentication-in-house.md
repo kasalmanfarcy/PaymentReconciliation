@@ -1,6 +1,6 @@
 # 0013. Build authentication in-house for v1, delegate to an identity provider later
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR 0015](0015-delegate-authentication-to-keycloak.md) (M10.1, 2026-11-16): the in-house implementation was replaced by Keycloak as planned; this record stays as the reasoning for v1
 - **Date:** 2026-11-16
 - **Tasks:** TASKS.md M3.3, M10.1
 

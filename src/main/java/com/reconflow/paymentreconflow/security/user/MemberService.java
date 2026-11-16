@@ -4,8 +4,7 @@ import com.reconflow.paymentreconflow.audit.AuditAction;
 import com.reconflow.paymentreconflow.audit.AuditEntityType;
 import com.reconflow.paymentreconflow.audit.AuditEntry;
 import com.reconflow.paymentreconflow.audit.AuditService;
-import com.reconflow.paymentreconflow.security.token.RefreshTokenService;
-import com.reconflow.paymentreconflow.security.token.RevocationReason;
+import com.reconflow.paymentreconflow.security.idp.IdentityProvider;
 import com.reconflow.paymentreconflow.shared.context.CurrentUser;
 import com.reconflow.paymentreconflow.shared.context.Role;
 import com.reconflow.paymentreconflow.shared.context.TenantContext;
@@ -18,13 +17,15 @@ import java.util.UUID;
 import org.jspecify.annotations.Nullable;
 import org.springframework.data.domain.Page;
 import org.springframework.jdbc.core.simple.JdbcClient;
-import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 /**
  * Admin-managed membership of the caller's organization (authentication.plan §4.6). There is no
  * sign-up: every account is created here (or by the platform flow) with a temporary password.
+ * Since M10.1 the account itself lives in Keycloak (created through its Admin API, with the "Update
+ * Password" required action); this service keeps the {@code app_user} row, linked by {@code sub},
+ * and the membership.
  *
  * <p>The organization is always {@code tenant.organizationId()}. Every lookup is by
  * {@code (userId, organizationId)}, so another organization's member is simply not found: 404,
@@ -39,8 +40,8 @@ public class MemberService {
     private final AppUserRepository users;
     private final MembershipRepository memberships;
     private final MemberQueries queries;
-    private final PasswordEncoder encoder;
-    private final RefreshTokenService refreshTokens;
+    private final AccountProvisioning provisioning;
+    private final IdentityProvider idp;
     private final TenantContext tenant;
     private final CurrentUser currentUser;
     private final JdbcClient jdbc;
@@ -51,8 +52,8 @@ public class MemberService {
             AppUserRepository users,
             MembershipRepository memberships,
             MemberQueries queries,
-            PasswordEncoder encoder,
-            RefreshTokenService refreshTokens,
+            AccountProvisioning provisioning,
+            IdentityProvider idp,
             TenantContext tenant,
             CurrentUser currentUser,
             JdbcClient jdbc,
@@ -61,8 +62,8 @@ public class MemberService {
         this.users = users;
         this.memberships = memberships;
         this.queries = queries;
-        this.encoder = encoder;
-        this.refreshTokens = refreshTokens;
+        this.provisioning = provisioning;
+        this.idp = idp;
         this.tenant = tenant;
         this.currentUser = currentUser;
         this.jdbc = jdbc;
@@ -92,8 +93,10 @@ public class MemberService {
                 throw new ConflictException(ProblemCodes.ALREADY_A_MEMBER, "This user is already a member.");
             }
         } else {
-            temporaryPassword = TemporaryPasswords.generate();
-            user = users.save(AppUser.create(email, displayName, encoder.encode(temporaryPassword), true));
+            // Keycloak first; if anything below rolls back, the account is deleted again.
+            var account = provisioning.provision(email, displayName);
+            temporaryPassword = account.temporaryPassword();
+            user = users.save(AppUser.create(email, displayName, account.subject()));
         }
         memberships.save(Membership.create(user.getId(), org, role, currentUser.id()));
         audit.record(AuditEntry.of(AuditAction.MEMBER_CREATED, AuditEntityType.MEMBERSHIP, user.getId())
@@ -119,22 +122,35 @@ public class MemberService {
         return view(org, userId);
     }
 
-    /** A new temporary password, shown once; every session of the user is revoked. */
+    /**
+     * A new temporary password, shown once; every session of the user ends (Keycloak logs the
+     * account out, which revokes its refresh tokens). Also the migration path for a user from
+     * before M10.1 who has no Keycloak account yet: one is created and linked here.
+     */
     @Transactional
     public String resetPassword(UUID userId) {
         UUID org = tenant.organizationId();
         membership(org, userId);
-        String temporaryPassword = TemporaryPasswords.generate();
-        users.findById(userId).orElseThrow().resetPassword(encoder.encode(temporaryPassword));
-        int revoked = refreshTokens.revokeAllForUser(userId, RevocationReason.ADMIN_REVOKED);
+        AppUser user = users.findById(userId).orElseThrow();
         audit.record(AuditEntry.of(AuditAction.PASSWORD_RESET_BY_ADMIN, AuditEntityType.USER, userId)
-                .with("revokedSessions", revoked));
+                .with("linkedNow", user.getExternalSubject() == null));
+        if (user.getExternalSubject() == null) {
+            var account = provisioning.provision(user.getEmail(), user.getDisplayName());
+            user.linkExternalSubject(account.subject());
+            if (account.temporaryPassword() != null) {
+                return account.temporaryPassword();
+            }
+        }
+        // Last, after every database write: if Keycloak fails, the transaction rolls back and
+        // nothing changed on either side.
+        String temporaryPassword = TemporaryPasswords.generate();
+        idp.resetPassword(user.getExternalSubject(), temporaryPassword);
         return temporaryPassword;
     }
 
     /**
-     * Disables the account and revokes its sessions; TenantContextFilter rejects its access token
-     * on the next request, because the status is checked every time.
+     * Disables the account here and in Keycloak; TenantContextFilter rejects its access token on the
+     * next request, because the status is checked every time.
      */
     @Transactional
     public MemberView disable(UUID userId) {
@@ -146,10 +162,15 @@ public class MemberService {
             requireAnotherActiveAdmin(org, userId);
         }
         user.disable();
-        int revoked = refreshTokens.revokeAllForUser(userId, RevocationReason.USER_DISABLED);
-        audit.record(AuditEntry.of(AuditAction.MEMBER_DISABLED, AuditEntityType.USER, userId)
-                .with("revokedSessions", revoked));
-        return view(org, userId);
+        audit.record(AuditEntry.of(AuditAction.MEMBER_DISABLED, AuditEntityType.USER, userId));
+        MemberView disabled = view(org, userId);
+        // Two independent stops: our status check rejects the user's next request whatever token
+        // they hold, and Keycloak stops issuing and refreshing tokens. The IdP call goes last, so a
+        // Keycloak failure rolls back the database change too.
+        if (user.getExternalSubject() != null) {
+            idp.disable(user.getExternalSubject());
+        }
+        return disabled;
     }
 
     private Membership membership(UUID org, UUID userId) {

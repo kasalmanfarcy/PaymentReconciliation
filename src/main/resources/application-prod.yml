@@ -13,7 +13,7 @@ spring:
 reconflow:
   # Checked at startup by shared.config.RequiredPropertiesCheck: a missing one stops the
   # boot with a message naming it, before any bean is created.
-  required-properties: DB_URL, DB_APP_USER, DB_APP_PASSWORD, DB_MIGRATOR_USER, DB_MIGRATOR_PASSWORD, JWT_PRIVATE_KEY, JWT_PUBLIC_KEY
+  required-properties: DB_URL, DB_APP_USER, DB_APP_PASSWORD, DB_MIGRATOR_USER, DB_MIGRATOR_PASSWORD, OIDC_ISSUER_URI, KEYCLOAK_BASE_URL, KEYCLOAK_ADMIN_CLIENT_SECRET
 
 server:
   error:

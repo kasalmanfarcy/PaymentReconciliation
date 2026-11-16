@@ -5,14 +5,9 @@ import java.time.Instant;
 import java.util.UUID;
 
 /**
- * A member of the caller's organization as the API shows it. Never the entity: no password hash,
- * no lockout counters, no platform flag.
+ * A member of the caller's organization as the API shows it. Never the entity: no platform flag, no
+ * identity-provider subject. (Whether a temporary password is pending is Keycloak's to know since
+ * M10.1, so {@code mustChangePassword} left the response.)
  */
 public record MemberView(
-        UUID userId,
-        String email,
-        String displayName,
-        Role role,
-        UserStatus status,
-        boolean mustChangePassword,
-        Instant createdAt) {}
+        UUID userId, String email, String displayName, Role role, UserStatus status, Instant createdAt) {}

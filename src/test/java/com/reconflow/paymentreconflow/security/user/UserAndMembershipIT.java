@@ -36,7 +36,7 @@ class UserAndMembershipIT extends AbstractIntegrationTest {
     void aUserWithTwoMembershipsInTwoOrganizationsIsReadBackWithOneQuery() {
         var acme = Organization.create("Acme");
         var globex = Organization.create("Globex");
-        var user = AppUser.create("Consultant." + acme.getId() + "@Both.test", "Consultant", "{noop}x", false);
+        var user = AppUser.create("Consultant." + acme.getId() + "@Both.test", "Consultant", null);
         tx.executeWithoutResult(status -> {
             organizations.save(acme);
             organizations.save(globex);
@@ -63,7 +63,7 @@ class UserAndMembershipIT extends AbstractIntegrationTest {
 
     @Test
     void emailLookupIgnoresCase() {
-        var user = AppUser.create("Mixed.Case." + System.nanoTime() + "@Example.test", "M", "{noop}x", true);
+        var user = AppUser.create("Mixed.Case." + System.nanoTime() + "@Example.test", "M", "kc-" + System.nanoTime());
         tx.executeWithoutResult(status -> users.save(user));
 
         assertThat(users.findByEmailIgnoreCase(user.getEmail().toLowerCase()))
@@ -72,7 +72,7 @@ class UserAndMembershipIT extends AbstractIntegrationTest {
                 .isEqualTo(user.getId());
         AppUser loaded = users.findById(user.getId()).orElseThrow();
         assertThat(loaded.getStatus()).isEqualTo(UserStatus.ACTIVE);
-        assertThat(loaded.isMustChangePassword()).isTrue();
+        assertThat(loaded.getExternalSubject()).startsWith("kc-");
         assertThat(loaded.isPlatformAdmin()).isFalse();
     }
 }

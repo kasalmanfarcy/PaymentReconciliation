@@ -16,13 +16,10 @@ public final class ProblemCodes {
     public static final String DUPLICATE_COLUMNS = "duplicate-columns";
     public static final String EMPTY_FILE = "empty-file";
     public static final String INVALID_ENCODING = "invalid-encoding";
-    public static final String PASSWORD_POLICY = "password-policy";
     // 401
     public static final String UNAUTHENTICATED = "unauthenticated";
-    public static final String INVALID_CREDENTIALS = "invalid-credentials";
     // 403
     public static final String FORBIDDEN = "forbidden";
-    public static final String PASSWORD_CHANGE_REQUIRED = "password-change-required";
     // 404
     public static final String NOT_FOUND = "not-found";
     public static final String ORGANIZATION_NOT_FOUND = "organization-not-found";
@@ -52,6 +49,7 @@ public final class ProblemCodes {
     // 500, 503
     public static final String INTERNAL_ERROR = "internal-error";
     public static final String STORAGE_UNAVAILABLE = "storage-unavailable";
+    public static final String IDENTITY_PROVIDER_UNAVAILABLE = "identity-provider-unavailable";
 
     /**
      * The code for an error Spring raised itself (no {@link ApiException}), chosen by status.

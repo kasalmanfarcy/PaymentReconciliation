@@ -10,6 +10,7 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
@@ -26,7 +27,7 @@ import org.springframework.web.filter.OncePerRequestFilter;
  *       the role's permissions become the request's authorities.</li>
  *   <li>Platform routes ({@code /api/v1/platform/**}): app_user only; PLATFORM_ORG_MANAGE if the
  *       database flag says so. Not skipped: this filter is the only thing that grants it.</li>
- *   <li>Anything else authenticated (change-password, actuator): an active user, no tenant.</li>
+ *   <li>Anything else authenticated (actuator): an active user, no tenant.</li>
  * </ul>
  *
  * Runs after bearer authentication and before authorization, so a non-member gets 404 before any
@@ -40,12 +41,12 @@ public class TenantContextFilter extends OncePerRequestFilter {
 
     private static final String API = "/api/v1/";
     private static final String PLATFORM = "/api/v1/platform/";
-    private static final String AUTH = "/api/v1/auth/";
-
+    private final PrincipalResolver principals;
     private final TenantLookup lookup;
     private final ProblemDetailWriter problemWriter;
 
-    public TenantContextFilter(TenantLookup lookup, ProblemDetailWriter problemWriter) {
+    public TenantContextFilter(PrincipalResolver principals, TenantLookup lookup, ProblemDetailWriter problemWriter) {
+        this.principals = principals;
         this.lookup = lookup;
         this.problemWriter = problemWriter;
     }
@@ -53,18 +54,17 @@ public class TenantContextFilter extends OncePerRequestFilter {
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
             throws ServletException, IOException {
-        // Public routes (login, refresh, logout, health) and unauthenticated requests carry no
-        // bearer identity; authorization decides what happens to them.
+        // Public routes (health, info) and unauthenticated requests carry no bearer identity;
+        // authorization decides what happens to them.
         if (!(SecurityContextHolder.getContext().getAuthentication() instanceof JwtAuthenticationToken jwtAuth)
                 || isPublic(request)) {
             chain.doFilter(request, response);
             return;
         }
-        UUID userId;
-        try {
-            userId = UUID.fromString(jwtAuth.getToken().getSubject());
-        } catch (IllegalArgumentException | NullPointerException e) {
-            // A validly signed token always has a UUID subject; anything else is not ours.
+        // M10.1: the token's subject is Keycloak's, not ours. A validly signed token for an account
+        // ReconFlow doesn't know (never provisioned, or an unverified email) is still a 401.
+        Optional<UUID> resolved = principals.resolveUserId(jwtAuth.getToken());
+        if (resolved.isEmpty()) {
             write(
                     request,
                     response,
@@ -75,12 +75,13 @@ public class TenantContextFilter extends OncePerRequestFilter {
                             null)));
             return;
         }
+        UUID userId = resolved.get();
 
         String path = path(request);
         var user = lookup.find(userId);
         Resolution resolution = path.startsWith(PLATFORM)
                 ? TenantResolver.platform(userId, user)
-                : path.startsWith(API) && !path.startsWith(AUTH)
+                : path.startsWith(API)
                         ? TenantResolver.tenant(userId, user, request.getHeader(TenantResolver.HEADER))
                         : TenantResolver.identity(userId, user);
 
@@ -112,11 +113,7 @@ public class TenantContextFilter extends OncePerRequestFilter {
 
     private static boolean isPublic(HttpServletRequest request) {
         String path = path(request);
-        if (path.startsWith("/actuator/health") || path.equals("/actuator/info")) {
-            return true;
-        }
-        return "POST".equals(request.getMethod())
-                && (path.equals(AUTH + "login") || path.equals(AUTH + "refresh") || path.equals(AUTH + "logout"));
+        return path.startsWith("/actuator/health") || path.equals("/actuator/info");
     }
 
     private static String path(HttpServletRequest request) {

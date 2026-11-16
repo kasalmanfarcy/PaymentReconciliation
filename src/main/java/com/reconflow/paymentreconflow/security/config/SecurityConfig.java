@@ -1,6 +1,6 @@
 package com.reconflow.paymentreconflow.security.config;
 
-import com.reconflow.paymentreconflow.security.auth.PasswordChangeRequiredFilter;
+import com.reconflow.paymentreconflow.security.tenant.PrincipalResolver;
 import com.reconflow.paymentreconflow.security.tenant.TenantContextFilter;
 import com.reconflow.paymentreconflow.security.tenant.TenantLookup;
 import com.reconflow.paymentreconflow.shared.context.Permission;
@@ -10,7 +10,6 @@ import com.reconflow.paymentreconflow.shared.error.ProblemDetails;
 import jakarta.servlet.DispatcherType;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.config.Customizer;
 import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
@@ -27,13 +26,15 @@ import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.access.AccessDeniedHandler;
 
 /**
- * The security filter chain (authentication.plan §6): a stateless OAuth2 resource server that
- * validates the app's own RS256 JWTs. M10.1 changes only the JwtDecoder (to Keycloak's
- * issuer-uri); nothing else here knows where tokens come from.
+ * The security filter chain (authentication.plan §6): a stateless OAuth2 resource server. Since
+ * M10.1 the tokens come from Keycloak: Boot builds the JwtDecoder from
+ * {@code spring.security.oauth2.resourceserver.jwt.issuer-uri} (discovery document, then the JWKS,
+ * re-fetched when an unknown {@code kid} appears, so Keycloak can rotate keys) and checks
+ * signature, {@code exp}, {@code iss} and {@code aud} ({@code audiences: reconflow-api}). This
+ * application issues no tokens and never sees a password.
  *
- * <p>Public: login, refresh and logout (the last two are authenticated by the refresh cookie, not
- * a bearer token) and health. Everything else needs a valid bearer token; paths are opened one at
- * a time, never {@code permitAll()} "for now".
+ * <p>Public: health and info only. Everything else needs a valid bearer token; paths are opened one
+ * at a time, never {@code permitAll()} "for now".
  */
 @Configuration(proxyBeanMethods = false)
 @EnableWebSecurity
@@ -48,11 +49,11 @@ class SecurityConfig {
             AccessDeniedHandler problemDeniedHandler,
             ProblemDetailWriter problemWriter,
             TenantLookup tenantLookup,
+            PrincipalResolver principalResolver,
             ManagementPort managementPort) {
         http.sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
-                // Bearer tokens aren't sent automatically by browsers, so CSRF can't use them. The
-                // refresh cookie is: SameSite=Strict plus Path=/api/v1/auth confine it to
-                // same-site requests to the auth endpoints (authentication.plan §3).
+                // Bearer tokens aren't sent automatically by browsers, so CSRF can't use them, and
+                // since M10.1 there are no cookies at all (refresh tokens live with Keycloak's client).
                 .csrf(AbstractHttpConfigurer::disable)
                 .httpBasic(AbstractHttpConfigurer::disable)
                 .formLogin(AbstractHttpConfigurer::disable)
@@ -72,9 +73,6 @@ class SecurityConfig {
                         .permitAll()
                         .requestMatchers("/actuator/prometheus")
                         .denyAll()
-                        .requestMatchers(
-                                HttpMethod.POST, "/api/v1/auth/login", "/api/v1/auth/refresh", "/api/v1/auth/logout")
-                        .permitAll()
                         // Granted only by TenantContextFilter in platform mode, from the database.
                         .requestMatchers("/api/v1/platform/**")
                         .hasAuthority(Permission.PLATFORM_ORG_MANAGE.name())
@@ -88,11 +86,12 @@ class SecurityConfig {
                 // they are written here in the same ProblemDetail shape.
                 .exceptionHandling(errors ->
                         errors.authenticationEntryPoint(problemEntryPoint).accessDeniedHandler(problemDeniedHandler))
-                // Bearer authentication, then the pending-password gate, then tenant resolution,
-                // then authorization (which sees the authentication the tenant filter installed).
-                .addFilterAfter(new PasswordChangeRequiredFilter(problemWriter), BearerTokenAuthenticationFilter.class)
+                // Bearer authentication, then tenant resolution, then authorization (which sees the
+                // authentication the tenant filter installed). A pending temporary password is
+                // Keycloak's "Update Password" required action now: no token until it's changed.
                 .addFilterAfter(
-                        new TenantContextFilter(tenantLookup, problemWriter), PasswordChangeRequiredFilter.class);
+                        new TenantContextFilter(principalResolver, tenantLookup, problemWriter),
+                        BearerTokenAuthenticationFilter.class);
         return http.build();
     }
 
@@ -125,7 +124,7 @@ class SecurityConfig {
     }
 
     /**
-     * No username/password authentication through Spring Security: login is our own endpoint.
+     * No username/password authentication through Spring Security: login happens at Keycloak.
      * Declaring this stops Boot generating (and logging) a default user and password.
      */
     @Bean

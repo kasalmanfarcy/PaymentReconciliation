@@ -168,11 +168,11 @@ class LogLeakIT extends AbstractIntegrationTest {
     private UUID member(UUID org, Role role) {
         UUID id = Ids.newId();
         jdbc.update(
-                "INSERT INTO app_user (id, email, display_name, password_hash, must_change_password)"
-                        + " VALUES (?, ?, ?, 'unused', false)",
+                "INSERT INTO app_user (id, email, display_name, external_subject) VALUES (?, ?, ?, ?)",
                 id,
                 CANARY_EMAIL_PART + "+" + id + CANARY_DOMAIN,
-                "Canary " + CANARY_NOTE);
+                "Canary " + CANARY_NOTE,
+                id.toString()); // linked to the token subject, as TestData does
         data().addMembership(id, org, role);
         return id;
     }

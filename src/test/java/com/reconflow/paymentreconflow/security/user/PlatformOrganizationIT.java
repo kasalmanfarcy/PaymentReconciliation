@@ -50,9 +50,17 @@ class PlatformOrganizationIT extends AbstractIntegrationTest {
                         orgId,
                         adminEmail))
                 .isEqualTo("ORG_ADMIN");
-        login(adminEmail, temporaryPassword)
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$.memberships[0].organizationId").value(orgId.toString()));
+        // The first admin's Keycloak account exists with that temporary password, linked by sub; a
+        // token for it is the new organization's admin.
+        String subject = jdbc.queryForObject(
+                "select external_subject from app_user where lower(email) = lower(?)", String.class, adminEmail);
+        assertThat(idp.account(subject).password()).isEqualTo(temporaryPassword);
+        mockMvc.perform(get("/api/v1/members")
+                        .header(
+                                "Authorization",
+                                com.reconflow.paymentreconflow.support.TestTokens.bearer(
+                                        tokens().forSubject(subject, c -> {}))))
+                .andExpect(status().isOk());
         mockMvc.perform(get("/api/v1/platform/organizations")
                         .with(as(platformAdmin.id()))
                         .param("size", "200"))

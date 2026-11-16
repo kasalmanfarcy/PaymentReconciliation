@@ -13,7 +13,7 @@
 # Times: "wall" is measured here around the HTTP calls and polling (0.2 s resolution); "db" is the
 # server's own started_at -> completed_at, which excludes queue wait and polling.
 #
-# Environment: BASE (http://localhost:8080), EMAIL (admin@acme.test), RECONFLOW_SEED_PASSWORD,
+# Environment: BASE (http://localhost:8080), EMAIL (admin@acme.test), PASSWORD, KEYCLOAK,
 # PSQL (how to reach the database; default: psql inside the compose postgres container), ORG (reuse
 # this organization instead of creating one per repetition; scripts/preload.sh uses it).
 # Local only: it talks to the URL in BASE and to the compose database, nothing else.
@@ -23,7 +23,7 @@ DATASET=${1:?usage: bench_import.sh <dataset-dir> [repetitions]}
 REPS=${2:-1}
 BASE=${BASE:-http://localhost:8080}
 EMAIL=${EMAIL:-admin@acme.test}
-PASSWORD=${RECONFLOW_SEED_PASSWORD:-reconflow-local-demo}
+PASSWORD=${PASSWORD:-reconflow-local-demo} # the local Keycloak realm's demo password
 PSQL=${PSQL:-docker compose exec -T -e PGPASSWORD=${DB_PASSWORD:-} postgres psql -U ${DB_USER:-reconflow} -d paymentreconflow -qAt}
 
 expected="$DATASET/expected.json"
@@ -38,8 +38,10 @@ now() { python3 -c 'import time; print(f"{time.time():.3f}")'; }
 elapsed() { python3 -c "print(f'{$2 - $1:.2f}')"; }
 
 token() {
-  curl -sf -X POST "$BASE/api/v1/auth/login" -H 'Content-Type: application/json' \
-    -d "{\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\"}" | jq -r .accessToken
+  # M10.1: tokens come from Keycloak (the local realm's demo client).
+  curl -sf -X POST "${KEYCLOAK:-http://localhost:8180}/realms/reconflow/protocol/openid-connect/token" \
+    -d grant_type=password -d client_id=reconflow-demo --data-urlencode "username=$EMAIL" \
+    --data-urlencode "password=$PASSWORD" | jq -r .access_token
 }
 
 new_org() {

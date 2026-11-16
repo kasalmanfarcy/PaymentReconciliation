@@ -167,7 +167,7 @@ Credentials live in a gitignored `.env` in the project root, read by both Docker
 
 ```bash
 cp .env.example .env
-# optionally change the passwords (DB_*, S3_SECRET_KEY)
+# optionally change the passwords (DB_*, S3_SECRET_KEY, KEYCLOAK_*)
 ```
 
 The `local` profile imports it with `spring.config.import: optional:file:.env[.properties]`. Real
@@ -202,13 +202,15 @@ script once, as a superuser, before the first deploy.
 
 ```bash
 docker compose up -d
-docker compose ps        # postgres and minio "healthy"; minio-init exited (0) after creating the bucket
+docker compose ps        # postgres, minio and keycloak "healthy"; minio-init exited (0)
 ```
 
 PostgreSQL listens on `localhost:5432` (change `DB_PORT` and `DB_URL` if that's taken), the MinIO
 S3 API on `localhost:9000` and its console on `http://localhost:9001` (log in with `S3_ACCESS_KEY` /
 `S3_SECRET_KEY`; bucket `reconflow-imports`). Data persists in named volumes;
-`docker compose down -v` wipes it.
+`docker compose down -v` wipes it. Keycloak (M10.1) listens on `http://localhost:8180`; its admin
+console logs in as `admin` / `KEYCLOAK_ADMIN_PASSWORD`, and the `reconflow` realm is imported from
+`infra/keycloak/realm-reconflow.json` on first start.
 
 ### Run
 
@@ -216,7 +218,7 @@ S3 API on `localhost:9000` and its console on `http://localhost:9001` (log in wi
 SPRING_PROFILES_ACTIVE=local,api,worker ./mvnw spring-boot:run
 ```
 
-Flyway applies `V1`–`V9` on first startup (`V7`/`V8` are M8's report support, `V9` M9.16's archive manifest) (`V5` is M6's engine support: summary columns, `exception_case_run`, `uuid_generate_v7()`, the reference index and the one-active-run-per-scope index; `V6` makes exception notes and status history append-only with triggers). Hibernate runs in `validate` mode, so a mismatch between
+Flyway applies `V1`–`V12` on first startup (`V7`/`V8` are M8's report support, `V9` M9.16's archive manifest, `V10` the application role's grants, `V11` the pending-job index, `V12` the Keycloak link column) (`V5` is M6's engine support: summary columns, `exception_case_run`, `uuid_generate_v7()`, the reference index and the one-active-run-per-scope index; `V6` makes exception notes and status history append-only with triggers). Hibernate runs in `validate` mode, so a mismatch between
 the entities and the schema fails the boot rather than silently altering it.
 
 | Profile | Kind | Effect |
@@ -243,9 +245,12 @@ Errors are RFC 9457 Problem Details with `code` and `requestId`
 
 ### Log in (local)
 
-The `local` profile seeds demo data on first start (once; a second start seeds nothing) and
-generates a fresh JWT signing key at every start, so tokens die on restart. Every seeded user's
-password is `reconflow-local-demo` (override with `RECONFLOW_SEED_PASSWORD`).
+Login is Keycloak's (M10.1): ReconFlow validates its tokens and never sees a password. The local
+realm holds the demo accounts below, all with the documented demo password `reconflow-local-demo`
+(local realm only, never a deployed one), and the `local` profile seeds the matching ReconFlow side
+(organizations, memberships, users linked by Keycloak id) on first start. The `reconflow-demo` client
+allows the password grant so curl and the scripts can get a token; a browser UI would use
+`reconflow-web` (authorization code with PKCE). Tokens last 15 minutes.
 
 | Account | Organization(s) and role |
 |---|---|
@@ -255,10 +260,9 @@ password is `reconflow-local-demo` (override with `RECONFLOW_SEED_PASSWORD`).
 | `platform@reconflow.test` | Platform admin: manages organizations, sees no tenant data |
 
 ```bash
-TOKEN=$(curl -s -c cookies.txt localhost:8080/api/v1/auth/login -H 'Content-Type: application/json' \
-  -d '{"email":"admin@acme.test","password":"reconflow-local-demo"}' | jq -r .accessToken)
+TOKEN=$(curl -s localhost:8180/realms/reconflow/protocol/openid-connect/token \
+  -d grant_type=password -d client_id=reconflow-demo -d username=admin@acme.test -d password=reconflow-local-demo | jq -r .access_token)
 curl -s localhost:8080/api/v1/members -H "Authorization: Bearer $TOKEN" | jq
-curl -s -b cookies.txt -X POST localhost:8080/api/v1/auth/refresh | jq      # rotates the refresh cookie
 ```
 
 ### Import a file (local)
@@ -267,8 +271,8 @@ Uploads are asynchronous: `202 Accepted` with the batch and a `Location` to poll
 `worker` role, on in this local setup) processes the file in the background.
 
 ```bash
-TOKEN=$(curl -s localhost:8080/api/v1/auth/login -H 'Content-Type: application/json' \
-  -d '{"email":"uploader@acme.test","password":"reconflow-local-demo"}' | jq -r .accessToken)
+TOKEN=$(curl -s localhost:8180/realms/reconflow/protocol/openid-connect/token \
+  -d grant_type=password -d client_id=reconflow-demo -d username=uploader@acme.test -d password=reconflow-local-demo | jq -r .access_token)
 curl -s localhost:8080/api/v1/imports -H "Authorization: Bearer $TOKEN" \
   -F file=@docs/samples/ledger-basic.csv --form-string sourceType=INTERNAL_LEDGER | jq
 curl -s localhost:8080/api/v1/imports -H "Authorization: Bearer $TOKEN" \
@@ -288,8 +292,8 @@ With both basic files imported, start a run as a user with `RUN_CREATE` (an inve
 or org admin). It is asynchronous too: `202 Accepted`, then poll until `COMPLETED`.
 
 ```bash
-TOKEN=$(curl -s localhost:8080/api/v1/auth/login -H 'Content-Type: application/json' \
-  -d '{"email":"investigator@acme.test","password":"reconflow-local-demo"}' | jq -r .accessToken)
+TOKEN=$(curl -s localhost:8180/realms/reconflow/protocol/openid-connect/token \
+  -d grant_type=password -d client_id=reconflow-demo -d username=investigator@acme.test -d password=reconflow-local-demo | jq -r .access_token)
 RUN=$(curl -s localhost:8080/api/v1/reconciliation-runs -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' -H 'Idempotency-Key: demo-oct-1' \
   -d '{"periodStart":"2026-10-01","periodEnd":"2026-10-02","currency":"AED"}' | jq -r .id)
@@ -320,24 +324,28 @@ curl -s localhost:8080/api/v1/exceptions/$CASE/resolve -H "Authorization: Bearer
 `{"assignedTo": "<user id>"}` (or `null`) in the same PATCH assigns the case. An org admin can then reopen it (`POST .../reopen` with `If-Match: "2"` and a `reason`) and read
 the whole trail with `GET /api/v1/audit-events?entityType=EXCEPTION_CASE&entityId=$CASE`.
 
-Access tokens last 15 minutes; the refresh token is an `HttpOnly` cookie scoped to `/api/v1/auth`.
-Users never sign up: an org admin creates them with a temporary password (`POST /api/v1/members`),
-which must be changed at first login. Design: [authentication.plan](plans/authentication.plan),
-[ADR 0013](docs/adr/0013-build-authentication-in-house.md).
+Access tokens last 15 minutes; Keycloak rotates refresh tokens and locks an account for 15 minutes
+after 5 failed passwords. Users never sign up: an org admin creates them (`POST /api/v1/members`),
+which creates the Keycloak account with a temporary password that must be changed at first login.
+Design: [ADR 0015](docs/adr/0015-delegate-authentication-to-keycloak.md) (which supersedes the
+in-house design of [ADR 0013](docs/adr/0013-build-authentication-in-house.md)).
 
 ### Configure a non-local environment
 
 | Variable | Purpose |
 |---|---|
-| `JWT_PRIVATE_KEY`, `JWT_PUBLIC_KEY` | RS256 key pair as PEM (PKCS#8 private, X.509 public). Required in `prod`: startup fails without them. Never commit them |
-| `RECONFLOW_BOOTSTRAP_ADMIN_EMAIL` | One-time: if set and no platform admin exists, creates one and logs its temporary password once. It then creates organizations through `POST /api/v1/platform/organizations` |
+| `DB_URL`, `DB_APP_USER`, `DB_APP_PASSWORD` | The application's database role (`reconflow_app`, M10.7) |
+| `DB_MIGRATOR_USER`, `DB_MIGRATOR_PASSWORD` | Flyway's role (`reconflow_migrator`); moves to a separate migrate step in M11.5 |
+| `OIDC_ISSUER_URI` | Keycloak realm URL, exactly as it appears in the tokens' `iss`, e.g. `https://id.example.com/realms/reconflow` |
+| `KEYCLOAK_BASE_URL`, `KEYCLOAK_ADMIN_CLIENT_SECRET` | Keycloak's Admin API (user management), as the `reconflow-admin` service account |
+| `RECONFLOW_BOOTSTRAP_ADMIN_EMAIL` | One-time: if set and no platform admin exists, makes that email the platform admin. Create the account in Keycloak with the email marked verified; its first login links it. No password is generated or logged |
 
-For example: `openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out jwt.pem` and
-`openssl pkey -in jwt.pem -pubout -out jwt.pub.pem`, then load the files into the variables.
+`prod` refuses to start, naming the variable, if any of these is missing. A deployed realm must not
+enable the password grant (`reconflow-demo` is local only) and runs Keycloak with `start`, its own
+database and TLS (M11).
 
-Row-level security only takes effect when the application connects as a non-superuser that
-doesn't own the tables (M10.7); local and test databases connect as superusers, so the RLS tests
-switch roles explicitly.
+Every security control, the threat it addresses and the test that proves it:
+[docs/security.md](docs/security.md).
 
 `./mvnw spring-boot:test-run` runs the application against a Testcontainers PostgreSQL instead of
 Compose.
@@ -397,7 +405,7 @@ request.
 
 | Endpoint | Purpose |
 | -------- | ------- |
-| `POST /api/v1/auth/login`, `/refresh`, `/logout`, `/change-password` | Session lifecycle |
+| (Keycloak) `POST /realms/reconflow/protocol/openid-connect/token` | Tokens; login, refresh, logout and password changes are Keycloak's since M10.1 |
 | `GET/POST /api/v1/members`, `PATCH /api/v1/members/{userId}`, `POST …/reset-password`, `POST …/disable` | Member management (`MEMBER_MANAGE`) |
 | `GET/POST /api/v1/platform/organizations` | Organizations (platform admins only) |
 | `POST /api/v1/imports` | Upload a ledger or gateway CSV (multipart); `202` with the batch (`IMPORT_CREATE`) |

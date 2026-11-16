@@ -15,7 +15,6 @@ import org.jspecify.annotations.Nullable;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
-import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 
@@ -35,7 +34,7 @@ public class PlatformOrganizationService {
     private final OrganizationService organizations;
     private final AppUserRepository users;
     private final MembershipRepository memberships;
-    private final PasswordEncoder encoder;
+    private final AccountProvisioning provisioning;
     private final TenantScope tenantScope;
     private final CurrentUser currentUser;
     private final TransactionTemplate tx;
@@ -45,7 +44,7 @@ public class PlatformOrganizationService {
             OrganizationService organizations,
             AppUserRepository users,
             MembershipRepository memberships,
-            PasswordEncoder encoder,
+            AccountProvisioning provisioning,
             TenantScope tenantScope,
             CurrentUser currentUser,
             TransactionTemplate tx,
@@ -53,7 +52,7 @@ public class PlatformOrganizationService {
         this.organizations = organizations;
         this.users = users;
         this.memberships = memberships;
-        this.encoder = encoder;
+        this.provisioning = provisioning;
         this.tenantScope = tenantScope;
         this.currentUser = currentUser;
         this.tx = tx;
@@ -86,9 +85,10 @@ public class PlatformOrganizationService {
                     if (existing.isPresent()) {
                         admin = existing.get();
                     } else {
-                        temporaryPassword = TemporaryPasswords.generate();
-                        admin = users.save(
-                                AppUser.create(adminEmail, adminDisplayName, encoder.encode(temporaryPassword), true));
+                        // Keycloak account first, deleted again if this transaction rolls back.
+                        var account = provisioning.provision(adminEmail, adminDisplayName);
+                        temporaryPassword = account.temporaryPassword();
+                        admin = users.save(AppUser.create(adminEmail, adminDisplayName, account.subject()));
                     }
                     memberships.save(Membership.create(admin.getId(), orgId, Role.ORG_ADMIN, platformAdmin));
                     audit.record(AuditEntry.of(AuditAction.MEMBER_CREATED, AuditEntityType.MEMBERSHIP, admin.getId())

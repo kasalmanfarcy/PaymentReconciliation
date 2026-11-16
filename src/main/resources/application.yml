@@ -64,6 +64,20 @@ spring:
         default-page-size: 50
         max-page-size: 200
 
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          # M10.1: Keycloak issues the tokens; this app only validates them. Boot reads the discovery
+          # document lazily (the app starts even if Keycloak is still starting), caches the JWKS and
+          # re-fetches it for an unknown kid, so Keycloak rotates its keys with no change here. The
+          # issuer must be the same URL in every token: Keycloak puts the hostname it was reached on
+          # into iss, so KC_HOSTNAME pins it (compose.yaml).
+          issuer-uri: ${OIDC_ISSUER_URI:http://localhost:8180/realms/reconflow}
+          # Rejects tokens Keycloak issued for other clients. Keycloak's default aud is "account";
+          # the realm's audience mapper adds this one.
+          audiences: reconflow-api
+
   modulith:
     moments:
       # Spring Modulith's Moments (time-passing events, unused here) puts @EnableScheduling on
@@ -156,14 +170,13 @@ management:
 
 reconflow:
   auth:
-    jwt:
-      issuer: reconflow
-      audience: reconflow-api
-      access-token-ttl: 15m
-      # PEM, from the environment only (authentication.plan §7). Without them, startup fails
-      # unless generate-ephemeral-key is on, which only the local and test profiles set.
-      private-key: ${JWT_PRIVATE_KEY:}
-      public-key: ${JWT_PUBLIC_KEY:}
+    keycloak:
+      # M10.1: user management through Keycloak's Admin REST API (security.idp). The service-account
+      # client has only manage-users; its secret comes from the environment only.
+      base-url: ${KEYCLOAK_BASE_URL:http://localhost:8180}
+      realm: ${KEYCLOAK_REALM:reconflow}
+      admin-client-id: reconflow-admin
+      admin-client-secret: ${KEYCLOAK_ADMIN_CLIENT_SECRET:}
   bootstrap:
     # One-time: creates the first platform admin in a fresh environment (security.bootstrap).
     admin-email: ${RECONFLOW_BOOTSTRAP_ADMIN_EMAIL:}

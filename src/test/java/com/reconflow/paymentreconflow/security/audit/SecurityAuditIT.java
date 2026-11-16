@@ -5,23 +5,19 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
-import com.reconflow.paymentreconflow.security.token.RefreshCookies;
-import com.reconflow.paymentreconflow.security.token.TokenHasher;
 import com.reconflow.paymentreconflow.shared.context.Role;
 import com.reconflow.paymentreconflow.support.AbstractIntegrationTest;
-import com.reconflow.paymentreconflow.support.TestData;
-import jakarta.servlet.http.Cookie;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.MediaType;
-import org.springframework.test.web.servlet.MvcResult;
 
 /**
- * M3.3h: each authentication and membership event is written exactly once per action, in the same
- * transaction as the change; a refused or rolled-back action leaves none; no secret is ever in a
- * payload.
+ * M3.3h: each membership event is written exactly once per action, in the same transaction as the
+ * change; a refused or rolled-back action leaves none; no secret is ever in a payload. Since M10.1,
+ * login, lockout, logout and password-change events are Keycloak's (its login and admin events);
+ * what ReconFlow still audits is linking an IdP account to a user ({@code USER_LINKED}).
  */
 class SecurityAuditIT extends AbstractIntegrationTest {
 
@@ -37,111 +33,24 @@ class SecurityAuditIT extends AbstractIntegrationTest {
         return events(action, entityId).size();
     }
 
-    private static String cookie(MvcResult result) {
-        return result.getResponse().getCookie(RefreshCookies.NAME).getValue();
-    }
-
     @Test
-    void successfulAndFailedLoginsAreRecordedOnceWithoutSecrets() throws Exception {
-        var user = data().newUser();
+    void aFirstLoginLinkedByVerifiedEmailIsAuditedAsAPlatformEvent() throws Exception {
+        var user = data().newUnlinkedUser("linked-" + UUID.randomUUID() + "@example.test");
+        String subject = "kc-" + UUID.randomUUID();
 
-        login(user.email(), TestData.PASSWORD).andExpect(status().isOk());
-        login(user.email(), "a-wrong-password-guess").andExpect(status().isUnauthorized());
+        mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get("/api/v1/exceptions")
+                        .header(
+                                "Authorization",
+                                com.reconflow.paymentreconflow.support.TestTokens.bearer(tokens().forSubject(
+                                                subject,
+                                                c -> c.claim("email", user.email())
+                                                        .claim("email_verified", true)))))
+                .andExpect(status().isNotFound()); // linked and authenticated; a member of nothing: 404
 
-        var succeeded = events("LOGIN_SUCCEEDED", user.id());
-        assertThat(succeeded).singleElement().satisfies(e -> {
+        assertThat(events("USER_LINKED", user.id())).singleElement().satisfies(e -> {
+            assertThat(e.get("organization_id")).isNull();
             assertThat(e.get("actor_id")).isEqualTo(user.id());
-            assertThat(e.get("organization_id")).isNull(); // login is global
-            assertThat((String) e.get("payload")).contains("\"ip\"");
         });
-        var failed = events("LOGIN_FAILED", user.id());
-        assertThat(failed)
-                .singleElement()
-                .satisfies(e -> assertThat((String) e.get("payload"))
-                        .contains("bad-password")
-                        .doesNotContain("a-wrong-password-guess")
-                        .doesNotContain(TestData.PASSWORD));
-    }
-
-    @Test
-    void anUnknownEmailIsRecordedAsAHashNotAsTyped() throws Exception {
-        String email = "Stuffing-" + UUID.randomUUID() + "@Example.test";
-        String hash = TokenHasher.sha256Hex(email.toLowerCase());
-
-        login(email, "some-password-guess").andExpect(status().isUnauthorized());
-
-        var rows = jdbc.queryForList(
-                "select actor_id, payload::text as payload from audit_event"
-                        + " where action = 'LOGIN_FAILED' and payload->>'emailSha256' = ?",
-                hash);
-        assertThat(rows).singleElement().satisfies(e -> {
-            assertThat(e.get("actor_id")).isNull();
-            assertThat((String) e.get("payload")).doesNotContain(email).doesNotContain(email.toLowerCase());
-        });
-    }
-
-    @Test
-    void theLockIsRecordedExactlyOnce() throws Exception {
-        var user = data().newUser();
-        for (int i = 0; i < 7; i++) {
-            login(user.email(), "wrong-guess-" + i);
-        }
-
-        assertThat(count("ACCOUNT_LOCKED", user.id())).isEqualTo(1);
-        assertThat(count("LOGIN_FAILED", user.id())).isEqualTo(7);
-    }
-
-    @Test
-    void reuseIsRecordedOnceButAnOrdinaryRevokedTokenRaisesNothing() throws Exception {
-        var user = data().newUser();
-        String first = cookie(login(user.email(), TestData.PASSWORD).andReturn());
-        mockMvc.perform(post("/api/v1/auth/refresh").cookie(new Cookie(RefreshCookies.NAME, first)))
-                .andExpect(status().isOk());
-        UUID family = jdbc.queryForObject(
-                "select family_id from refresh_token where token_hash = ?", UUID.class, TokenHasher.sha256Hex(first));
-
-        mockMvc.perform(post("/api/v1/auth/refresh").cookie(new Cookie(RefreshCookies.NAME, first)))
-                .andExpect(status().isUnauthorized());
-
-        assertThat(events("REFRESH_TOKEN_REUSE", family))
-                .singleElement()
-                .satisfies(e -> assertThat(e.get("actor_id")).isEqualTo(user.id()));
-
-        // A token revoked by logout comes back from another device: 401, and no alarm.
-        String other = cookie(login(user.email(), TestData.PASSWORD).andReturn());
-        mockMvc.perform(post("/api/v1/auth/logout").cookie(new Cookie(RefreshCookies.NAME, other)));
-        UUID otherFamily = jdbc.queryForObject(
-                "select family_id from refresh_token where token_hash = ?", UUID.class, TokenHasher.sha256Hex(other));
-        mockMvc.perform(post("/api/v1/auth/refresh").cookie(new Cookie(RefreshCookies.NAME, other)))
-                .andExpect(status().isUnauthorized());
-        assertThat(count("REFRESH_TOKEN_REUSE", otherFamily)).isZero();
-    }
-
-    @Test
-    void logoutAndPasswordChangeAreRecordedOnce() throws Exception {
-        var user = data().newUser();
-        MvcResult session = login(user.email(), TestData.PASSWORD).andReturn();
-        String token = jsonMapper
-                .readTree(session.getResponse().getContentAsString())
-                .get("accessToken")
-                .asString();
-
-        mockMvc.perform(post("/api/v1/auth/change-password")
-                        .header("Authorization", "Bearer " + token)
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(jsonMapper.writeValueAsString(Map.of(
-                                "currentPassword", TestData.PASSWORD, "newPassword", "another-long-passphrase"))))
-                .andExpect(status().isOk());
-        String newCookie = cookie(login(user.email(), "another-long-passphrase").andReturn());
-        mockMvc.perform(post("/api/v1/auth/logout").cookie(new Cookie(RefreshCookies.NAME, newCookie)))
-                .andExpect(status().isNoContent());
-        // Logging out twice is still one LOGOUT: the second finds nothing live to revoke.
-        mockMvc.perform(post("/api/v1/auth/logout").cookie(new Cookie(RefreshCookies.NAME, newCookie)));
-
-        assertThat(events("PASSWORD_CHANGED", user.id()))
-                .singleElement()
-                .satisfies(e -> assertThat((String) e.get("payload")).doesNotContain("another-long-passphrase"));
-        assertThat(count("LOGOUT", user.id())).isEqualTo(1);
     }
 
     @Test

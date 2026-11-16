@@ -1,24 +1,17 @@
 package com.reconflow.paymentreconflow.support;
 
-import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
-
 import com.reconflow.paymentreconflow.TestcontainersConfiguration;
 import com.reconflow.paymentreconflow.shared.context.TenantScope;
-import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Supplier;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.context.annotation.Import;
-import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.security.oauth2.jwt.JwtEncoder;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
-import org.springframework.test.web.servlet.ResultActions;
 import org.springframework.test.web.servlet.request.RequestPostProcessor;
 import tools.jackson.databind.json.JsonMapper;
 
@@ -37,7 +30,7 @@ import tools.jackson.databind.json.JsonMapper;
 @SpringBootTest
 @AutoConfigureMockMvc
 @ActiveProfiles("test")
-@Import(TestcontainersConfiguration.class)
+@Import({TestcontainersConfiguration.class, StandInIdentityConfig.class})
 public abstract class AbstractIntegrationTest {
 
     @Autowired
@@ -62,18 +55,16 @@ public abstract class AbstractIntegrationTest {
     @Autowired
     protected JsonMapper jsonMapper;
 
+    /** Records what the application asked of the identity provider (M10.1). */
     @Autowired
-    private JwtEncoder jwtEncoder;
+    protected FakeIdentityProvider idp;
 
-    @Value("${reconflow.auth.jwt.issuer}")
-    private String issuer;
-
-    @Value("${reconflow.auth.jwt.audience}")
+    @Value("${spring.security.oauth2.resourceserver.jwt.audiences}")
     private String audience;
 
-    /** Access tokens minted with the app's own key (or deliberately not). */
+    /** Access tokens from the stand-in issuer, as Keycloak would issue them (or deliberately not). */
     protected TestTokens tokens() {
-        return new TestTokens(jwtEncoder, issuer, audience);
+        return new TestTokens(TestIssuer.instance(), audience);
     }
 
     /** Authenticates a MockMvc request as the user, with a freshly minted access token. */
@@ -115,28 +106,5 @@ public abstract class AbstractIntegrationTest {
     /** Fresh organizations and users, written with plain SQL. */
     protected TestData data() {
         return new TestData(jdbc);
-    }
-
-    /**
-     * POST /api/v1/auth/login from a random client IP, so the per-IP login rate limit (M3.3f)
-     * never couples unrelated tests. Rate-limit tests set the IP themselves.
-     */
-    protected ResultActions login(String email, String password) throws Exception {
-        return mockMvc.perform(post("/api/v1/auth/login")
-                .with(randomClientIp())
-                .contentType(MediaType.APPLICATION_JSON)
-                .content(jsonMapper.writeValueAsString(Map.of("email", email, "password", password))));
-    }
-
-    protected static RequestPostProcessor randomClientIp() {
-        String ip = "10.%d.%d.%d"
-                .formatted(
-                        ThreadLocalRandom.current().nextInt(256),
-                        ThreadLocalRandom.current().nextInt(256),
-                        ThreadLocalRandom.current().nextInt(1, 255));
-        return request -> {
-            request.setRemoteAddr(ip);
-            return request;
-        };
     }
 }

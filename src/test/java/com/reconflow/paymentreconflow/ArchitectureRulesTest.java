@@ -55,15 +55,17 @@ class ArchitectureRulesTest {
     }
 
     @Test
-    void loginAndTokenInternalsStayInsideSecurity() {
-        // authentication.plan §6. Modulith already hides security's sub-packages; this rule names
-        // the two that matter most, so the failure message says exactly what went wrong.
+    void identityProviderInternalsStayInsideSecurity() {
+        // authentication.plan §6 named security.auth and security.token; M10.1 deleted both (Keycloak
+        // issues tokens now). What took their place is the Admin API client in security.idp: no
+        // business module may call Keycloak directly, or a second IdP integration would grow
+        // outside the one seam.
         noClasses()
                 .that()
                 .resideOutsideOfPackage(ROOT + ".security..")
                 .should()
                 .dependOnClassesThat()
-                .resideInAnyPackage(ROOT + ".security.auth..", ROOT + ".security.token..")
+                .resideInAnyPackage(ROOT + ".security.idp..")
                 .check(classes);
     }
 
@@ -100,16 +102,13 @@ class ArchitectureRulesTest {
 
     @Test
     void everyEndpointDeclaresItsPermission() {
-        // M3.7: a forgotten annotation must be a red build, not an open endpoint. Only the auth
-        // endpoints (login, refresh, logout: public; change-password: any authenticated user) are
-        // exempt.
+        // M3.7: a forgotten annotation must be a red build, not an open endpoint. Until M10.1 the
+        // auth endpoints (login, refresh, logout, change-password) were exempt; they moved to
+        // Keycloak, so now there are no exceptions at all.
         methods()
                 .that()
                 .areDeclaredInClassesThat()
                 .areAnnotatedWith(RestController.class)
-                .and()
-                .areDeclaredInClassesThat()
-                .resideOutsideOfPackage(ROOT + ".security.auth..")
                 .and()
                 .areMetaAnnotatedWith(RequestMapping.class)
                 .should()

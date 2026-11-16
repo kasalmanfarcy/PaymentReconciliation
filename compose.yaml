@@ -1,8 +1,8 @@
-# Local dependencies for ReconFlow: PostgreSQL 16 and S3-compatible object storage.
+# Local dependencies for ReconFlow: PostgreSQL 16, S3-compatible object storage and Keycloak.
 #
 #   cp .env.example .env      # Compose reads .env from this directory, like the app does
 #   docker compose up -d
-#   docker compose ps         # postgres and minio: "healthy"; minio-init: exited (0)
+#   docker compose ps         # postgres, minio and keycloak: "healthy"; minio-init: exited (0)
 #
 # Data lives in named volumes and survives `docker compose down`.
 # `docker compose down -v` wipes it (a fresh database re-runs every migration).
@@ -79,6 +79,34 @@ services:
       S3_SECRET_KEY: ${S3_SECRET_KEY}
       S3_BUCKET: ${S3_BUCKET:-reconflow-imports}
     restart: "no"
+
+  # Identity provider (M10.1): issues every access token; ReconFlow only validates them.
+  # start-dev = embedded H2 database and plain HTTP: local only. A deployed Keycloak runs `start`,
+  # with its own PostgreSQL database and TLS (M11). The realm (clients, policies, demo users) is
+  # imported from git on first start, so it is reproducible; it is never re-imported over changes.
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.2   # pinned; check quay.io/keycloak/keycloak tags before bumping
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?set KEYCLOAK_ADMIN_PASSWORD in .env}
+      # One issuer URL for the browser and the app alike: Keycloak writes the hostname it was reached
+      # on into `iss`, and a mismatch is a confusing 401 on every request.
+      KC_HOSTNAME: http://localhost:8180
+      KC_HTTP_PORT: "8180"
+      KC_HEALTH_ENABLED: "true"
+      # Substituted into the realm file's ${...} placeholder at import: the secret stays out of git.
+      RECONFLOW_KEYCLOAK_ADMIN_CLIENT_SECRET: ${KEYCLOAK_ADMIN_CLIENT_SECRET:?set KEYCLOAK_ADMIN_CLIENT_SECRET in .env}
+    ports:
+      - "8180:8180"
+    volumes:
+      - ./infra/keycloak/realm-reconflow.json:/opt/keycloak/data/import/realm-reconflow.json:ro
+    healthcheck:
+      # Health is on the management port (9000, not published); the image has no curl.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/9000 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q UP <&3"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
 
   # --- Observability (M9.10): `docker compose --profile observability up -d` -------------------
   # Off by default, so a plain `docker compose up` stays light. Scrapes the app running on the host

@@ -45,7 +45,6 @@ class MemberController {
             String displayName,
             Role role,
             UserStatus status,
-            boolean mustChangePassword,
             java.time.Instant createdAt,
             @Nullable String temporaryPassword) {}
 
@@ -82,7 +81,6 @@ class MemberController {
                         m.displayName(),
                         m.role(),
                         m.status(),
-                        m.mustChangePassword(),
                         m.createdAt(),
                         created.temporaryPassword()));
     }

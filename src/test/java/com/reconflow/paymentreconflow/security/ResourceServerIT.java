@@ -1,8 +1,8 @@
 package com.reconflow.paymentreconflow.security;
 
 import static com.reconflow.paymentreconflow.support.TestTokens.bearer;
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
-import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -12,12 +12,15 @@ import com.reconflow.paymentreconflow.shared.context.Role;
 import com.reconflow.paymentreconflow.support.AbstractIntegrationTest;
 import java.time.Instant;
 import java.util.List;
+import java.util.UUID;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.ResultActions;
 
 /**
- * M3.3e: the app validates its own JWTs, and every rejection is the same ProblemDetail 401.
+ * M3.3e, M10.1: the app validates Keycloak's access tokens (here signed by the stand-in
+ * {@code TestIssuer}, through the real issuer-uri decoder) and maps their subject to a user; every
+ * rejection is the same ProblemDetail 401.
  *
  * <p>"Authenticated" is probed with {@code GET /api/v1/no-such-endpoint}: a valid token gets past
  * security to MVC's 404, an invalid one stops at 401.
@@ -100,21 +103,62 @@ class ResourceServerIT extends AbstractIntegrationTest {
     }
 
     @Test
-    void aPendingPasswordChangeBlocksEverythingButChangePasswordAndLogout() throws Exception {
+    void aTokenFromAnotherIssuerSignedWithItsOwnKeyIs401() throws Exception {
         var user = data().newUser();
-        String token = tokens().forUser(user.id(), c -> c.claim("pwd_change", true));
+        // What another realm (or another IdP) would issue: its own iss and its own key.
+        String token = tokens().forUser(user.id(), c -> c.issuer("http://localhost:1/realms/other"));
 
-        mockMvc.perform(get(PROBE).header("Authorization", bearer(token)))
-                .andExpect(status().isForbidden())
-                .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON))
-                .andExpect(jsonPath("$.code").value("password-change-required"));
-        // Allowed through (and then fails validation on the empty body, not on the gate).
-        mockMvc.perform(post("/api/v1/auth/change-password")
-                        .header("Authorization", bearer(token))
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content("{}"))
-                .andExpect(status().isBadRequest());
-        mockMvc.perform(post("/api/v1/auth/logout").header("Authorization", bearer(token)))
-                .andExpect(status().isNoContent());
+        assertUnauthenticated(probe(token));
+        assertUnauthenticated(probe(tokens().signedWithAnotherKey(user.id())));
+    }
+
+    @Test
+    void aValidTokenForAnAccountReconFlowDoesNotKnowIs401() throws Exception {
+        // Correctly signed, right issuer and audience, but no app_user has this subject and there
+        // is no verified email to link by: authenticated at Keycloak, unknown here.
+        assertUnauthenticated(probe(tokens().forSubject("unknown-" + UUID.randomUUID(), c -> {})));
+    }
+
+    @Test
+    void aVerifiedEmailLinksAPreProvisionedUserOnceByItsSubject() throws Exception {
+        var user = data().newUnlinkedUser("first-login-" + UUID.randomUUID() + "@example.test");
+        String subject = "kc-" + UUID.randomUUID();
+
+        probe(tokens().forSubject(
+                                subject,
+                                c -> c.claim("email", user.email().toUpperCase())
+                                        .claim("email_verified", true)))
+                .andExpect(status().isNotFound()); // authenticated: past security to MVC's 404
+
+        assertThat(jdbc.queryForObject("select external_subject from app_user where id = ?", String.class, user.id()))
+                .isEqualTo(subject);
+        // From now on the subject alone is enough; the email is never consulted again.
+        probe(tokens().forSubject(subject, c -> {})).andExpect(status().isNotFound());
+    }
+
+    @Test
+    void anUnverifiedEmailNeverLinks() throws Exception {
+        // Anyone who can register this address at the IdP without proving it would otherwise become
+        // this user: an account takeover.
+        var user = data().newUnlinkedUser("unverified-" + UUID.randomUUID() + "@example.test");
+
+        assertUnauthenticated(probe(tokens().forSubject(
+                        "kc-" + UUID.randomUUID(),
+                        c -> c.claim("email", user.email()).claim("email_verified", false))));
+        assertUnauthenticated(
+                probe(tokens().forSubject("kc-" + UUID.randomUUID(), c -> c.claim("email", user.email()))));
+        assertThat(jdbc.queryForObject("select external_subject from app_user where id = ?", String.class, user.id()))
+                .isNull();
+    }
+
+    @Test
+    void anAlreadyLinkedUserIsNeverRelinkedToAnotherSubject() throws Exception {
+        var user = data().newUser(); // linked: external_subject = its id
+
+        assertUnauthenticated(probe(tokens().forSubject(
+                        "kc-" + UUID.randomUUID(),
+                        c -> c.claim("email", user.email()).claim("email_verified", true))));
+        assertThat(jdbc.queryForObject("select external_subject from app_user where id = ?", String.class, user.id()))
+                .isEqualTo(user.id().toString());
     }
 }

@@ -14,15 +14,17 @@ PSQL=${PSQL:-docker compose exec -T -e PGPASSWORD=${DB_PASSWORD:-} postgres psql
 HERE=$(cd "$(dirname "$0")" && pwd)
 
 BASE=${BASE:-http://localhost:8080}
-PASSWORD=${RECONFLOW_SEED_PASSWORD:-reconflow-local-demo}
+PASSWORD=${PASSWORD:-reconflow-local-demo} # the local Keycloak realm's demo password
 SKIP=${SKIP:-0} # organizations already loaded by an earlier, interrupted call
 
 i=0
 for orgdir in "$ROOT"/org-*; do
   i=$((i + 1))
   [ "$i" -le "$SKIP" ] && continue
-  # One login per organization (tokens live 15 minutes; a login per import trips the rate limit).
-  TOKEN=$(curl -sf -X POST "$BASE/api/v1/auth/login" -H 'Content-Type: application/json'     -d "{\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\"}" | jq -r .accessToken)
+  # One login per organization (tokens live 15 minutes; a login per import trips Keycloak's brute-force guard needlessly).
+  TOKEN=$(curl -sf -X POST "${KEYCLOAK:-http://localhost:8180}/realms/reconflow/protocol/openid-connect/token" \
+    -d grant_type=password -d client_id=reconflow-demo --data-urlencode "username=$EMAIL" \
+    --data-urlencode "password=$PASSWORD" | jq -r .access_token)
   export TOKEN
   org=$(uuidgen | tr 'A-Z' 'a-z')
   $PSQL -c "INSERT INTO organization (id, name) VALUES ('$org', 'preload $(basename "$orgdir")');

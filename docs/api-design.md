@@ -25,18 +25,18 @@ Authentication and authorization are designed in [plans/authentication.plan](../
 
 ## 2. Authentication and tenant selection
 
-Full design: [authentication.plan §3–§4](../plans/authentication.plan).
+Full design: [authentication.plan](../plans/authentication.plan) (in-house, M3.3) and [ADR 0015](adr/0015-delegate-authentication-to-keycloak.md) (Keycloak, M10.1).
 
-- **`Authorization: Bearer <access JWT>`** on every route except `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout` (cookie-authenticated) and `/actuator/health/**`. The access token lives 15 minutes; the refresh token is an `HttpOnly` cookie scoped to `/api/v1/auth`.
+- **Login happens at Keycloak** (OpenID Connect; realm `reconflow`). Browsers use the authorization-code flow with PKCE (client `reconflow-web`); the demo scripts use the local realm's `reconflow-demo` client. Keycloak owns passwords, lockout (5 failures, 15 minutes), refresh-token rotation, password changes and MFA; this API has no login, refresh, logout or change-password endpoint.
+- **`Authorization: Bearer <access JWT>`** from Keycloak on every route except `/actuator/health/**`. The API checks the signature (Keycloak's JWKS), `exp`, `iss` and `aud` (must contain `reconflow-api`), then maps the token's `sub` to a ReconFlow user. Access tokens live 15 minutes.
+- **First login of a pre-provisioned user** (created by an org admin, or existing before M10.1): the account is linked by email once, and only if Keycloak marks the email verified; from then on only `sub` counts. A valid token for an account ReconFlow doesn't know is `401`.
 - **`X-Organization-Id: <uuid>`** selects the organization on every org-scoped route. The token carries identity only; membership and permissions are looked up per request, so a role change or removal applies on the next request.
   - Header absent and the user has exactly one membership → that organization is used.
   - Header absent and the user has several → `400 organization-required`.
   - Header present but the user isn't a member, or the organization is suspended → `404 organization-not-found`, so the organization's existence isn't confirmed.
   - Header not a UUID → `400 validation-failed`.
 - **Platform routes** (`/api/v1/platform/**`) take no organization header and require `PLATFORM_ORG_MANAGE`, granted only from `app_user.is_platform_admin` read from the database. A platform admin has **no** access to org-scoped routes (`404` on all of them).
-- While a temporary password is pending (`pwd_change` claim), every route except `POST /auth/change-password` and `POST /auth/logout` returns `403 password-change-required`.
-- `POST /auth/change-password` is about the caller, not an organization: it needs only an active user and takes no `X-Organization-Id`, so a user with several memberships (or none) can still change their password.
-- Login answers `200 {accessToken, expiresIn, memberships: [{organizationId, name, role}]}` plus the refresh cookie; `memberships` lists active organizations only. Login is rate-limited per client IP (10 attempts, refilled at 10 a minute): over the limit is `429 rate-limited` with `Retry-After`.
+- **Temporary passwords** (new members, admin resets) are set in Keycloak with its *Update Password* required action: Keycloak issues no token until the user has chosen a new one. A disabled user is refused by this API on the next request (status checked every time) and by Keycloak for new tokens.
 
 ---
 
@@ -94,11 +94,8 @@ Validation errors add an `errors` array, one entry per problem:
 | `duplicate-columns` | 400 | Upload: a CSV header name repeats |
 | `empty-file` | 400 | Upload: zero bytes, no header, or no data row |
 | `invalid-encoding` | 400 | Upload: the CSV header isn't valid UTF-8 |
-| `password-policy` | 400 | A new password doesn't meet the policy |
-| `unauthenticated` | 401 | Missing, expired, tampered or otherwise invalid token; disabled user |
-| `invalid-credentials` | 401 | Login failed. Identical for unknown email, wrong password and locked account |
+| `unauthenticated` | 401 | Missing, expired, tampered or otherwise invalid token (wrong issuer or audience included); a valid token for an account ReconFlow doesn't know; disabled user |
 | `forbidden` | 403 | Authenticated member without the required permission |
-| `password-change-required` | 403 | A temporary password must be changed first |
 | `not-found` | 404 | Unknown ID **or another tenant's ID**: the two are indistinguishable on purpose |
 | `organization-not-found` | 404 | `X-Organization-Id` names an organization the user isn't a member of, or a suspended one |
 | `method-not-allowed` | 405 | The path exists but not with this HTTP method (added in M2.10) |
@@ -121,6 +118,7 @@ Validation errors add an `errors` array, one entry per problem:
 | `rate-limited` | 429 | Too many requests, with `Retry-After` (seconds). Uploads and import retries: 10 a minute per user per organization; run requests and run retries: 20 a minute (M10.4, `RateLimit-Remaining` on accepted requests). Also when the organization already has 50 imports, runs or exports queued or running (`Retry-After: 30`); the request then created nothing |
 | `internal-error` | 500 | Anything unexpected; no details in the body |
 | `storage-unavailable` | 503 | Object storage didn't answer (an outage, not a problem with the request): an upload stored nothing and created nothing; retry after `Retry-After` seconds. Added in M9.4 (it was a `500` before) |
+| `identity-provider-unavailable` | 503 | Keycloak didn't answer while creating, resetting or disabling an account; nothing was changed in ReconFlow (the transaction rolled back, and an account created in Keycloak is deleted again). Added in M10.1 |
 
 The codes live in one class, `shared.error.ProblemCodes`, kept in sync with this table. An error Spring raises itself with a status that has no row here gets `http-<status>` (for example `http-408`); clients should fall back on the HTTP status for any code they don't recognise.
 
@@ -222,8 +220,6 @@ Strict HTTP says a failed `If-Match` is `412 Precondition Failed`. The project u
 | `POST /exceptions/{id}/notes` | `201 Created` | The note, `Location` |
 | `PATCH /exceptions/{id}`, `POST …/resolve`, `POST …/reopen` | `200 OK` | The updated case, new `ETag` |
 | `POST /members`, `POST /platform/organizations` | `201 Created` | The created resource, `Location` |
-| `POST /auth/login`, `/auth/refresh`, `/auth/change-password` | `200 OK` | Tokens |
-| `POST /auth/logout` | `204 No Content` | — |
 
 **`202` means "accepted for processing, not done".** The file (or run request) and its job row are committed before the response, so the work can't be lost, but it hasn't happened yet. The client polls the `Location` URL until the status is terminal; non-terminal responses carry `Retry-After: 2` to say how often. **`201`** is used only when the resource is complete in its final form by the time the response is sent (a note, a member). ([ADR 0003](adr/0003-asynchronous-imports-and-runs.md).)
 
@@ -237,15 +233,11 @@ Permissions are from [authentication.plan §5](../plans/authentication.plan), pl
 
 | Method and path | Permission | Success | Main errors | Task |
 |---|---|---|---|---|
-| `POST /auth/login` | public | 200 | 401 `invalid-credentials`, 429 | M3.3b |
-| `POST /auth/refresh` | refresh cookie | 200 | 401 | M3.3d |
-| `POST /auth/logout` | refresh cookie | 204 | — | M3.3d |
-| `POST /auth/change-password` | authenticated | 200 | 400 `password-policy`, 401 | M3.3g |
 | `GET /members` | `MEMBER_MANAGE` | 200 page | — | M3.3g |
-| `POST /members` | `MEMBER_MANAGE` | 201 | 400, 409 `already-a-member` | M3.3g |
+| `POST /members` | `MEMBER_MANAGE` | 201 | 400, 409 `already-a-member`, 503 `identity-provider-unavailable` | M3.3g, M10.1 |
 | `PATCH /members/{userId}` | `MEMBER_MANAGE` | 200 | 404, 409 `last-org-admin` | M3.3g |
-| `POST /members/{userId}/reset-password` | `MEMBER_MANAGE` | 200 | 404 | M3.3g |
-| `POST /members/{userId}/disable` | `MEMBER_MANAGE` | 200 | 404, 409 `last-org-admin` | M3.3g |
+| `POST /members/{userId}/reset-password` | `MEMBER_MANAGE` | 200 | 404, 503 | M3.3g, M10.1 |
+| `POST /members/{userId}/disable` | `MEMBER_MANAGE` | 200 | 404, 409 `last-org-admin`, 503 | M3.3g, M10.1 |
 | `GET /platform/organizations` | `PLATFORM_ORG_MANAGE` | 200 page | — | M3 |
 | `POST /platform/organizations` | `PLATFORM_ORG_MANAGE` | 201 | 400 | M3 |
 | `POST /imports` | `IMPORT_CREATE` | 202 | 400, 409 `duplicate-file`, 413, 415 | M5.7 |

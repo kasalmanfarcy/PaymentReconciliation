@@ -13,7 +13,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 import com.reconflow.paymentreconflow.shared.context.Role;
 import com.reconflow.paymentreconflow.support.AbstractIntegrationTest;
-import com.reconflow.paymentreconflow.support.TestData;
+import com.reconflow.paymentreconflow.support.TestTokens;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -28,6 +28,12 @@ import org.springframework.test.web.servlet.ResultActions;
 
 /** M3.3g: admin-created users only, with temporary passwords, and the last-admin guard. */
 class MemberManagementIT extends AbstractIntegrationTest {
+
+    @org.springframework.beans.factory.annotation.Autowired
+    AccountProvisioning provisioning;
+
+    @org.springframework.beans.factory.annotation.Autowired
+    org.springframework.transaction.support.TransactionTemplate tx;
 
     private ResultActions createMember(UUID admin, UUID org, String email, Role role) throws Exception {
         return mockMvc.perform(post("/api/v1/members")
@@ -47,7 +53,7 @@ class MemberManagementIT extends AbstractIntegrationTest {
     }
 
     @Test
-    void anAdminCreatesAMemberWithATemporaryPasswordThatMustBeChanged() throws Exception {
+    void anAdminCreatesAMemberWhoseKeycloakAccountHasATemporaryPassword() throws Exception {
         UUID org = data().newOrganization();
         var admin = data().newMember(org, Role.ORG_ADMIN);
         String email = "new-" + UUID.randomUUID() + "@example.test";
@@ -57,7 +63,6 @@ class MemberManagementIT extends AbstractIntegrationTest {
                 .andExpect(header().string("Location", startsWith("/api/v1/members/")))
                 .andExpect(jsonPath("$.email").value(email))
                 .andExpect(jsonPath("$.role").value("UPLOADER"))
-                .andExpect(jsonPath("$.mustChangePassword").value(true))
                 .andExpect(jsonPath("$.createdAt").isNotEmpty())
                 .andExpect(jsonPath("$.passwordHash").doesNotExist())
                 .andReturn()
@@ -65,19 +70,50 @@ class MemberManagementIT extends AbstractIntegrationTest {
                 .getContentAsString();
         String temporaryPassword =
                 jsonMapper.readTree(body).get("temporaryPassword").asString();
+        UUID userId = UUID.fromString(jsonMapper.readTree(body).get("userId").asString());
 
         assertThat(temporaryPassword).hasSize(16);
-        // The new user can log in with it, and must change it before anything else.
-        String token = jsonMapper
-                .readTree(login(email, temporaryPassword)
-                        .andReturn()
-                        .getResponse()
-                        .getContentAsString())
-                .get("accessToken")
-                .asString();
-        mockMvc.perform(get("/api/v1/members").header("Authorization", "Bearer " + token))
-                .andExpect(status().isForbidden())
-                .andExpect(jsonPath("$.code").value("password-change-required"));
+        // M10.1: the account was created in the identity provider with that temporary password
+        // (Keycloak's "Update Password" required action makes it single-use), and linked by sub.
+        String subject =
+                jdbc.queryForObject("select external_subject from app_user where id = ?", String.class, userId);
+        assertThat(idp.account(subject)).satisfies(a -> {
+            assertThat(a.email()).isEqualTo(email);
+            assertThat(a.password()).isEqualTo(temporaryPassword);
+        });
+        assertThat(jdbc.queryForObject("select password_hash from app_user where id = ?", String.class, userId))
+                .as("no password is stored in ReconFlow any more")
+                .isNull();
+        // A token for that subject is the new member.
+        mockMvc.perform(get("/api/v1/imports")
+                        .header("Authorization", TestTokens.bearer(tokens().forSubject(subject, c -> {}))))
+                .andExpect(status().isOk());
+    }
+
+    @Test
+    void ifTheDatabaseHalfRollsBackTheKeycloakAccountIsDeletedAgain() {
+        // No transaction spans Keycloak and PostgreSQL: AccountProvisioning compensates instead.
+        String email = "rolled-back-" + UUID.randomUUID() + "@example.test";
+
+        String subject = tx.execute(status -> {
+            String created = provisioning.provision(email, "Rolled Back").subject();
+            status.setRollbackOnly(); // e.g. the app_user insert lost a unique-email race
+            return created;
+        });
+
+        assertThat(idp.calls()).contains("create:" + subject, "delete:" + subject);
+        assertThat(idp.exists(subject)).isFalse();
+    }
+
+    @Test
+    void aCommittedProvisioningIsKept() {
+        String email = "kept-" + UUID.randomUUID() + "@example.test";
+
+        String subject =
+                tx.execute(status -> provisioning.provision(email, "Kept").subject());
+
+        assertThat(idp.exists(subject)).isTrue();
+        assertThat(idp.calls()).doesNotContain("delete:" + subject);
     }
 
     @Test
@@ -91,8 +127,8 @@ class MemberManagementIT extends AbstractIntegrationTest {
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.userId").value(elsewhere.id().toString()))
                 .andExpect(jsonPath("$.temporaryPassword").value(nullValue()));
-        // Their password is untouched.
-        login(elsewhere.email(), TestData.PASSWORD).andExpect(status().isOk());
+        // No new identity-provider account: the person already has one.
+        assertThat(idp.calls()).noneMatch(call -> call.contains(elsewhere.id().toString()));
     }
 
     @Test
@@ -217,7 +253,6 @@ class MemberManagementIT extends AbstractIntegrationTest {
         UUID org = data().newOrganization();
         var admin = data().newMember(org, Role.ORG_ADMIN);
         var member = data().newMember(org, Role.INVESTIGATOR);
-        login(member.email(), TestData.PASSWORD).andExpect(status().isOk());
 
         String body = mockMvc.perform(post("/api/v1/members/" + member.id() + "/reset-password")
                         .with(as(admin.id())))
@@ -228,36 +263,47 @@ class MemberManagementIT extends AbstractIntegrationTest {
         String temporaryPassword =
                 jsonMapper.readTree(body).get("temporaryPassword").asString();
 
-        login(member.email(), TestData.PASSWORD).andExpect(status().isUnauthorized());
-        login(member.email(), temporaryPassword).andExpect(status().isOk());
-        assertThat(jdbc.queryForObject(
-                        "select count(*) from refresh_token where user_id = ? and revoked_reason = 'ADMIN_REVOKED'",
-                        Integer.class,
-                        member.id()))
-                .isEqualTo(1);
-        assertThat(jdbc.queryForObject(
-                        "select must_change_password from app_user where id = ?", Boolean.class, member.id()))
-                .isTrue();
+        // Keycloak sets it as temporary and logs the account out (which revokes refresh tokens).
+        assertThat(idp.calls()).contains("reset:" + member.id());
+        assertThat(temporaryPassword).hasSize(16);
     }
 
     @Test
-    void aDisabledMemberIsOutImmediately() throws Exception {
+    void resetPasswordForAUserFromBeforeKeycloakCreatesAndLinksTheirAccount() throws Exception {
+        UUID org = data().newOrganization();
+        var admin = data().newMember(org, Role.ORG_ADMIN);
+        var legacy = data().newUnlinkedUser("legacy-" + UUID.randomUUID() + "@example.test");
+        data().addMembership(legacy.id(), org, Role.VIEWER);
+
+        String body = mockMvc.perform(post("/api/v1/members/" + legacy.id() + "/reset-password")
+                        .with(as(admin.id())))
+                .andExpect(status().isOk())
+                .andReturn()
+                .getResponse()
+                .getContentAsString();
+
+        String subject =
+                jdbc.queryForObject("select external_subject from app_user where id = ?", String.class, legacy.id());
+        assertThat(subject).isNotNull();
+        assertThat(idp.account(subject).password())
+                .isEqualTo(jsonMapper.readTree(body).get("temporaryPassword").asString());
+    }
+
+    @Test
+    void aDisabledMemberIsOutImmediatelyHereAndAtTheIdentityProvider() throws Exception {
         UUID org = data().newOrganization();
         var admin = data().newMember(org, Role.ORG_ADMIN);
         var member = data().newMember(org, Role.ORG_ADMIN);
-        login(member.email(), TestData.PASSWORD).andExpect(status().isOk());
+        mockMvc.perform(get("/api/v1/members").with(as(member.id()))).andExpect(status().isOk());
 
         mockMvc.perform(post("/api/v1/members/" + member.id() + "/disable").with(as(admin.id())))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("DISABLED"));
 
+        // A token issued before the disable is refused on the very next request...
         mockMvc.perform(get("/api/v1/members").with(as(member.id()))).andExpect(status().isUnauthorized());
-        login(member.email(), TestData.PASSWORD).andExpect(status().isUnauthorized());
-        assertThat(jdbc.queryForObject(
-                        "select count(*) from refresh_token where user_id = ? and revoked_reason = 'USER_DISABLED'",
-                        Integer.class,
-                        member.id()))
-                .isEqualTo(1);
+        // ...and Keycloak won't issue or refresh another.
+        assertThat(idp.calls()).contains("disable:" + member.id());
     }
 
     @Test

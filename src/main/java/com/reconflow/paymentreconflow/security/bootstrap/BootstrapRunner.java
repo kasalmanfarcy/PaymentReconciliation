@@ -6,7 +6,6 @@ import com.reconflow.paymentreconflow.audit.AuditEntry;
 import com.reconflow.paymentreconflow.audit.AuditService;
 import com.reconflow.paymentreconflow.security.user.AppUser;
 import com.reconflow.paymentreconflow.security.user.AppUserRepository;
-import com.reconflow.paymentreconflow.security.user.TemporaryPasswords;
 import com.reconflow.paymentreconflow.shared.logging.Masked;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -14,20 +13,20 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
-import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * How a fresh non-local environment gets its first user (authentication.plan §4.6). There is no
  * sign-up, and the local seeder never runs outside {@code local}, so without this nobody could ever
- * log in to create the first organization.
+ * create the first organization.
  *
  * <p>Gated on a one-time setting, {@code RECONFLOW_BOOTSTRAP_ADMIN_EMAIL}: if it is set and no
- * platform admin exists yet, create one with a temporary password printed once to the log (the
- * only secret this application ever logs, and only this once), which must be changed at first
- * login. Idempotent: once any platform admin exists it does nothing, so the variable can stay set.
- * The platform admin then creates organizations through the API.
+ * platform admin exists yet, an {@code app_user} with that email becomes (or is created as) the
+ * platform admin. Since M10.1 it has no password here and the application generates none: the
+ * operator creates the account in Keycloak's admin console with that email marked verified, and its
+ * first request links the two by verified email (OidcPrincipalResolver). Nothing secret is ever
+ * logged. Idempotent: once any platform admin exists it does nothing, so the variable can stay set.
  */
 @Component
 @ConditionalOnExpression("'${reconflow.bootstrap.admin-email:}' != ''")
@@ -37,19 +36,16 @@ public class BootstrapRunner implements ApplicationRunner {
 
     private final String adminEmail;
     private final AppUserRepository users;
-    private final PasswordEncoder encoder;
     private final TransactionTemplate tx;
     private final AuditService audit;
 
     public BootstrapRunner(
             @Value("${reconflow.bootstrap.admin-email}") String adminEmail,
             AppUserRepository users,
-            PasswordEncoder encoder,
             TransactionTemplate tx,
             AuditService audit) {
         this.adminEmail = adminEmail.trim();
         this.users = users;
-        this.encoder = encoder;
         this.tx = tx;
         this.audit = audit;
     }
@@ -66,27 +62,14 @@ public class BootstrapRunner implements ApplicationRunner {
                 log.info("Bootstrap skipped: a platform admin already exists");
                 return false;
             }
-            var existing = users.findByEmailIgnoreCase(adminEmail);
-            if (existing.isPresent()) {
-                existing.get().grantPlatformAdmin();
-                audit.record(AuditEntry.of(
-                                AuditAction.PLATFORM_ADMIN_BOOTSTRAPPED,
-                                AuditEntityType.USER,
-                                existing.get().getId())
-                        .with("existingAccount", true));
-                log.warn("Bootstrap: granted platform admin to the existing user {}", Masked.email(adminEmail));
-                return true;
-            }
-            String temporaryPassword = TemporaryPasswords.generate();
-            AppUser admin = AppUser.create(adminEmail, "Platform admin", encoder.encode(temporaryPassword), true);
+            AppUser admin = users.findByEmailIgnoreCase(adminEmail)
+                    .orElseGet(() -> users.save(AppUser.create(adminEmail, "Platform admin", null)));
             admin.grantPlatformAdmin();
-            users.save(admin);
             audit.record(AuditEntry.of(AuditAction.PLATFORM_ADMIN_BOOTSTRAPPED, AuditEntityType.USER, admin.getId()));
             log.warn(
-                    "Bootstrap: created platform admin {} with temporary password {} (shown once; change it at"
-                            + " first login, then unset RECONFLOW_BOOTSTRAP_ADMIN_EMAIL)",
-                    adminEmail,
-                    temporaryPassword);
+                    "Bootstrap: {} is the platform admin. Create that account in Keycloak with the email marked"
+                            + " verified; its first request links it. Then unset RECONFLOW_BOOTSTRAP_ADMIN_EMAIL.",
+                    Masked.email(adminEmail));
             return true;
         }));
     }

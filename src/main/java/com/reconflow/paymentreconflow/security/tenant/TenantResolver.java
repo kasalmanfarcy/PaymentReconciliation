@@ -99,9 +99,8 @@ final class TenantResolver {
     }
 
     /**
-     * Routes about the caller, not an organization ({@code /api/v1/auth/change-password}): an
-     * active user, nothing more. A user with several memberships, or none, must still be able to
-     * change their own password.
+     * Authenticated routes outside {@code /api/v1/} (none in the API since M10.1 moved password
+     * changes to Keycloak): an active user, nothing more.
      */
     static Resolution identity(UUID userId, Optional<UserMemberships> found) {
         return rejectInactive(found).orElseGet(() -> new Resolution.Resolved(new Bound(userId, null, null, Set.of())));

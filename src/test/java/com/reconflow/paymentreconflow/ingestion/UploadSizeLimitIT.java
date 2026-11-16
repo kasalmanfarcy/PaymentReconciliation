@@ -4,8 +4,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import com.reconflow.paymentreconflow.TestcontainersConfiguration;
 import com.reconflow.paymentreconflow.shared.context.Role;
+import com.reconflow.paymentreconflow.support.StandInIdentityConfig;
 import com.reconflow.paymentreconflow.support.TestData;
 import com.reconflow.paymentreconflow.support.TestDatabase;
+import com.reconflow.paymentreconflow.support.TestIssuer;
 import com.reconflow.paymentreconflow.support.TestTokens;
 import java.io.ByteArrayOutputStream;
 import java.net.URI;
@@ -23,7 +25,6 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.context.annotation.Import;
 import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.security.oauth2.jwt.JwtEncoder;
 import org.springframework.test.context.ActiveProfiles;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.S3Object;
@@ -39,7 +40,7 @@ import software.amazon.awssdk.services.s3.model.S3Object;
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @ActiveProfiles("test")
-@Import(TestcontainersConfiguration.class)
+@Import({TestcontainersConfiguration.class, StandInIdentityConfig.class})
 class UploadSizeLimitIT {
 
     @LocalServerPort
@@ -52,13 +53,7 @@ class UploadSizeLimitIT {
         this.jdbc = database.superuser(); // fixtures and assertions see every tenant (M10.7)
     }
 
-    @Autowired
-    JwtEncoder jwtEncoder;
-
-    @Value("${reconflow.auth.jwt.issuer}")
-    String issuer;
-
-    @Value("${reconflow.auth.jwt.audience}")
+    @Value("${spring.security.oauth2.resourceserver.jwt.audiences}")
     String audience;
 
     @Autowired
@@ -104,7 +99,7 @@ class UploadSizeLimitIT {
         TestData data = new TestData(jdbc);
         UUID org = data.newOrganization();
         UUID user = data.newMember(org, Role.UPLOADER).id();
-        return new Uploader(org, new TestTokens(jwtEncoder, issuer, audience).forUser(user));
+        return new Uploader(org, new TestTokens(TestIssuer.instance(), audience).forUser(user));
     }
 
     private void assertRejectedAndNothingStored(Uploader uploader, HttpResponse<String> res) {

@@ -8,7 +8,6 @@ import com.reconflow.paymentreconflow.support.AbstractIntegrationTest;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.transaction.support.TransactionTemplate;
 
 /**
@@ -22,16 +21,13 @@ class BootstrapRunnerIT extends AbstractIntegrationTest {
     AppUserRepository users;
 
     @Autowired
-    PasswordEncoder encoder;
-
-    @Autowired
     TransactionTemplate tx;
 
     @Autowired
     AuditService audit;
 
     private BootstrapRunner runner(String email) {
-        return new BootstrapRunner(email, users, encoder, tx, audit);
+        return new BootstrapRunner(email, users, tx, audit);
     }
 
     @Test
@@ -39,13 +35,15 @@ class BootstrapRunnerIT extends AbstractIntegrationTest {
         String email = "root-" + UUID.randomUUID() + "@example.test";
 
         tx.executeWithoutResult(status -> {
-            jdbc.update("update app_user set is_platform_admin = false where is_platform_admin");
+            // appJdbc: inside this (rolled-back) transaction. The superuser jdbc would commit it.
+            appJdbc.update("update app_user set is_platform_admin = false where is_platform_admin");
 
             assertThat(runner(email).bootstrap()).isTrue();
             // Through the repository: a JPQL query flushes the pending insert first.
             var admin = users.findByEmailIgnoreCase(email).orElseThrow();
             assertThat(admin.isPlatformAdmin()).isTrue();
-            assertThat(admin.isMustChangePassword()).isTrue();
+            // No password anywhere in ReconFlow (M10.1): the Keycloak account links on first login.
+            assertThat(admin.getExternalSubject()).isNull();
             // Idempotent: a second start finds the admin and does nothing.
             assertThat(runner("someone-else-" + email).bootstrap()).isFalse();
 

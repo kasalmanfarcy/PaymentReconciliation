@@ -34,12 +34,3 @@ reconflow:
     # Two organizations, a user per role, a two-org user and a platform admin (security.seed).
     # Local only: no other profile turns this on, so prod can never seed.
     enabled: true
-    # Every seeded user's password. A documented demo value, not a secret; README lists the accounts.
-    password: ${RECONFLOW_SEED_PASSWORD:reconflow-local-demo}
-  auth:
-    jwt:
-      # A fresh RSA key pair per start (logged as a warning); tokens die on restart.
-      generate-ephemeral-key: true
-    cookie:
-      # Safari may refuse Secure cookies on http://localhost. Every other profile keeps true.
-      secure: false

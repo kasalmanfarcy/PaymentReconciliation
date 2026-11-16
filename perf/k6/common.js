@@ -9,16 +9,22 @@ export const BASE = __ENV.BASE || 'http://localhost:8080';
 export const EMAIL = __ENV.EMAIL || 'admin@acme.test';
 export const PASSWORD = __ENV.PASSWORD || 'reconflow-local-demo';
 
-/** One login in setup(): the per-IP login rate limit (M3.3f) would refuse one per virtual user. */
+export const KEYCLOAK = __ENV.KEYCLOAK || 'http://localhost:8180';
+
+/**
+ * One token in setup(), from Keycloak (M10.1) with the local realm's demo client. One per virtual
+ * user would trip Keycloak's brute-force guard and measure Keycloak, not ReconFlow.
+ */
 export function login() {
-  const res = http.post(`${BASE}/api/v1/auth/login`, JSON.stringify({ email: EMAIL, password: PASSWORD }), {
-    headers: { 'Content-Type': 'application/json' },
-    tags: { kind: 'login' },
-  });
+  const res = http.post(
+    `${KEYCLOAK}/realms/reconflow/protocol/openid-connect/token`,
+    { grant_type: 'password', client_id: 'reconflow-demo', username: EMAIL, password: PASSWORD },
+    { tags: { kind: 'login' } },
+  );
   if (res.status !== 200) {
     throw new Error(`login failed: ${res.status} ${res.body}`);
   }
-  return res.json('accessToken');
+  return res.json('access_token');
 }
 
 export function auth(token, org, extra = {}) {

@@ -36,7 +36,7 @@ public class MemberQueries {
             "role", "m.role");
 
     private static final String SELECT = """
-            SELECT u.id, u.email, u.display_name, m.role, u.status, u.must_change_password, m.created_at
+            SELECT u.id, u.email, u.display_name, m.role, u.status, m.created_at
               FROM membership m
               JOIN app_user u ON u.id = m.user_id
              WHERE m.organization_id = :org
@@ -121,7 +121,6 @@ public class MemberQueries {
                 rs.getString("display_name"),
                 Role.valueOf(rs.getString("role")),
                 UserStatus.valueOf(rs.getString("status")),
-                rs.getBoolean("must_change_password"),
                 rs.getTimestamp("created_at").toInstant());
     }
 }

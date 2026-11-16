@@ -10,14 +10,14 @@
 # it and run with PHASE=verify ORG=<printed org> BATCH=<printed batch>: it waits for the import and
 # checks the counts against expected.json and that no source row was stored twice.
 #
-# Environment as bench_import.sh (BASE, EMAIL, RECONFLOW_SEED_PASSWORD, PSQL).
+# Environment as bench_import.sh (BASE, EMAIL, PASSWORD, KEYCLOAK, PSQL).
 set -euo pipefail
 
 DATASET=${1:?usage: chaos_kill.sh <dataset-dir> <seconds>}
 DELAY=${2:-3}
 BASE=${BASE:-http://localhost:8080}
 EMAIL=${EMAIL:-admin@acme.test}
-PASSWORD=${RECONFLOW_SEED_PASSWORD:-reconflow-local-demo}
+PASSWORD=${PASSWORD:-reconflow-local-demo} # the local Keycloak realm's demo password
 PSQL=${PSQL:-docker compose exec -T -e PGPASSWORD=${DB_PASSWORD:-} postgres psql -U ${DB_USER:-reconflow} -d paymentreconflow -qAt}
 SIGNAL=${SIGNAL:-KILL}
 PHASE=${PHASE:-kill}
@@ -25,8 +25,10 @@ expected="$DATASET/expected.json"
 
 sql() { $PSQL -c "$1"; }
 token() {
-  curl -sf -X POST "$BASE/api/v1/auth/login" -H 'Content-Type: application/json' \
-    -d "{\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\"}" | jq -r .accessToken
+  # M10.1: tokens come from Keycloak (the local realm's demo client).
+  curl -sf -X POST "${KEYCLOAK:-http://localhost:8180}/realms/reconflow/protocol/openid-connect/token" \
+    -d grant_type=password -d client_id=reconflow-demo --data-urlencode "username=$EMAIL" \
+    --data-urlencode "password=$PASSWORD" | jq -r .access_token
 }
 state() {
   sql "SELECT 'job: ' || j.status || ', attempts ' || j.attempts || ', lease ' || coalesce(j.lease_until::text, '-')

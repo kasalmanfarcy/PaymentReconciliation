@@ -10,7 +10,7 @@
 # postgres:16.4-alpine container (target, removed at the end), the packaged jar (./mvnw package).
 #
 # Environment: SOURCE_PSQL / SOURCE_DUMP (how to reach the source; defaults: the compose postgres),
-# DB_USER, DB_PASSWORD (the source's superuser, for pg_dump), RECONFLOW_SEED_PASSWORD, EMAIL, SOURCE_BASE (the running source
+# DB_USER, DB_PASSWORD (the source's superuser, for pg_dump), PASSWORD (the local realm's demo password), KEYCLOAK, EMAIL, SOURCE_BASE (the running source
 # app: its report is compared byte for byte), S3_* (the app's storage, for its readiness check).
 # Writes target/drill/.
 set -euo pipefail
@@ -21,7 +21,7 @@ DB_USER=${DB_USER:-reconflow}
 SOURCE_PSQL=${SOURCE_PSQL:-docker compose exec -T -e PGPASSWORD=${DB_PASSWORD:-} postgres psql -U $DB_USER -d paymentreconflow -qAt}
 SOURCE_DUMP=${SOURCE_DUMP:-docker compose exec -T -e PGPASSWORD=${DB_PASSWORD:-} postgres pg_dump -U $DB_USER -d paymentreconflow -Fc}
 EMAIL=${EMAIL:-admin@acme.test}
-PASSWORD=${RECONFLOW_SEED_PASSWORD:-reconflow-local-demo}
+PASSWORD=${PASSWORD:-reconflow-local-demo} # the local Keycloak realm's demo password
 TARGET=reconflow-restore-drill
 TARGET_PORT=55433
 TARGET_PASSWORD=drill-local-only
@@ -94,14 +94,15 @@ until curl -sf localhost:8091/actuator/health/readiness >/dev/null; do
   sleep 0.5
 done
 app_s=$(since "$t"); echo "   ready in ${app_s}s"
-token=$(curl -sf -X POST localhost:8090/api/v1/auth/login -H 'Content-Type: application/json' \
-  -d "{\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\"}" | jq -r .accessToken)
+# M10.1: one Keycloak token works against both the restored copy and the source (same issuer).
+token=$(curl -sf -X POST "${KEYCLOAK:-http://localhost:8180}/realms/reconflow/protocol/openid-connect/token" \
+  -d grant_type=password -d client_id=reconflow-demo --data-urlencode "username=$EMAIL" \
+  --data-urlencode "password=$PASSWORD" | jq -r .access_token)
 report=$(curl -sf "localhost:8090/api/v1/reports/reconciliation?runId=$RUN" -H "Authorization: Bearer $token" \
   -H "X-Organization-Id: $ORG" | jq -S -c 'del(.generatedAt)')
 echo "$report" > "$OUT/report-from-restore.json"
 if [ -n "${SOURCE_BASE:-}" ]; then # the running source app, e.g. http://localhost:8080
-  stoken=$(curl -sf -X POST "$SOURCE_BASE/api/v1/auth/login" -H 'Content-Type: application/json' \
-    -d "{\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\"}" | jq -r .accessToken)
+  stoken=$token
   curl -sf "$SOURCE_BASE/api/v1/reports/reconciliation?runId=$RUN" -H "Authorization: Bearer $stoken" \
     -H "X-Organization-Id: $ORG" | jq -S -c 'del(.generatedAt)' > "$OUT/report-from-source.json"
   cmp -s "$OUT/report-from-source.json" "$OUT/report-from-restore.json" \

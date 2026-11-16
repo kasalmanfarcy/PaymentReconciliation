@@ -1,5 +1,6 @@
 package com.reconflow.paymentreconflow.reconciliation;
 
+import com.reconflow.paymentreconflow.exceptions.DiscrepancyRecorder;
 import com.reconflow.paymentreconflow.ledger.SourceType;
 import com.reconflow.paymentreconflow.reconciliation.engine.DayResult;
 import com.reconflow.paymentreconflow.reconciliation.engine.MatchingStrategy;
@@ -17,9 +18,12 @@ class EngineCalls {
     private final MatchingStrategy strategy;
     private final TenantScope tenantScope;
     private final TransactionTemplate tx;
+    private final DiscrepancyRecorder recorder;
 
-    EngineCalls(MatchingStrategy strategy, TenantScope tenantScope, TransactionTemplate tx) {
+    EngineCalls(
+            MatchingStrategy strategy, TenantScope tenantScope, TransactionTemplate tx, DiscrepancyRecorder recorder) {
         this.strategy = strategy;
+        this.recorder = recorder;
         this.tenantScope = tenantScope;
         this.tx = tx;
     }
@@ -31,5 +35,16 @@ class EngineCalls {
 
     DayResult reconcileDay(RunContext run, LocalDate day) {
         return tenantScope.call(run.organizationId(), () -> tx.execute(s -> strategy.reconcileDay(run, day)));
+    }
+
+    /** The strategy and the exceptions module in one transaction, as a day-chunk does. */
+    DayResult reconcileAndRecord(RunContext run, LocalDate day) {
+        return tenantScope.call(
+                run.organizationId(),
+                () -> tx.execute(s -> {
+                    DayResult result = strategy.reconcileDay(run, day);
+                    recorder.record(run.organizationId(), run.runId(), result.discrepancies());
+                    return result;
+                }));
     }
 }

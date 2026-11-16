@@ -68,6 +68,39 @@ public class PartitionManager {
         return rows == null ? 0 : rows;
     }
 
+    /**
+     * The months that have a partition, from the catalog (M9.16: archival looks for old ones).
+     */
+    public java.util.List<YearMonth> existingMonths() {
+        return jdbc
+                .queryForList(
+                        "SELECT c.relname FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid"
+                                + " WHERE i.inhparent = 'transaction_record'::regclass"
+                                + " AND c.relname ~ '^transaction_record_[0-9]{4}_[0-9]{2}$' ORDER BY 1",
+                        String.class)
+                .stream()
+                .map(name -> YearMonth.of(
+                        Integer.parseInt(name.substring(19, 23)), Integer.parseInt(name.substring(24, 26))))
+                .toList();
+    }
+
+    /**
+     * Detaches and drops a month's partition (M9.16, after its rows are archived and verified). Plain
+     * DETACH, not CONCURRENTLY: CONCURRENTLY can't run while a default partition exists, nor inside
+     * a transaction. It locks the parent briefly, so the job runs at night. Every foreign key into
+     * the partition must already be gone (archival deletes the dependents first), or PostgreSQL
+     * refuses.
+     */
+    public void drop(YearMonth month) {
+        requiresNew.executeWithoutResult(status -> {
+            jdbc.queryForObject("SELECT pg_advisory_xact_lock(hashtext(?))", Object.class, LOCK_KEY);
+            String name = partitionName(month);
+            jdbc.execute("ALTER TABLE transaction_record DETACH PARTITION " + name);
+            jdbc.execute("DROP TABLE " + name);
+        });
+        known.remove(month);
+    }
+
     static String partitionName(YearMonth month) {
         return "transaction_record_%04d_%02d".formatted(month.getYear(), month.getMonthValue());
     }

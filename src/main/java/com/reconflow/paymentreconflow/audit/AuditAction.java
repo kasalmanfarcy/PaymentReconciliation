@@ -49,5 +49,8 @@ public enum AuditAction {
     /** A large export was queued as a background job (payload: runId, jobId, rowCount). */
     EXPORT_REQUESTED,
     /** A run's exceptions left the system as CSV (payload: runId, rowCount, mode, jobId if async). */
-    EXCEPTIONS_EXPORTED
+    EXCEPTIONS_EXPORTED,
+    // M9: data lifecycle
+    /** An old month of the organization's records left PostgreSQL for verified files in object storage. */
+    PARTITION_ARCHIVED
 }

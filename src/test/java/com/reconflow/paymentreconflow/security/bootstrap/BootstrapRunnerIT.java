@@ -2,6 +2,7 @@ package com.reconflow.paymentreconflow.security.bootstrap;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.reconflow.paymentreconflow.audit.AuditService;
 import com.reconflow.paymentreconflow.security.user.AppUserRepository;
 import com.reconflow.paymentreconflow.support.AbstractIntegrationTest;
 import java.util.UUID;
@@ -26,8 +27,11 @@ class BootstrapRunnerIT extends AbstractIntegrationTest {
     @Autowired
     TransactionTemplate tx;
 
+    @Autowired
+    AuditService audit;
+
     private BootstrapRunner runner(String email) {
-        return new BootstrapRunner(email, users, encoder, tx);
+        return new BootstrapRunner(email, users, encoder, tx, audit);
     }
 
     @Test

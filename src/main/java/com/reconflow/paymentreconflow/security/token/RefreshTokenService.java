@@ -1,5 +1,6 @@
 package com.reconflow.paymentreconflow.security.token;
 
+import com.reconflow.paymentreconflow.security.auth.AuthAudit;
 import com.reconflow.paymentreconflow.security.config.AuthProperties;
 import com.reconflow.paymentreconflow.shared.id.Ids;
 import java.time.OffsetDateTime;
@@ -47,11 +48,13 @@ public class RefreshTokenService {
     private final JdbcClient jdbc;
     private final TransactionTemplate tx;
     private final AuthProperties properties;
+    private final AuthAudit audit;
 
-    RefreshTokenService(JdbcClient jdbc, TransactionTemplate tx, AuthProperties properties) {
+    RefreshTokenService(JdbcClient jdbc, TransactionTemplate tx, AuthProperties properties, AuthAudit audit) {
         this.jdbc = jdbc;
         this.tx = tx;
         this.properties = properties;
+        this.audit = audit;
     }
 
     /**
@@ -168,11 +171,13 @@ public class RefreshTokenService {
      * response would still be 401, so every test that checks only the status would pass.
      */
     private void revokeFamilyForReuse(Row row) {
-        tx.executeWithoutResult(
-                status -> jdbc.sql("""
-                        UPDATE refresh_token SET revoked_at = now(), revoked_reason = 'REUSE_DETECTED'
-                         WHERE family_id = :familyId AND revoked_at IS NULL
-                        """).param("familyId", row.familyId()).update());
+        tx.executeWithoutResult(status -> {
+            int revoked = jdbc.sql("""
+                            UPDATE refresh_token SET revoked_at = now(), revoked_reason = 'REUSE_DETECTED'
+                             WHERE family_id = :familyId AND revoked_at IS NULL
+                            """).param("familyId", row.familyId()).update();
+            audit.refreshTokenReuse(row.userId(), row.familyId(), revoked);
+        });
     }
 
     /** Revokes the family's live tokens (logout). Joins the caller's transaction. */

@@ -1,5 +1,9 @@
 package com.reconflow.paymentreconflow.security.user;
 
+import com.reconflow.paymentreconflow.audit.AuditAction;
+import com.reconflow.paymentreconflow.audit.AuditEntityType;
+import com.reconflow.paymentreconflow.audit.AuditEntry;
+import com.reconflow.paymentreconflow.audit.AuditService;
 import com.reconflow.paymentreconflow.organization.Organization;
 import com.reconflow.paymentreconflow.organization.OrganizationService;
 import com.reconflow.paymentreconflow.shared.context.CurrentUser;
@@ -35,6 +39,7 @@ public class PlatformOrganizationService {
     private final TenantScope tenantScope;
     private final CurrentUser currentUser;
     private final TransactionTemplate tx;
+    private final AuditService audit;
 
     PlatformOrganizationService(
             OrganizationService organizations,
@@ -43,7 +48,8 @@ public class PlatformOrganizationService {
             PasswordEncoder encoder,
             TenantScope tenantScope,
             CurrentUser currentUser,
-            TransactionTemplate tx) {
+            TransactionTemplate tx,
+            AuditService audit) {
         this.organizations = organizations;
         this.users = users;
         this.memberships = memberships;
@@ -51,6 +57,7 @@ public class PlatformOrganizationService {
         this.tenantScope = tenantScope;
         this.currentUser = currentUser;
         this.tx = tx;
+        this.audit = audit;
     }
 
     public Page<Organization> list(int page, int size) {
@@ -72,7 +79,7 @@ public class PlatformOrganizationService {
         return tenantScope.call(
                 orgId,
                 () -> tx.execute(status -> {
-                    Organization org = organizations.create(orgId, name.trim());
+                    Organization org = organizations.create(orgId, name.trim(), platformAdmin);
                     var existing = users.findByEmailIgnoreCase(adminEmail.trim());
                     String temporaryPassword = null;
                     AppUser admin;
@@ -84,6 +91,10 @@ public class PlatformOrganizationService {
                                 AppUser.create(adminEmail, adminDisplayName, encoder.encode(temporaryPassword), true));
                     }
                     memberships.save(Membership.create(admin.getId(), orgId, Role.ORG_ADMIN, platformAdmin));
+                    audit.record(AuditEntry.of(AuditAction.MEMBER_CREATED, AuditEntityType.MEMBERSHIP, admin.getId())
+                            .actorId(platformAdmin)
+                            .with("role", Role.ORG_ADMIN)
+                            .with("newAccount", temporaryPassword != null));
                     return new CreatedOrganization(org, admin.getId(), admin.getEmail(), temporaryPassword);
                 }));
     }

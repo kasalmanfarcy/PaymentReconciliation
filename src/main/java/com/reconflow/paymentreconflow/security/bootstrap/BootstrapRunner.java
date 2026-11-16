@@ -1,5 +1,9 @@
 package com.reconflow.paymentreconflow.security.bootstrap;
 
+import com.reconflow.paymentreconflow.audit.AuditAction;
+import com.reconflow.paymentreconflow.audit.AuditEntityType;
+import com.reconflow.paymentreconflow.audit.AuditEntry;
+import com.reconflow.paymentreconflow.audit.AuditService;
 import com.reconflow.paymentreconflow.security.user.AppUser;
 import com.reconflow.paymentreconflow.security.user.AppUserRepository;
 import com.reconflow.paymentreconflow.security.user.TemporaryPasswords;
@@ -34,16 +38,19 @@ public class BootstrapRunner implements ApplicationRunner {
     private final AppUserRepository users;
     private final PasswordEncoder encoder;
     private final TransactionTemplate tx;
+    private final AuditService audit;
 
     public BootstrapRunner(
             @Value("${reconflow.bootstrap.admin-email}") String adminEmail,
             AppUserRepository users,
             PasswordEncoder encoder,
-            TransactionTemplate tx) {
+            TransactionTemplate tx,
+            AuditService audit) {
         this.adminEmail = adminEmail.trim();
         this.users = users;
         this.encoder = encoder;
         this.tx = tx;
+        this.audit = audit;
     }
 
     @Override
@@ -61,6 +68,11 @@ public class BootstrapRunner implements ApplicationRunner {
             var existing = users.findByEmailIgnoreCase(adminEmail);
             if (existing.isPresent()) {
                 existing.get().grantPlatformAdmin();
+                audit.record(AuditEntry.of(
+                                AuditAction.PLATFORM_ADMIN_BOOTSTRAPPED,
+                                AuditEntityType.USER,
+                                existing.get().getId())
+                        .with("existingAccount", true));
                 log.warn("Bootstrap: granted platform admin to the existing user {}", adminEmail);
                 return true;
             }
@@ -68,6 +80,7 @@ public class BootstrapRunner implements ApplicationRunner {
             AppUser admin = AppUser.create(adminEmail, "Platform admin", encoder.encode(temporaryPassword), true);
             admin.grantPlatformAdmin();
             users.save(admin);
+            audit.record(AuditEntry.of(AuditAction.PLATFORM_ADMIN_BOOTSTRAPPED, AuditEntityType.USER, admin.getId()));
             log.warn(
                     "Bootstrap: created platform admin {} with temporary password {} (shown once; change it at"
                             + " first login, then unset RECONFLOW_BOOTSTRAP_ADMIN_EMAIL)",

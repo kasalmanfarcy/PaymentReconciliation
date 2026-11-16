@@ -1,5 +1,9 @@
 package com.reconflow.paymentreconflow.security.user;
 
+import com.reconflow.paymentreconflow.audit.AuditAction;
+import com.reconflow.paymentreconflow.audit.AuditEntityType;
+import com.reconflow.paymentreconflow.audit.AuditEntry;
+import com.reconflow.paymentreconflow.audit.AuditService;
 import com.reconflow.paymentreconflow.security.token.RefreshTokenService;
 import com.reconflow.paymentreconflow.security.token.RevocationReason;
 import com.reconflow.paymentreconflow.shared.context.CurrentUser;
@@ -41,6 +45,7 @@ public class MemberService {
     private final CurrentUser currentUser;
     private final JdbcClient jdbc;
     private final EntityManager em;
+    private final AuditService audit;
 
     MemberService(
             AppUserRepository users,
@@ -51,7 +56,8 @@ public class MemberService {
             TenantContext tenant,
             CurrentUser currentUser,
             JdbcClient jdbc,
-            EntityManager em) {
+            EntityManager em,
+            AuditService audit) {
         this.users = users;
         this.memberships = memberships;
         this.queries = queries;
@@ -61,6 +67,7 @@ public class MemberService {
         this.currentUser = currentUser;
         this.jdbc = jdbc;
         this.em = em;
+        this.audit = audit;
     }
 
     @Transactional(readOnly = true)
@@ -89,6 +96,9 @@ public class MemberService {
             user = users.save(AppUser.create(email, displayName, encoder.encode(temporaryPassword), true));
         }
         memberships.save(Membership.create(user.getId(), org, role, currentUser.id()));
+        audit.record(AuditEntry.of(AuditAction.MEMBER_CREATED, AuditEntityType.MEMBERSHIP, user.getId())
+                .with("role", role)
+                .with("newAccount", temporaryPassword != null));
         return new CreatedMember(view(org, user.getId()), temporaryPassword);
     }
 
@@ -101,7 +111,11 @@ public class MemberService {
         if (membership.getRole() == Role.ORG_ADMIN && newRole != Role.ORG_ADMIN) {
             requireAnotherActiveAdmin(org, userId);
         }
+        Role previous = membership.getRole();
         membership.changeRole(newRole);
+        audit.record(AuditEntry.of(AuditAction.MEMBER_ROLE_CHANGED, AuditEntityType.MEMBERSHIP, userId)
+                .with("from", previous)
+                .with("to", newRole));
         return view(org, userId);
     }
 
@@ -112,7 +126,9 @@ public class MemberService {
         membership(org, userId);
         String temporaryPassword = TemporaryPasswords.generate();
         users.findById(userId).orElseThrow().resetPassword(encoder.encode(temporaryPassword));
-        refreshTokens.revokeAllForUser(userId, RevocationReason.ADMIN_REVOKED);
+        int revoked = refreshTokens.revokeAllForUser(userId, RevocationReason.ADMIN_REVOKED);
+        audit.record(AuditEntry.of(AuditAction.PASSWORD_RESET_BY_ADMIN, AuditEntityType.USER, userId)
+                .with("revokedSessions", revoked));
         return temporaryPassword;
     }
 
@@ -130,7 +146,9 @@ public class MemberService {
             requireAnotherActiveAdmin(org, userId);
         }
         user.disable();
-        refreshTokens.revokeAllForUser(userId, RevocationReason.USER_DISABLED);
+        int revoked = refreshTokens.revokeAllForUser(userId, RevocationReason.USER_DISABLED);
+        audit.record(AuditEntry.of(AuditAction.MEMBER_DISABLED, AuditEntityType.USER, userId)
+                .with("revokedSessions", revoked));
         return view(org, userId);
     }
 

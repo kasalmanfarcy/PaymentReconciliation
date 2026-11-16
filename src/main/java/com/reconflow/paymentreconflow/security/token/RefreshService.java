@@ -1,5 +1,7 @@
 package com.reconflow.paymentreconflow.security.token;
 
+import com.reconflow.paymentreconflow.security.auth.AuthAudit;
+import com.reconflow.paymentreconflow.security.auth.ClientInfo;
 import com.reconflow.paymentreconflow.security.token.AccessTokenService.AccessToken;
 import com.reconflow.paymentreconflow.security.token.RefreshTokenService.RotationResult;
 import com.reconflow.paymentreconflow.security.user.AppUser;
@@ -19,16 +21,19 @@ public class RefreshService {
     private final AccessTokenService accessTokens;
     private final AppUserRepository users;
     private final TransactionTemplate tx;
+    private final AuthAudit audit;
 
     RefreshService(
             RefreshTokenService refreshTokens,
             AccessTokenService accessTokens,
             AppUserRepository users,
-            TransactionTemplate tx) {
+            TransactionTemplate tx,
+            AuthAudit audit) {
         this.refreshTokens = refreshTokens;
         this.accessTokens = accessTokens;
         this.users = users;
         this.tx = tx;
+        this.audit = audit;
     }
 
     public Optional<Refreshed> refresh(String rawToken) {
@@ -48,10 +53,13 @@ public class RefreshService {
      * Revokes the presented token's family. Idempotent: an unknown, expired or already revoked
      * token is simply ignored, and the caller always answers 204 and clears the cookie.
      */
-    public void logout(String rawToken) {
+    public void logout(String rawToken, ClientInfo client) {
         refreshTokens.find(rawToken).ifPresent(row -> {
             if (row.revokedAt() == null) {
-                tx.executeWithoutResult(status -> refreshTokens.revokeFamily(row.familyId(), RevocationReason.LOGOUT));
+                tx.executeWithoutResult(status -> {
+                    refreshTokens.revokeFamily(row.familyId(), RevocationReason.LOGOUT);
+                    audit.logout(row.userId(), row.familyId(), client);
+                });
             }
         });
     }

@@ -139,7 +139,7 @@ class BruteForceProtectionIT extends AbstractIntegrationTest {
             for (int i = 0; i < 20; i++) {
                 results.add(pool.submit(() -> {
                     start.await();
-                    return auth.login(user.email(), "wrong-password");
+                    return auth.login(user.email(), "wrong-password", ClientInfo.unknown());
                 }));
             }
             start.countDown();

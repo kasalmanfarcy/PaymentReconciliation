@@ -79,7 +79,7 @@ class AuthController {
                             ProblemCodes.RATE_LIMITED,
                             "Too many login attempts. Try again later."));
         }
-        return switch (auth.login(request.email(), request.password())) {
+        return switch (auth.login(request.email(), request.password(), ClientInfo.of(http))) {
             case LoginResult.Success s ->
                 ResponseEntity.ok()
                         .header(
@@ -108,9 +108,11 @@ class AuthController {
 
     /** Always 204 with an expired cookie, whether or not the token was valid: logout is idempotent. */
     @PostMapping("/logout")
-    ResponseEntity<Void> logout(@CookieValue(name = RefreshCookies.NAME, required = false) @Nullable String token) {
+    ResponseEntity<Void> logout(
+            @CookieValue(name = RefreshCookies.NAME, required = false) @Nullable String token,
+            HttpServletRequest http) {
         if (token != null && !token.isBlank()) {
-            refresh.logout(token);
+            refresh.logout(token, ClientInfo.of(http));
         }
         return ResponseEntity.noContent()
                 .header(HttpHeaders.SET_COOKIE, cookies.clear().toString())
@@ -119,9 +121,12 @@ class AuthController {
 
     @PostMapping(path = "/change-password", consumes = MediaType.APPLICATION_JSON_VALUE)
     ResponseEntity<?> changePassword(
-            @AuthenticationPrincipal Jwt jwt, @Valid @RequestBody ChangePasswordRequest request) {
+            @AuthenticationPrincipal Jwt jwt,
+            @Valid @RequestBody ChangePasswordRequest request,
+            HttpServletRequest http) {
         UUID userId = UUID.fromString(jwt.getSubject());
-        return switch (auth.changePassword(userId, request.currentPassword(), request.newPassword())) {
+        return switch (auth.changePassword(
+                userId, request.currentPassword(), request.newPassword(), ClientInfo.of(http))) {
             case ChangeResult.Changed c ->
                 ResponseEntity.ok()
                         .header(

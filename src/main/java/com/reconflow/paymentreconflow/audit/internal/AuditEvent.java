@@ -13,6 +13,8 @@ import jakarta.persistence.PostPersist;
 import jakarta.persistence.Table;
 import jakarta.persistence.Transient;
 import java.time.Instant;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
 import org.hibernate.annotations.Immutable;
@@ -89,7 +91,8 @@ public class AuditEvent implements Persistable<UUID> {
         e.action = action;
         e.entityType = entityType;
         e.entityId = entityId;
-        e.payload = Map.copyOf(payload);
+        // Insertion order kept for readability; null values allowed ("assignedTo": null).
+        e.payload = Collections.unmodifiableMap(new LinkedHashMap<>(payload));
         e.requestId = requestId;
         e.isNew = true;
         return e;

@@ -13,6 +13,7 @@
 #   3. edge      traefik and keycloak up (no-op when unchanged)
 #   4. worker    recreated first: it has no traffic to drop, and it validates the schema on start
 #   5. api       recreated; ready means /actuator/health/readiness is UP (database and storage)
+#                and Traefik routes to it (an anonymous call through the edge answers 401)
 #
 # The api is recreated in place, so requests during its restart (about 10 s) get 502/503 from
 # Traefik. docs/runbooks/deploy.md, "Downtime", says what removing that would take.
@@ -87,6 +88,18 @@ stage "5/5 api"
 compose up -d --no-deps api
 wait_healthy api 180
 wait_ready 120
+
+# Traefik routes only to an api its own health check has seen ready (every 5 s), so "ready inside
+# the container" isn't yet "serving": wait until an anonymous call through the edge answers 401.
+env_value() { sed -n "s/^$1=//p" "$env_file" | tail -1; }
+api_host=$(env_value API_HOST); https_port=$(env_value HTTPS_PORT); https_port=${https_port:-443}
+edge_serving() {
+  [[ "$(curl -sk -o /dev/null -w '%{http_code}' --resolve "$api_host:$https_port:127.0.0.1" \
+        "https://$api_host:$https_port/api/v1/members")" == 401 ]]
+}
+for ((i = 0; i < 60; i += 2)); do edge_serving && break; sleep 2; done
+edge_serving || { echo "deploy: the edge isn't routing to the api" >&2; exit 1; }
+echo "edge: https://$api_host routes to the new api"
 
 echo "$TAG" > "$here/.deployed-tag.$project"
 stage "done: $TAG is serving"

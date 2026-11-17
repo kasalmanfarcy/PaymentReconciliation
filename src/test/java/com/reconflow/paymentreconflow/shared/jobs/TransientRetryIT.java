@@ -7,6 +7,8 @@ import com.reconflow.paymentreconflow.support.AbstractIntegrationTest;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
@@ -38,29 +40,36 @@ class TransientRetryIT extends AbstractIntegrationTest {
         UUID b = data().newOrganization();
         CyclicBarrier bothHoldTheirFirstLock = new CyclicBarrier(2);
         AtomicInteger executions = new AtomicInteger();
+        // Two dedicated threads: the common ForkJoinPool can be too small (or busy) on a CI runner
+        // to run both sides at once, and then the barrier waits for a party that never starts.
+        try (ExecutorService pool = Executors.newFixedThreadPool(2)) {
+            CompletableFuture<Void> one = CompletableFuture.runAsync(
+                    () -> retry.run(
+                            "test.deadlock",
+                            () -> tx.executeWithoutResult(s -> {
+                                boolean first = executions.incrementAndGet() <= 2;
+                                touch(a, "one");
+                                if (first) {
+                                    await(bothHoldTheirFirstLock);
+                                }
+                                touch(b, "one");
+                            })),
+                    pool);
+            CompletableFuture<Void> two = CompletableFuture.runAsync(
+                    () -> retry.run(
+                            "test.deadlock",
+                            () -> tx.executeWithoutResult(s -> {
+                                boolean first = executions.incrementAndGet() <= 2;
+                                touch(b, "two");
+                                if (first) {
+                                    await(bothHoldTheirFirstLock);
+                                }
+                                touch(a, "two");
+                            })),
+                    pool);
 
-        CompletableFuture<Void> one = CompletableFuture.runAsync(() -> retry.run(
-                "test.deadlock",
-                () -> tx.executeWithoutResult(s -> {
-                    boolean first = executions.incrementAndGet() <= 2;
-                    touch(a, "one");
-                    if (first) {
-                        await(bothHoldTheirFirstLock);
-                    }
-                    touch(b, "one");
-                })));
-        CompletableFuture<Void> two = CompletableFuture.runAsync(() -> retry.run(
-                "test.deadlock",
-                () -> tx.executeWithoutResult(s -> {
-                    boolean first = executions.incrementAndGet() <= 2;
-                    touch(b, "two");
-                    if (first) {
-                        await(bothHoldTheirFirstLock);
-                    }
-                    touch(a, "two");
-                })));
-
-        CompletableFuture.allOf(one, two).get(60, TimeUnit.SECONDS);
+            CompletableFuture.allOf(one, two).get(60, TimeUnit.SECONDS);
+        }
 
         assertThat(executions.get())
                 .as("two attempts, plus one retry of the deadlock victim")

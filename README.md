@@ -8,10 +8,8 @@ else.** ReconFlow imports both, matches them with deterministic rules, turns eve
 a case an investigator can work, and records who resolved what, and why, in an append-only audit
 trail. Multi-tenant, built as a Spring Boot modular monolith on PostgreSQL.
 
-> **Status: v1 complete (M0–M11).** Everything in [TASKS.md](TASKS.md) through M11 is built, tested
-> and documented, including a production deployment that has been rehearsed end to end on a laptop.
-> Not yet done, because each needs an account or a person: the live deployment, the GitHub
-> repository settings and a recorded demo GIF ([what's left](#whats-left-for-the-owner)).
+> **Status: v1 complete.** Ingestion, reconciliation engine, exception workflow, reporting,
+> reliability, security hardening and a production-style deployment setup are built, tested and documented.
 
 ```text
 $ ./scripts/demo.sh
@@ -235,27 +233,19 @@ account: [docs/runbooks/deploy.md](docs/runbooks/deploy.md) §9.
 
 | Phase | Scope | Status |
 |---|---|---|
-| M0–M2 | Repository, requirements and design, project foundation | Done (protecting `main`: owner) |
+| M0–M2 | Repository, requirements and design, project foundation | Done |
 | M3–M4 | Organizations, users, tenant isolation; append-only audit | Done |
 | M5–M8 | Ingestion, reconciliation engine, exception workflow, reporting | Done |
 | M9 | Reliability and performance (recovery, benchmarks, metrics) | Done |
 | M10 | Security hardening (Keycloak, DB roles, scanning, rate limits) | Done |
-| M11 | Deployment and portfolio | Done (live deployment: owner step) |
+| M11 | Deployment (Compose, Traefik, CI image publishing, runbooks) | Done |
 | v2 | Many-to-one matching, fees, bank statements, a web UI, … | [Planned](plans/phase-v2-later-scope.plan) |
 
-### What's left for the owner
+### Next steps
 
-These need an account, a machine or a person, so they were prepared but not done:
-
-- **Deploy** to a VM with a managed PostgreSQL and a bucket: [runbook](docs/runbooks/deploy.md) §2–§4,
-  then switch on the [deploy workflow](.github/workflows/deploy.yml).
-- **Push the work and protect `main`** (TASKS.md M0.4, make the repository public if it isn't); CI
-  then runs `build` and `image` on every PR and `publish-image` on `main`.
-- **GitHub settings:** Dependabot, secret scanning and push protection, required checks
-  (`build`, `image`, `dependency-review`, `gitleaks`), `NVD_API_KEY` ([security.md §3](docs/security.md#3-steps-that-live-outside-the-repository)),
-  and making the GHCR package public after the first push.
-- **A demo GIF** for this page: `asciinema rec` of `./scripts/demo.sh`, converted with `agg`
-  (TASKS.md M11.12).
+- Live deployment on a VM with managed PostgreSQL and S3 ([runbook](docs/runbooks/deploy.md))
+- A recorded demo of `./scripts/demo.sh`
+- v2 scope: many-to-one matching, fee handling, bank statements and a web UI
 
 ---
 

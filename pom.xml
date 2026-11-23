@@ -50,7 +50,7 @@
         <!-- M5 ingestion. Boot manages none of these, so they are pinned here. -->
         <commons-csv.version>1.14.1</commons-csv.version>
         <commons-io.version>2.22.0</commons-io.version>
-        <awssdk.version>2.59.1</awssdk.version>
+        <awssdk.version>2.59.5</awssdk.version>
         <!-- M6.19 property tests. 1.10.x is the line that runs on the JUnit Platform Boot 4 ships. -->
         <jqwik.version>1.10.2</jqwik.version>
         <!-- M10.4 request rate limits (token buckets). Not managed by Boot. -->
